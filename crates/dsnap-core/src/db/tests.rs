@@ -1,5 +1,6 @@
 //! Unit tests for the index database.
 
+use std::collections::HashSet;
 use std::thread;
 
 use rusqlite::TransactionBehavior;
@@ -157,10 +158,45 @@ use std::time::Instant;
 
 use crate::types::{AutoSnapshot, EntryKind};
 
-/// A store value for `insert_version`; DSNA-31 tests never touch its files.
-fn dummy_store() -> Store {
-    Store {
-        dir: PathBuf::from("unused-objects"),
+/// In-memory stand-in for the blob store (Chain C's `Store` is not on main yet).
+#[derive(Default)]
+struct FakeFiles {
+    /// `contains` is always true (for tests that do not exercise the blob check).
+    all_present: bool,
+    present: std::sync::Mutex<HashSet<BlobHash>>,
+    deleted: std::sync::Mutex<Vec<BlobHash>>,
+}
+
+impl FakeFiles {
+    fn with(hashes: &[BlobHash]) -> Self {
+        let f = Self::default();
+        f.present.lock().unwrap().extend(hashes.iter().copied());
+        f
+    }
+    fn has(&self, h: &BlobHash) -> bool {
+        self.present.lock().unwrap().contains(h)
+    }
+}
+
+impl BlobFiles for FakeFiles {
+    fn contains(&self, hash: &BlobHash) -> bool {
+        self.all_present || self.has(hash)
+    }
+    fn delete(&self, hash: &BlobHash) -> crate::Result<u64> {
+        self.deleted.lock().unwrap().push(*hash);
+        Ok(if self.present.lock().unwrap().remove(hash) {
+            100
+        } else {
+            0
+        })
+    }
+}
+
+/// A store where every blob exists; for tests that do not exercise the blob check.
+fn dummy_store() -> FakeFiles {
+    FakeFiles {
+        all_present: true,
+        ..FakeFiles::default()
     }
 }
 
@@ -315,7 +351,7 @@ fn version_round_trip_and_entry_kinds() {
         deleted: 2,
     };
     nv.new_blobs = vec![blob(b"hello")];
-    let v = db.insert_version(&nv, &dummy_store()).unwrap();
+    let v = db.insert_version_with(&nv, &dummy_store()).unwrap();
     assert_eq!(db.get_version(v.id).unwrap(), v);
     assert_eq!(v.kind, VersionKind::Safety);
     assert!(v.unstable && !v.pinned);
@@ -340,7 +376,7 @@ fn entries_are_sorted_by_path() {
         file_entry("a.txt", b"4"),
     ];
     let v = db
-        .insert_version(&new_version(p, "v", unsorted), &dummy_store())
+        .insert_version_with(&new_version(p, "v", unsorted), &dummy_store())
         .unwrap();
     let paths: Vec<_> = db
         .entries(v.id)
@@ -364,13 +400,13 @@ fn version_listing_latest_and_previous() {
 
     let store = dummy_store();
     let v1 = db
-        .insert_version(&new_version(p, "v1", vec![]), &store)
+        .insert_version_with(&new_version(p, "v1", vec![]), &store)
         .unwrap();
     let o1 = db
-        .insert_version(&new_version(other, "o1", vec![]), &store)
+        .insert_version_with(&new_version(other, "o1", vec![]), &store)
         .unwrap();
     let v2 = db
-        .insert_version(&new_version(p, "v2", vec![file_entry("x", b"x")]), &store)
+        .insert_version_with(&new_version(p, "v2", vec![file_entry("x", b"x")]), &store)
         .unwrap();
 
     let labels: Vec<_> = db
@@ -403,7 +439,7 @@ fn edit_and_delete_versions() {
     let db = Db::open_in_memory().unwrap();
     let p = add_project(&db, "p");
     let v = db
-        .insert_version(
+        .insert_version_with(
             &new_version(p, "v", vec![file_entry("f", b"f")]),
             &dummy_store(),
         )
@@ -433,9 +469,9 @@ fn deleting_a_project_cascades_but_keeps_blobs() {
     let keep = add_project(&db, "keep");
     let mut nv = new_version(p, "v", vec![file_entry("f", b"f")]);
     nv.new_blobs = vec![blob(b"f")];
-    db.insert_version(&nv, &dummy_store()).unwrap();
+    db.insert_version_with(&nv, &dummy_store()).unwrap();
     let nk = new_version(keep, "k", vec![file_entry("g", b"g")]);
-    db.insert_version(&nk, &dummy_store()).unwrap();
+    db.insert_version_with(&nk, &dummy_store()).unwrap();
 
     db.delete_project(p).unwrap();
     assert_eq!(count(&db, "versions"), 1);
@@ -457,7 +493,7 @@ fn failed_insert_leaves_nothing_behind() {
     ];
     let mut nv = new_version(p, "bad", entries);
     nv.new_blobs = vec![blob(b"a")];
-    let err = db.insert_version(&nv, &dummy_store()).unwrap_err();
+    let err = db.insert_version_with(&nv, &dummy_store()).unwrap_err();
     assert!(matches!(err, Error::InvalidInput(_)), "{err}");
     assert_eq!(count(&db, "versions"), 0);
     assert_eq!(count(&db, "entries"), 0);
@@ -470,13 +506,13 @@ fn failed_insert_leaves_nothing_behind() {
         vec![file_entry("a", b"a"), file_entry("b", b"b")],
     );
     nv.entries[1].size = u64::MAX;
-    assert!(db.insert_version(&nv, &dummy_store()).is_err());
+    assert!(db.insert_version_with(&nv, &dummy_store()).is_err());
     assert_eq!(count(&db, "versions"), 0);
     assert_eq!(count(&db, "entries"), 0);
 
     // The connection is still usable afterwards.
     let ok = new_version(p, "ok", vec![file_entry("a", b"a")]);
-    db.insert_version(&ok, &dummy_store()).unwrap();
+    db.insert_version_with(&ok, &dummy_store()).unwrap();
     assert_eq!(count(&db, "versions"), 1);
 }
 
@@ -484,7 +520,7 @@ fn failed_insert_leaves_nothing_behind() {
 fn version_for_unknown_project_is_not_found() {
     let db = Db::open_in_memory().unwrap();
     let err = db
-        .insert_version(&new_version(ProjectId(42), "v", vec![]), &dummy_store())
+        .insert_version_with(&new_version(ProjectId(42), "v", vec![]), &dummy_store())
         .unwrap_err();
     assert!(matches!(err, Error::NotFound(_)), "{err}");
 }
@@ -537,7 +573,7 @@ fn insert_10k_entries_is_fast() {
     nv.entries.sort_by(|a, b| a.path.cmp(&b.path));
     nv.new_blobs = (0..10_000u32).map(|i| blob(&i.to_le_bytes())).collect();
     let start = Instant::now();
-    let v = db.insert_version(&nv, &dummy_store()).unwrap();
+    let v = db.insert_version_with(&nv, &dummy_store()).unwrap();
     let took = start.elapsed();
     assert_eq!(db.entries(v.id).unwrap().len(), 10_000);
     // Target is < 150 ms; the bound is generous so slow CI machines do not flake.
@@ -570,7 +606,7 @@ fn change_token_sees_other_connection_writes() {
 
     let t0 = app.change_token().unwrap();
     let v = cli
-        .insert_version(&new_version(p, "from cli", vec![]), &dummy_store())
+        .insert_version_with(&new_version(p, "from cli", vec![]), &dummy_store())
         .unwrap();
     let t1 = app.change_token().unwrap();
     assert_ne!(t0, t1, "insert from another connection");
@@ -591,4 +627,194 @@ fn change_token_sees_own_writes() {
     assert_ne!(t0, t1);
     db.set_project_name(p, "q").unwrap();
     assert_ne!(db.change_token().unwrap(), t1);
+}
+
+// ---- DSNA-82: blob lifetime protocol ----
+
+/// Two handles on one file, as the CLI and the app would have, plus a version that used to
+/// reference blob X and was deleted, leaving X recorded but unreferenced.
+fn two_handles_with_unreferenced_x() -> (tempfile::TempDir, Db, Db, ProjectId, BlobHash) {
+    let (dir, path) = temp_db();
+    let snap_side = Db::open(&path).unwrap();
+    let prune_side = Db::open(&path).unwrap();
+    let p = add_project(&snap_side, "p");
+    let x = BlobHash::of(b"x");
+    let mut old = new_version(p, "old", vec![file_entry("f", b"x")]);
+    old.new_blobs = vec![blob(b"x")];
+    let old = snap_side.insert_version_with(&old, &dummy_store()).unwrap();
+    snap_side.delete_version(old.id).unwrap();
+    assert!(!snap_side.blob_referenced(&x).unwrap());
+    (dir, snap_side, prune_side, p, x)
+}
+
+#[test]
+fn prune_then_insert_referencing_pruned_blob_is_blob_missing() {
+    let (_dir, snap_side, prune_side, p, x) = two_handles_with_unreferenced_x();
+    let files = FakeFiles::with(&[x]);
+
+    // Snapshot side: X's file exists, so `Store::put` dedupes and X is not in new_blobs.
+    let nv = new_version(p, "dedupe", vec![file_entry("f", b"x")]);
+
+    // Prune side runs to completion first.
+    let report = prune_side
+        .prune_unreferenced_with(&files, PRUNE_BATCH)
+        .unwrap();
+    assert_eq!(report.blobs_pruned, 1);
+    assert_eq!(report.bytes_freed, 100);
+    assert_eq!(report.versions_deleted, 0);
+    assert!(!files.has(&x));
+
+    // Then the snapshot commits: it must fail and commit nothing.
+    let err = snap_side.insert_version_with(&nv, &files).unwrap_err();
+    assert!(matches!(err, Error::BlobMissing(h) if h == x), "{err}");
+    assert_eq!(count(&snap_side, "versions"), 0);
+    assert_eq!(count(&snap_side, "entries"), 0);
+    assert_eq!(count(&snap_side, "blobs"), 0);
+    assert_eq!(snap_side.latest_version(p).unwrap(), None);
+
+    // Retry after re-storing X (protocol step 3) succeeds.
+    files.present.lock().unwrap().insert(x);
+    let mut retry = nv.clone();
+    retry.new_blobs = vec![blob(b"x")];
+    snap_side.insert_version_with(&retry, &files).unwrap();
+    assert!(snap_side.blob_referenced(&x).unwrap());
+}
+
+#[test]
+fn insert_then_prune_keeps_referenced_blob() {
+    let (_dir, snap_side, prune_side, p, x) = two_handles_with_unreferenced_x();
+    let files = FakeFiles::with(&[x]);
+
+    let nv = new_version(p, "dedupe", vec![file_entry("f", b"x")]);
+    snap_side.insert_version_with(&nv, &files).unwrap();
+
+    let report = prune_side
+        .prune_unreferenced_with(&files, PRUNE_BATCH)
+        .unwrap();
+    assert_eq!(report, RetentionReport::default());
+    assert!(files.has(&x));
+    assert!(files.deleted.lock().unwrap().is_empty());
+    assert_eq!(count(&prune_side, "blobs"), 1);
+}
+
+#[test]
+fn insert_waits_for_a_prune_holding_the_write_lock() {
+    // The prune side holds BEGIN IMMEDIATE while it deletes X; the snapshot side's insert
+    // must block on the lock and then see X gone, never commit a dangling reference.
+    let (_dir, snap_side, prune_side, p, x) = two_handles_with_unreferenced_x();
+    let files = std::sync::Arc::new(FakeFiles::with(&[x]));
+
+    let mut conn = prune_side.conn();
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .unwrap();
+
+    let insert = {
+        let files = files.clone();
+        let nv = new_version(p, "dedupe", vec![file_entry("f", b"x")]);
+        thread::spawn(move || snap_side.insert_version_with(&nv, &*files).map(|_| ()))
+    };
+    thread::sleep(std::time::Duration::from_millis(200));
+    assert!(!insert.is_finished(), "insert must wait for the write lock");
+
+    files.delete(&x).unwrap();
+    tx.execute("DELETE FROM blobs WHERE hash = ?1", [x.0.as_slice()])
+        .unwrap();
+    tx.commit().unwrap();
+    drop(conn);
+
+    let err = insert.join().unwrap().unwrap_err();
+    assert!(matches!(err, Error::BlobMissing(h) if h == x), "{err}");
+    assert_eq!(count(&prune_side, "versions"), 0);
+}
+
+#[test]
+fn blob_check_only_applies_to_unreferenced_blobs() {
+    let db = Db::open_in_memory().unwrap();
+    let p = add_project(&db, "p");
+    let a = BlobHash::of(b"a");
+    let files = FakeFiles::with(&[a]);
+    let v1 = new_version(p, "v1", vec![file_entry("a", b"a")]);
+    db.insert_version_with(&v1, &files).unwrap();
+    // A blob an existing entry references cannot be pruned, so it is not checked.
+    files.present.lock().unwrap().clear();
+    let v2 = new_version(p, "v2", vec![file_entry("a2", b"a")]);
+    db.insert_version_with(&v2, &files).unwrap();
+    // A new blob missing from the store is rejected.
+    let v3 = new_version(p, "v3", vec![file_entry("b", b"b")]);
+    let err = db.insert_version_with(&v3, &files).unwrap_err();
+    assert!(matches!(err, Error::BlobMissing(h) if h == BlobHash::of(b"b")));
+    // Dirs and symlinks carry no blob and need no check.
+    let dir = Entry {
+        path: rp("d"),
+        kind: EntryKind::Dir,
+        blob: None,
+        size: 0,
+        mtime_ns: 0,
+        readonly: false,
+    };
+    db.insert_version_with(&new_version(p, "v4", vec![dir]), &files)
+        .unwrap();
+}
+
+#[test]
+fn prune_respects_limit_and_reports() {
+    let db = Db::open_in_memory().unwrap();
+    let hashes: Vec<_> = (0..5u8).map(|i| BlobHash::of(&[i])).collect();
+    for i in 0..5u8 {
+        db.insert_blob(&blob(&[i])).unwrap();
+    }
+    let p = add_project(&db, "p");
+    // Blob 0 stays referenced.
+    let v = new_version(p, "v", vec![file_entry("f", &[0])]);
+    db.insert_version_with(&v, &dummy_store()).unwrap();
+    let files = FakeFiles::with(&hashes);
+
+    let r = db.prune_unreferenced_with(&files, 3).unwrap();
+    assert_eq!((r.blobs_pruned, r.bytes_freed), (3, 300));
+    let r = db.prune_unreferenced_with(&files, 3).unwrap();
+    assert_eq!((r.blobs_pruned, r.bytes_freed), (1, 100));
+    let r = db.prune_unreferenced_with(&files, 3).unwrap();
+    assert_eq!(r.blobs_pruned, 0);
+    assert_eq!(
+        db.prune_unreferenced_with(&files, 0).unwrap().blobs_pruned,
+        0
+    );
+
+    assert!(files.has(&hashes[0]));
+    assert_eq!(files.present.lock().unwrap().len(), 1);
+    assert!(db.blob_referenced(&hashes[0]).unwrap());
+    assert!(!db.blob_referenced(&hashes[1]).unwrap());
+    assert!(db.unreferenced_blobs().unwrap().is_empty());
+}
+
+#[test]
+fn prune_of_rows_whose_files_are_gone_frees_zero_bytes() {
+    // A prune that crashed after deleting files leaves rows; the next prune clears them.
+    let db = Db::open_in_memory().unwrap();
+    db.insert_blob(&blob(b"gone")).unwrap();
+    let files = FakeFiles::default();
+    let r = db.prune_unreferenced_with(&files, PRUNE_BATCH).unwrap();
+    assert_eq!((r.blobs_pruned, r.bytes_freed), (1, 0));
+    assert_eq!(count(&db, "blobs"), 0);
+}
+
+#[test]
+fn failed_store_delete_rolls_back_the_batch() {
+    struct Failing;
+    impl BlobFiles for Failing {
+        fn contains(&self, _: &BlobHash) -> bool {
+            true
+        }
+        fn delete(&self, _: &BlobHash) -> crate::Result<u64> {
+            Err(Error::io("objects/xx", std::io::Error::other("denied")))
+        }
+    }
+    let db = Db::open_in_memory().unwrap();
+    db.insert_blob(&blob(b"a")).unwrap();
+    assert!(matches!(
+        db.prune_unreferenced_with(&Failing, PRUNE_BATCH),
+        Err(Error::Io { .. })
+    ));
+    assert_eq!(count(&db, "blobs"), 1);
 }

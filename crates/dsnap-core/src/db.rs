@@ -25,14 +25,12 @@
 //! files. Those rows are unreferenced, so step 2 catches any reuse and the next prune removes
 //! them (`Store::delete` of a missing file returns `Ok(0)`). Keep prune batches small (see
 //! `limit`) so the write lock is not held for longer than the busy timeout.
-#![allow(unused_variables)] // DSNA-82 stubs below; removed when implemented
-
 mod codec;
 mod schema;
 #[cfg(test)]
 mod tests;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -52,6 +50,12 @@ use codec::{
     blob_from_row, blob_row, entry_kind_to_sql, root_to_sql, settings_from_sql, settings_to_sql,
     u64_to_sql, version_kind_to_sql,
 };
+
+/// Blobs deleted per [`Db::prune_unreferenced`] call when pruning everything in batches.
+///
+/// Small enough that one batch (one store file delete per blob) finishes well inside the
+/// 5 s busy timeout another process waits for the write lock.
+pub const PRUNE_BATCH: usize = 256;
 
 /// Key of the global settings row in the `settings` table.
 const GLOBAL_SETTINGS_KEY: &str = "global";
@@ -220,7 +224,19 @@ impl Db {
     /// no existing entry references; otherwise rolls back with [`crate::Error::BlobMissing`]
     /// (see the module docs).
     pub fn insert_version(&self, v: &NewVersion, store: &Store) -> Result<Version> {
-        self.write(|tx| insert_version_tx(tx, v))
+        self.insert_version_with(v, store)
+    }
+
+    /// [`Db::insert_version`] against any [`BlobFiles`] (tests use a fake store).
+    pub(crate) fn insert_version_with(
+        &self,
+        v: &NewVersion,
+        files: &dyn BlobFiles,
+    ) -> Result<Version> {
+        self.write(|tx| {
+            check_new_blobs_present(tx, v, files)?;
+            insert_version_tx(tx, v)
+        })
     }
 
     /// Load one version.
@@ -353,13 +369,50 @@ impl Db {
     /// Delete up to `limit` unreferenced blobs (store file and row) in one `BEGIN IMMEDIATE`
     /// transaction. This is the only code path that deletes blob files (see the module docs).
     /// Returns `versions_deleted: 0` plus the blobs and bytes freed.
+    ///
+    /// Call it repeatedly with [`PRUNE_BATCH`] until `blobs_pruned` is 0 to prune everything.
+    /// If a store delete fails, the transaction rolls back and the error is returned; files
+    /// already deleted leave unreferenced rows that the next prune removes.
     pub fn prune_unreferenced(&self, store: &Store, limit: usize) -> Result<RetentionReport> {
-        todo!("DSNA-82")
+        self.prune_unreferenced_with(store, limit)
+    }
+
+    /// [`Db::prune_unreferenced`] against any [`BlobFiles`] (tests use a fake store).
+    pub(crate) fn prune_unreferenced_with(
+        &self,
+        files: &dyn BlobFiles,
+        limit: usize,
+    ) -> Result<RetentionReport> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        self.write(|tx| {
+            let hashes = {
+                let mut stmt = tx.prepare_cached(
+                    "SELECT hash FROM blobs b
+                     WHERE NOT EXISTS (SELECT 1 FROM entries e WHERE e.blob_hash = b.hash)
+                     ORDER BY hash LIMIT ?1",
+                )?;
+                let rows = stmt
+                    .query_map([limit], |r| r.get::<_, Vec<u8>>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                rows.into_iter()
+                    .map(codec::hash_from_sql)
+                    .collect::<Result<Vec<_>>>()?
+            };
+            let mut report = RetentionReport::default();
+            let mut delete_row = tx.prepare_cached("DELETE FROM blobs WHERE hash = ?1")?;
+            for hash in &hashes {
+                report.bytes_freed = report.bytes_freed.saturating_add(files.delete(hash)?);
+                delete_row.execute([hash.0.as_slice()])?;
+                report.blobs_pruned = report.blobs_pruned.saturating_add(1);
+            }
+            Ok(report)
+        })
     }
 
     /// Whether any entry references `hash`.
     pub fn blob_referenced(&self, hash: &BlobHash) -> Result<bool> {
-        todo!("DSNA-82")
+        let conn = self.conn();
+        is_referenced(&conn, hash)
     }
 
     /// Stored global settings (defaults if never set; missing fields take their defaults).
@@ -408,6 +461,48 @@ impl Dsnap {
     pub fn db_change_token(&self) -> Result<i64> {
         self.db.change_token()
     }
+}
+
+/// Blob file access used by the lifetime protocol. [`Store`] is the real implementation.
+pub(crate) trait BlobFiles {
+    /// Whether the blob file exists.
+    fn contains(&self, hash: &BlobHash) -> bool;
+    /// Delete the blob file; bytes freed (0 if absent).
+    fn delete(&self, hash: &BlobHash) -> Result<u64>;
+}
+
+impl BlobFiles for Store {
+    fn contains(&self, hash: &BlobHash) -> bool {
+        Store::contains(self, hash)
+    }
+
+    fn delete(&self, hash: &BlobHash) -> Result<u64> {
+        Store::delete(self, hash)
+    }
+}
+
+/// Protocol step 2 (module docs): every blob the new entries use that no committed entry
+/// references must still exist in the store. Runs under the write lock, before the new
+/// entries are inserted, so a concurrent prune either finished (and the check sees the file
+/// gone) or cannot start until this transaction ends.
+fn check_new_blobs_present(
+    tx: &Transaction<'_>,
+    v: &NewVersion,
+    files: &dyn BlobFiles,
+) -> Result<()> {
+    let mut seen = HashSet::new();
+    for hash in v.entries.iter().filter_map(|e| e.blob.as_ref()) {
+        if seen.insert(*hash) && !is_referenced(tx, hash)? && !files.contains(hash) {
+            return Err(Error::BlobMissing(*hash));
+        }
+    }
+    Ok(())
+}
+
+fn is_referenced(conn: &Connection, hash: &BlobHash) -> Result<bool> {
+    let mut stmt =
+        conn.prepare_cached("SELECT EXISTS (SELECT 1 FROM entries WHERE blob_hash = ?1)")?;
+    Ok(stmt.query_row([hash.0.as_slice()], |r| r.get(0))?)
 }
 
 fn insert_version_tx(tx: &Transaction<'_>, v: &NewVersion) -> Result<Version> {
