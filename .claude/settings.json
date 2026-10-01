@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__andare",
+      "Bash(cargo:*)",
+      "Bash(rustup:*)",
+      "Bash(npm:*)",
+      "Bash(npx:*)",
+      "Bash(git:*)",
+      "Bash(gh run:*)",
+      "Bash(gh repo view:*)"
+    ],
+    "deny": [
+      "mcp__andare__delete_issue",
+      "Bash(git push --force origin main:*)",
+      "Bash(git push -f origin main:*)",
+      "Bash(git push origin +main:*)"
+    ]
+  }
+}
