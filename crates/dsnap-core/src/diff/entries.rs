@@ -179,8 +179,11 @@ fn renamed(o: &Entry, n: &Entry) -> FileChange {
 /// kind (DSNA-89: on a case-insensitive file system both names are one file, so a delete plus
 /// an add would be wrong). Paired entries are removed from `deleted` and `added`.
 ///
-/// Pairing is one-to-one. For each added path (in path order) the best free candidate wins:
-/// identical content, then the same kind, then old path order. So it is deterministic.
+/// Pairing is one-to-one and runs in three passes over all added paths: identical content,
+/// then the same kind, then anything. Within a pass, each free added path (in path order)
+/// takes the first free fold-equal old path (in path order). So an exact-content match is
+/// never taken by an earlier added path that only matches by case (DSNA-95), and the result
+/// is deterministic.
 fn pair_case_renames<'a>(
     deleted: &mut Vec<&'a Entry>,
     added: &mut Vec<&'a Entry>,
@@ -193,29 +196,32 @@ fn pair_case_renames<'a>(
     for (i, o) in deleted.iter().enumerate() {
         by_key.entry(fold(&o.path)).or_default().push(i);
     }
+    let cands: Vec<Option<&Vec<usize>>> =
+        added.iter().map(|n| by_key.get(&fold(&n.path))).collect();
+    // Pass 0: identical content; pass 1: same kind; pass 2: anything.
+    let accept = |pass: u8, o: &Entry, n: &Entry| match pass {
+        0 => same_content(o, n),
+        1 => std::mem::discriminant(&o.kind) == std::mem::discriminant(&n.kind),
+        _ => true,
+    };
     let mut used_old = vec![false; deleted.len()];
     let mut used_new = vec![false; added.len()];
-    for (j, n) in added.iter().enumerate() {
-        let Some(cands) = by_key.get(&fold(&n.path)) else {
-            continue;
-        };
-        let rank = |i: usize| {
-            let o = deleted[i];
-            (
-                !same_content(o, n),
-                std::mem::discriminant(&o.kind) != std::mem::discriminant(&n.kind),
-                i,
-            )
-        };
-        if let Some(i) = cands
-            .iter()
-            .copied()
-            .filter(|&i| !used_old[i])
-            .min_by_key(|&i| rank(i))
-        {
-            used_old[i] = true;
-            used_new[j] = true;
-            out.push(renamed(deleted[i], n));
+    for pass in 0..3u8 {
+        for (j, n) in added.iter().enumerate() {
+            let Some(olds) = cands[j] else {
+                continue;
+            };
+            if used_new[j] {
+                continue;
+            }
+            if let Some(&i) = olds
+                .iter()
+                .find(|&&i| !used_old[i] && accept(pass, deleted[i], n))
+            {
+                used_old[i] = true;
+                used_new[j] = true;
+                out.push(renamed(deleted[i], n));
+            }
         }
     }
     retain_unused(deleted, &used_old);
@@ -666,6 +672,26 @@ mod tests {
             got,
             owned(vec![("FOO", "D"), ("fOO", "D"), ("foo", "R<-FoO")])
         );
+    }
+
+    #[test]
+    fn case_pairing_exact_content_is_not_taken_by_earlier_path() {
+        // DSNA-95: `aB` comes first but has no exact match; it must not take `AB`, the exact
+        // match of `ab`.
+        let old = vec![file("AB", "x"), file("Ab", "y")];
+        let new = vec![file("aB", "z"), file("ab", "x")];
+        let got = summary(&diff_entries(&old, &new, CI));
+        assert_eq!(got, owned(vec![("aB", "R<-Ab"), ("ab", "R<-AB")]));
+    }
+
+    #[test]
+    fn case_pairing_same_kind_is_not_taken_by_earlier_path() {
+        // `aB` (a dir) has no same-kind candidate; it must not take `AB`, the only symlink
+        // candidate of `ab`.
+        let old = vec![link("AB", "t"), file("Ab", "x")];
+        let new = vec![dir("aB"), link("ab", "u")];
+        let got = summary(&diff_entries(&old, &new, CI));
+        assert_eq!(got, owned(vec![("aB", "R<-Ab"), ("ab", "R<-AB")]));
     }
 
     #[test]
