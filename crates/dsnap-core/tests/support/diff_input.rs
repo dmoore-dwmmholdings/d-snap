@@ -50,25 +50,69 @@ pub fn source() -> Vec<u8> {
     out.into_bytes()
 }
 
+/// An edited copy of a file plus the size of the edit that made it.
+pub struct Edited {
+    /// New file content.
+    pub bytes: Vec<u8>,
+    /// Lines the edit added.
+    pub added: u32,
+    /// Lines the edit removed.
+    pub removed: u32,
+}
+
 /// `source` with `percent`% of its lines changed at scattered positions: a mix of
-/// modifications (most), deletions and insertions.
-pub fn modified(source: &[u8], percent: u32) -> Vec<u8> {
+/// modifications (most), deletions and insertions. Changed lines are unique.
+pub fn modified(source: &[u8], percent: u32) -> Edited {
+    edit(source, percent, |n, rng| {
+        format!("changed line {n} {}\n", rng.next() % 1000)
+    })
+}
+
+/// CSV-like data: `rows` lines drawn from `distinct` different values, so almost no line is
+/// unique. About 6 bytes per row.
+pub fn data_rows(rows: usize, distinct: u64) -> Vec<u8> {
+    let mut rng = Rng(0x2545_F491_4F6C_DD1D ^ distinct);
+    let mut out = String::with_capacity(rows * 8);
+    for _ in 0..rows {
+        let v = rng.next() % distinct;
+        out.push_str(&format!("{},{}\n", v / 3, v % 3));
+    }
+    out.into_bytes()
+}
+
+/// `data_rows` output with `percent`% of rows edited; replacement rows repeat too.
+pub fn data_modified(source: &[u8], percent: u32) -> Edited {
+    edit(source, percent, |_, rng| {
+        format!("{},x\n", rng.next() % 1000)
+    })
+}
+
+fn edit(source: &[u8], percent: u32, mut changed: impl FnMut(usize, &mut Rng) -> String) -> Edited {
     let text = String::from_utf8_lossy(source);
     let mut rng = Rng(0xD1B5_4A32_D192_ED03 ^ u64::from(percent));
     let mut out = String::with_capacity(source.len() + source.len() / 10);
+    let (mut added, mut removed) = (0, 0);
     for (n, line) in text.split_inclusive('\n').enumerate() {
         if rng.next() % 100 >= u64::from(percent) {
             out.push_str(line);
             continue;
         }
         match rng.next() % 10 {
-            0 => {} // delete
+            0 => removed += 1,
             1 => {
                 out.push_str(line);
                 out.push_str(&format!("inserted line after {n}\n"));
+                added += 1;
             }
-            _ => out.push_str(&format!("changed line {n} {}\n", rng.next() % 1000)),
+            _ => {
+                out.push_str(&changed(n, &mut rng));
+                (added, removed) = (added + 1, removed + 1);
+            }
         }
     }
-    out.into_bytes()
+    Edited {
+        bytes: out.into_bytes(),
+        added,
+        removed,
+    }
 }

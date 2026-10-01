@@ -6,6 +6,7 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::ops::Range;
 use std::time::{Duration, Instant};
 
@@ -223,65 +224,172 @@ impl<'a> Prepared<'a> {
     }
 }
 
-/// Patience-anchored diff of two key sequences.
+/// Gaps with at most this many old × new lines go straight to Myers.
+const SMALL_GAP: usize = 64 * 64;
+
+/// Longest run of lines tried as an anchor when no single line is unique.
+const MAX_RUN: usize = 16;
+
+/// Recursion limit for [`diff_range`]; past it, Myers diffs what is left.
+const MAX_DEPTH: u32 = 48;
+
+/// Recursive anchored diff of two key sequences.
 ///
-/// Lines that occur exactly once on each side are matched up by a longest increasing
-/// subsequence (O(n log n)); the gaps between those anchors are diffed with Myers. Plain
-/// Myers is O(N·D), which is too slow when many lines change across a large file (DSNA-40);
-/// `similar`'s own Patience runs Myers over all unique lines and degrades the same way.
+/// Each range is trimmed of its common prefix and suffix. Lines that occur exactly once on
+/// each side of the range are matched up by a longest increasing subsequence (patience,
+/// O(n log n)), and each gap between those anchors is diffed the same way. When no line is
+/// unique in a range (data files with many repeated lines), runs of 2, 4, 8 and 16 lines are
+/// tried as anchors instead. Only small gaps, or gaps with no anchors at all, go to Myers.
+///
+/// Plain Myers is O(N·D): too slow when many lines change across a large file, and past the
+/// deadline it reports the whole remaining range as replaced (DSNA-40).
 fn diff_keys(old: &[u32], new: &[u32], deadline: Option<Instant>) -> Vec<DiffOp> {
     let mut ops = Vec::new();
-    let (mut o, mut n) = (0usize, 0usize);
-    for (ao, an) in unique_anchors(old, new) {
-        ops.extend(similar::capture_diff_deadline(
-            Algorithm::Myers,
-            old,
-            o..ao,
-            new,
-            n..an,
-            deadline,
-        ));
+    diff_range(old, 0..old.len(), new, 0..new.len(), deadline, 0, &mut ops);
+    normalize_ops(ops)
+}
+
+fn diff_range(
+    old: &[u32],
+    mut o: Range<usize>,
+    new: &[u32],
+    mut n: Range<usize>,
+    deadline: Option<Instant>,
+    depth: u32,
+    ops: &mut Vec<DiffOp>,
+) {
+    let prefix = old[o.clone()]
+        .iter()
+        .zip(&new[n.clone()])
+        .take_while(|(a, b)| a == b)
+        .count();
+    if prefix > 0 {
         ops.push(DiffOp::Equal {
-            old_index: ao,
-            new_index: an,
-            len: 1,
+            old_index: o.start,
+            new_index: n.start,
+            len: prefix,
         });
-        (o, n) = (ao + 1, an + 1);
+        o.start += prefix;
+        n.start += prefix;
+    }
+    let suffix = old[o.clone()]
+        .iter()
+        .rev()
+        .zip(new[n.clone()].iter().rev())
+        .take_while(|(a, b)| a == b)
+        .count();
+    o.end -= suffix;
+    n.end -= suffix;
+    diff_middle(old, o.clone(), new, n.clone(), deadline, depth, ops);
+    if suffix > 0 {
+        ops.push(DiffOp::Equal {
+            old_index: o.end,
+            new_index: n.end,
+            len: suffix,
+        });
+    }
+}
+
+/// Diff a range whose first and last lines differ.
+fn diff_middle(
+    old: &[u32],
+    o: Range<usize>,
+    new: &[u32],
+    n: Range<usize>,
+    deadline: Option<Instant>,
+    depth: u32,
+    ops: &mut Vec<DiffOp>,
+) {
+    if o.is_empty() || n.is_empty() {
+        if !o.is_empty() {
+            ops.push(DiffOp::Delete {
+                old_index: o.start,
+                old_len: o.len(),
+                new_index: n.start,
+            });
+        } else if !n.is_empty() {
+            ops.push(DiffOp::Insert {
+                old_index: o.start,
+                new_index: n.start,
+                new_len: n.len(),
+            });
+        }
+        return;
+    }
+    if o.len().saturating_mul(n.len()) > SMALL_GAP && depth < MAX_DEPTH {
+        let mut run = 1;
+        loop {
+            let found = anchors(&old[o.clone()], &new[n.clone()], run);
+            if !found.is_empty() {
+                let (mut oc, mut nc) = (o.start, n.start);
+                for (ao, an) in found {
+                    let (ao, an) = (o.start + ao, n.start + an);
+                    diff_range(old, oc..ao, new, nc..an, deadline, depth + 1, ops);
+                    ops.push(DiffOp::Equal {
+                        old_index: ao,
+                        new_index: an,
+                        len: run,
+                    });
+                    (oc, nc) = (ao + run, an + run);
+                }
+                diff_range(old, oc..o.end, new, nc..n.end, deadline, depth + 1, ops);
+                return;
+            }
+            if run >= MAX_RUN || run * 2 > o.len().min(n.len()) {
+                break;
+            }
+            run *= 2;
+        }
     }
     ops.extend(similar::capture_diff_deadline(
         Algorithm::Myers,
         old,
-        o..old.len(),
+        o,
         new,
-        n..new.len(),
+        n,
         deadline,
     ));
-    normalize_ops(ops)
 }
 
-/// `(old_index, new_index)` pairs of lines unique on both sides, forming the longest chain
-/// increasing on both sides.
-fn unique_anchors(old: &[u32], new: &[u32]) -> Vec<(usize, usize)> {
+/// Anchors for a range: `(old_index, new_index)` starts of `run`-line windows that occur
+/// exactly once on each side, forming the longest chain increasing on both sides, with no two
+/// anchors overlapping. Indices are relative to the slices.
+fn anchors(old: &[u32], new: &[u32], run: usize) -> Vec<(usize, usize)> {
     const NONE: usize = usize::MAX;
-    let n_keys = old.iter().chain(new).max().map_or(0, |&m| m as usize + 1);
-    // Per key: count and position on each side (position valid when the count is 1).
-    let mut old_count = vec![0u8; n_keys];
-    let mut new_count = vec![0u8; n_keys];
-    let mut new_pos = vec![NONE; n_keys];
-    for &k in old {
-        let c = &mut old_count[k as usize];
-        *c = c.saturating_add(1);
+    #[derive(Default)]
+    struct Slot {
+        old_count: u32,
+        new_count: u32,
+        new_pos: usize,
     }
-    for (i, &k) in new.iter().enumerate() {
-        let c = &mut new_count[k as usize];
-        *c = c.saturating_add(1);
-        new_pos[k as usize] = i;
+    if run == 0 || old.len() < run || new.len() < run {
+        return Vec::new();
     }
-    let pairs: Vec<(usize, usize)> = old
+    let old_hashes: Vec<u64> = old.windows(run).map(window_hash).collect();
+    let mut slots: HashMap<u64, Slot, BuildHasherDefault<IdHasher>> =
+        HashMap::with_capacity_and_hasher(old_hashes.len(), BuildHasherDefault::default());
+    for &h in &old_hashes {
+        let s = slots.entry(h).or_default();
+        s.old_count = s.old_count.saturating_add(1);
+    }
+    for (j, w) in new.windows(run).enumerate() {
+        if let Some(s) = slots.get_mut(&window_hash(w)) {
+            s.new_count = s.new_count.saturating_add(1);
+            s.new_pos = j;
+        }
+    }
+    // A hash collision within one side only makes a window look repeated. Across sides it
+    // could pair different windows, so the windows themselves are compared before pairing.
+    let pairs: Vec<(usize, usize)> = old_hashes
         .iter()
         .enumerate()
-        .filter(|&(_, &k)| old_count[k as usize] == 1 && new_count[k as usize] == 1)
-        .map(|(i, &k)| (i, new_pos[k as usize]))
+        .filter_map(|(i, h)| {
+            let s = slots.get(h)?;
+            (s.old_count == 1
+                && s.new_count == 1
+                && old.get(i..i + run) == new.get(s.new_pos..s.new_pos + run))
+            .then_some((i, s.new_pos))
+        })
         .collect();
 
     // Patience sorting: tails[l] = index into `pairs` of the smallest new_index ending an
@@ -306,7 +414,43 @@ fn unique_anchors(old: &[u32], new: &[u32]) -> Vec<(usize, usize)> {
         cur = prev[cur];
     }
     chain.reverse();
+    if run > 1 {
+        let mut next = (0, 0);
+        chain.retain(|&(o, n)| {
+            let keep = o >= next.0 && n >= next.1;
+            if keep {
+                next = (o + run, n + run);
+            }
+            keep
+        });
+    }
     chain
+}
+
+fn window_hash(keys: &[u32]) -> u64 {
+    keys.iter().fold(0xCBF2_9CE4_8422_2325, |h: u64, &k| {
+        (h.rotate_left(5) ^ u64::from(k)).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+    })
+}
+
+/// Pass-through hasher for keys that are already well-mixed `u64` hashes.
+#[derive(Default)]
+struct IdHasher(u64);
+
+impl Hasher for IdHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0.rotate_left(8) ^ u64::from(b)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        }
+    }
+
+    fn write_u64(&mut self, n: u64) {
+        self.0 = n;
+    }
 }
 
 /// Rewrite the op indices from a running cursor, drop empty ops and join adjacent `Equal`
@@ -788,10 +932,21 @@ mod tests {
             seed ^= seed << 17;
             seed % m
         };
-        for _ in 0..200 {
+        for case in 0..300 {
             // Small alphabets give many duplicate lines; larger ones give many anchors.
-            let alphabet = 2 + rnd(40);
-            let old: Vec<u32> = (0..rnd(60)).map(|_| rnd(alphabet) as u32).collect();
+            // Every third case is large enough to go through the anchor recursion (and,
+            // with a tiny alphabet, through multi-line run anchors) instead of plain Myers.
+            let alphabet = if case % 3 == 0 {
+                [2, 3, 8, 50, 5000][case / 3 % 5]
+            } else {
+                2 + rnd(40)
+            };
+            let len = if case % 3 == 0 {
+                200 + rnd(1500)
+            } else {
+                rnd(60)
+            };
+            let old: Vec<u32> = (0..len).map(|_| rnd(alphabet) as u32).collect();
             let mut new = Vec::new();
             for &k in &old {
                 match rnd(6) {
@@ -813,10 +968,25 @@ mod tests {
     fn anchors_skip_lines_repeated_on_either_side() {
         // 1 is unique on both sides; 2 repeats in old; 3 repeats in new; 4 moves.
         // (0, 1) and (4, 0) cross, so only one of them can be kept.
-        let anchors = unique_anchors(&[1, 2, 2, 3, 4, 5], &[4, 1, 3, 3, 5]);
+        let anchors = anchors(&[1, 2, 2, 3, 4, 5], &[4, 1, 3, 3, 5], 1);
         assert_eq!(anchors.len(), 2, "{anchors:?}");
         assert_eq!(anchors.last(), Some(&(5, 4)));
         assert!(anchors.iter().all(|&(o, _)| o == 0 || o == 4 || o == 5));
+    }
+
+    #[test]
+    fn run_anchors_are_used_when_no_line_is_unique() {
+        // Two values only: no single line is unique, but 4-line runs are.
+        let old: Vec<u32> = (0..64)
+            .map(|i| (0x9E37_79B9_7F4A_7C15u64 >> i) as u32 & 1)
+            .collect();
+        let found = (1..=MAX_RUN)
+            .map(|run| anchors(&old, &old, run))
+            .find(|a| !a.is_empty())
+            .unwrap();
+        assert!(found.windows(2).all(|w| w[0].0 < w[1].0));
+        assert!(anchors(&old, &old, 1).is_empty());
+        check_ops(&old, &old[1..]);
     }
 
     #[test]
