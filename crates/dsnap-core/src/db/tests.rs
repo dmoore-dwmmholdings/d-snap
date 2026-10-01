@@ -149,3 +149,400 @@ fn two_connections_write_under_contention_without_busy_errors() {
         .unwrap();
     assert_eq!(n, 2 * PER_THREAD);
 }
+
+// ---- DSNA-31: repository layer ----
+
+use std::path::PathBuf;
+use std::time::Instant;
+
+use crate::types::{AutoSnapshot, EntryKind};
+
+/// A store value for `insert_version`; DSNA-31 tests never touch its files.
+fn dummy_store() -> Store {
+    Store {
+        dir: PathBuf::from("unused-objects"),
+    }
+}
+
+fn rp(s: &str) -> RelPath {
+    RelPath::new(s).unwrap()
+}
+
+fn file_entry(path: &str, content: &[u8]) -> Entry {
+    Entry {
+        path: rp(path),
+        kind: EntryKind::File,
+        blob: Some(BlobHash::of(content)),
+        size: content.len() as u64,
+        mtime_ns: 1_700_000_000_000_000_000,
+        readonly: false,
+    }
+}
+
+fn blob(content: &[u8]) -> BlobInfo {
+    BlobInfo {
+        hash: BlobHash::of(content),
+        size: content.len() as u64,
+        stored_size: content.len() as u64 / 2,
+    }
+}
+
+fn new_version(project: ProjectId, label: &str, entries: Vec<Entry>) -> NewVersion {
+    NewVersion {
+        project_id: project,
+        label: label.into(),
+        created_at_ms: 1_700_000_000_000,
+        kind: VersionKind::Manual,
+        unstable: false,
+        counts: ChangeCounts::default(),
+        entries,
+        new_blobs: Vec::new(),
+    }
+}
+
+fn add_project(db: &Db, name: &str) -> ProjectId {
+    let root = std::env::temp_dir().join("dsnap-db-tests").join(name);
+    db.insert_project(name, &root, &ProjectSettings::default())
+        .unwrap()
+}
+
+fn count(db: &Db, table: &str) -> i64 {
+    db.conn()
+        .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+        .unwrap()
+}
+
+#[test]
+fn project_crud() {
+    let db = Db::open_in_memory().unwrap();
+    let root = PathBuf::from("/work/alpha");
+    let id = db
+        .insert_project("alpha", &root, &ProjectSettings::default())
+        .unwrap();
+    let p = db.get_project(id).unwrap();
+    assert_eq!(
+        (p.name.as_str(), p.root.as_path()),
+        ("alpha", root.as_path())
+    );
+    assert_eq!(p.settings, ProjectSettings::default());
+    assert!(!p.missing);
+
+    db.set_project_name(id, "Alpha 2").unwrap();
+    db.set_project_root(id, Path::new("/work/alpha2")).unwrap();
+    let settings = ProjectSettings {
+        extra_ignore: vec!["*.log".into()],
+        respect_gitignore: false,
+        auto_snapshot: AutoSnapshot::AfterIdle { secs: 30 },
+    };
+    db.set_project_settings(id, &settings).unwrap();
+    let p = db.get_project(id).unwrap();
+    assert_eq!(p.name, "Alpha 2");
+    assert_eq!(p.root, PathBuf::from("/work/alpha2"));
+    assert_eq!(p.settings, settings);
+
+    db.delete_project(id).unwrap();
+    assert!(matches!(db.get_project(id), Err(Error::NotFound(_))));
+    assert!(matches!(db.delete_project(id), Err(Error::NotFound(_))));
+    assert!(matches!(
+        db.set_project_name(id, "x"),
+        Err(Error::NotFound(_))
+    ));
+}
+
+#[test]
+fn duplicate_project_root_is_invalid_input() {
+    let db = Db::open_in_memory().unwrap();
+    let root = PathBuf::from("/work/same");
+    db.insert_project("a", &root, &ProjectSettings::default())
+        .unwrap();
+    let err = db
+        .insert_project("b", &root, &ProjectSettings::default())
+        .unwrap_err();
+    assert!(matches!(err, Error::InvalidInput(_)), "{err}");
+    let other = db
+        .insert_project("c", Path::new("/work/other"), &ProjectSettings::default())
+        .unwrap();
+    let err = db.set_project_root(other, &root).unwrap_err();
+    assert!(matches!(err, Error::InvalidInput(_)), "{err}");
+}
+
+#[test]
+fn projects_list_by_name() {
+    let db = Db::open_in_memory().unwrap();
+    for n in ["charlie", "Bravo", "alpha"] {
+        add_project(&db, n);
+    }
+    let names: Vec<_> = db
+        .list_projects()
+        .unwrap()
+        .into_iter()
+        .map(|p| p.name)
+        .collect();
+    assert_eq!(names, ["alpha", "Bravo", "charlie"]);
+}
+
+#[test]
+fn version_round_trip_and_entry_kinds() {
+    let db = Db::open_in_memory().unwrap();
+    let p = add_project(&db, "p");
+    let entries = vec![
+        Entry {
+            path: rp("a/dir"),
+            kind: EntryKind::Dir,
+            blob: None,
+            size: 0,
+            mtime_ns: -5,
+            readonly: false,
+        },
+        file_entry("a/file.txt", b"hello"),
+        Entry {
+            path: rp("link"),
+            kind: EntryKind::Symlink {
+                target: "../outside".into(),
+            },
+            blob: None,
+            size: 10,
+            mtime_ns: 7,
+            readonly: true,
+        },
+    ];
+    let mut nv = new_version(p, "first", entries.clone());
+    nv.kind = VersionKind::Safety;
+    nv.unstable = true;
+    nv.counts = ChangeCounts {
+        added: 3,
+        modified: 1,
+        deleted: 2,
+    };
+    nv.new_blobs = vec![blob(b"hello")];
+    let v = db.insert_version(&nv, &dummy_store()).unwrap();
+    assert_eq!(db.get_version(v.id).unwrap(), v);
+    assert_eq!(v.kind, VersionKind::Safety);
+    assert!(v.unstable && !v.pinned);
+    assert_eq!(v.counts.deleted, 2);
+    assert_eq!(db.entries(v.id).unwrap(), entries);
+    assert_eq!(
+        db.entry(v.id, &rp("link")).unwrap().as_ref(),
+        Some(&entries[2])
+    );
+    assert_eq!(db.entry(v.id, &rp("nope")).unwrap(), None);
+    assert_eq!(count(&db, "blobs"), 1);
+}
+
+#[test]
+fn entries_are_sorted_by_path() {
+    let db = Db::open_in_memory().unwrap();
+    let p = add_project(&db, "p");
+    let unsorted = vec![
+        file_entry("b", b"1"),
+        file_entry("a/z", b"2"),
+        file_entry("B", b"3"),
+        file_entry("a.txt", b"4"),
+    ];
+    let v = db
+        .insert_version(&new_version(p, "v", unsorted), &dummy_store())
+        .unwrap();
+    let paths: Vec<_> = db
+        .entries(v.id)
+        .unwrap()
+        .into_iter()
+        .map(|e| e.path)
+        .collect();
+    let mut expected = paths.clone();
+    expected.sort();
+    assert_eq!(paths, expected);
+    assert_eq!(paths[0].as_str(), "B");
+}
+
+#[test]
+fn version_listing_latest_and_previous() {
+    let db = Db::open_in_memory().unwrap();
+    let p = add_project(&db, "p");
+    let other = add_project(&db, "other");
+    assert_eq!(db.latest_version(p).unwrap(), None);
+    assert!(db.latest_entry_index(p).unwrap().is_empty());
+
+    let store = dummy_store();
+    let v1 = db
+        .insert_version(&new_version(p, "v1", vec![]), &store)
+        .unwrap();
+    let o1 = db
+        .insert_version(&new_version(other, "o1", vec![]), &store)
+        .unwrap();
+    let v2 = db
+        .insert_version(&new_version(p, "v2", vec![file_entry("x", b"x")]), &store)
+        .unwrap();
+
+    let labels: Vec<_> = db
+        .list_versions(p)
+        .unwrap()
+        .into_iter()
+        .map(|v| v.label)
+        .collect();
+    assert_eq!(labels, ["v2", "v1"]);
+    assert_eq!(db.latest_version(p).unwrap(), Some(v2.clone()));
+    assert_eq!(db.previous_version(v2.id).unwrap(), Some(v1.clone()));
+    assert_eq!(db.previous_version(v1.id).unwrap(), None);
+    assert_eq!(db.previous_version(o1.id).unwrap(), None);
+    assert!(matches!(
+        db.previous_version(VersionId(999)),
+        Err(Error::NotFound(_))
+    ));
+    assert!(matches!(
+        db.entries(VersionId(999)),
+        Err(Error::NotFound(_))
+    ));
+
+    let index = db.latest_entry_index(p).unwrap();
+    assert_eq!(index.len(), 1);
+    assert_eq!(index[&rp("x")], file_entry("x", b"x"));
+}
+
+#[test]
+fn edit_and_delete_versions() {
+    let db = Db::open_in_memory().unwrap();
+    let p = add_project(&db, "p");
+    let v = db
+        .insert_version(
+            &new_version(p, "v", vec![file_entry("f", b"f")]),
+            &dummy_store(),
+        )
+        .unwrap();
+    db.set_version_label(v.id, "renamed").unwrap();
+    db.set_version_pinned(v.id, true).unwrap();
+    let got = db.get_version(v.id).unwrap();
+    assert_eq!(got.label, "renamed");
+    assert!(got.pinned);
+    db.set_version_pinned(v.id, false).unwrap();
+    assert!(!db.get_version(v.id).unwrap().pinned);
+
+    db.delete_version(v.id).unwrap();
+    assert!(matches!(db.get_version(v.id), Err(Error::NotFound(_))));
+    assert_eq!(count(&db, "entries"), 0);
+    assert!(matches!(
+        db.set_version_label(v.id, "x"),
+        Err(Error::NotFound(_))
+    ));
+    assert!(matches!(db.delete_version(v.id), Err(Error::NotFound(_))));
+}
+
+#[test]
+fn deleting_a_project_cascades_but_keeps_blobs() {
+    let db = Db::open_in_memory().unwrap();
+    let p = add_project(&db, "p");
+    let keep = add_project(&db, "keep");
+    let mut nv = new_version(p, "v", vec![file_entry("f", b"f")]);
+    nv.new_blobs = vec![blob(b"f")];
+    db.insert_version(&nv, &dummy_store()).unwrap();
+    let nk = new_version(keep, "k", vec![file_entry("g", b"g")]);
+    db.insert_version(&nk, &dummy_store()).unwrap();
+
+    db.delete_project(p).unwrap();
+    assert_eq!(count(&db, "versions"), 1);
+    assert_eq!(count(&db, "entries"), 1);
+    assert_eq!(count(&db, "blobs"), 1);
+    assert_eq!(db.unreferenced_blobs().unwrap(), vec![blob(b"f")]);
+}
+
+#[test]
+fn failed_insert_leaves_nothing_behind() {
+    // Crash simulation: the version row and the first entries are written, then an entry
+    // fails (duplicate path) and the transaction is dropped. Nothing may remain.
+    let db = Db::open_in_memory().unwrap();
+    let p = add_project(&db, "p");
+    let entries = vec![
+        file_entry("a", b"a"),
+        file_entry("b", b"b"),
+        file_entry("a", b"again"),
+    ];
+    let mut nv = new_version(p, "bad", entries);
+    nv.new_blobs = vec![blob(b"a")];
+    let err = db.insert_version(&nv, &dummy_store()).unwrap_err();
+    assert!(matches!(err, Error::InvalidInput(_)), "{err}");
+    assert_eq!(count(&db, "versions"), 0);
+    assert_eq!(count(&db, "entries"), 0);
+    assert_eq!(count(&db, "blobs"), 0);
+
+    // An out-of-range value late in the list fails the same way.
+    let mut nv = new_version(
+        p,
+        "bad2",
+        vec![file_entry("a", b"a"), file_entry("b", b"b")],
+    );
+    nv.entries[1].size = u64::MAX;
+    assert!(db.insert_version(&nv, &dummy_store()).is_err());
+    assert_eq!(count(&db, "versions"), 0);
+    assert_eq!(count(&db, "entries"), 0);
+
+    // The connection is still usable afterwards.
+    let ok = new_version(p, "ok", vec![file_entry("a", b"a")]);
+    db.insert_version(&ok, &dummy_store()).unwrap();
+    assert_eq!(count(&db, "versions"), 1);
+}
+
+#[test]
+fn version_for_unknown_project_is_not_found() {
+    let db = Db::open_in_memory().unwrap();
+    let err = db
+        .insert_version(&new_version(ProjectId(42), "v", vec![]), &dummy_store())
+        .unwrap_err();
+    assert!(matches!(err, Error::NotFound(_)), "{err}");
+}
+
+#[test]
+fn blobs_insert_is_idempotent() {
+    let db = Db::open_in_memory().unwrap();
+    db.insert_blob(&blob(b"x")).unwrap();
+    db.insert_blob(&blob(b"x")).unwrap();
+    assert_eq!(count(&db, "blobs"), 1);
+    assert_eq!(db.unreferenced_blobs().unwrap(), vec![blob(b"x")]);
+}
+
+#[test]
+fn global_settings_default_and_round_trip() {
+    let (_dir, path) = temp_db();
+    let db = Db::open(&path).unwrap();
+    assert_eq!(db.global_settings().unwrap(), GlobalSettings::default());
+    let s = GlobalSettings {
+        size_cap_bytes: 1234,
+        retention_keep: 7,
+    };
+    db.set_global_settings(&s).unwrap();
+    db.set_global_settings(&s).unwrap();
+    drop(db);
+    let db = Db::open(&path).unwrap();
+    assert_eq!(db.global_settings().unwrap(), s);
+
+    // Fields missing from the stored JSON take their defaults.
+    db.conn()
+        .execute(
+            r#"UPDATE settings SET value_json = '{"retentionKeep": 3}' WHERE key = 'global'"#,
+            [],
+        )
+        .unwrap();
+    let got = db.global_settings().unwrap();
+    assert_eq!(got.retention_keep, 3);
+    assert_eq!(got.size_cap_bytes, GlobalSettings::DEFAULT_SIZE_CAP_BYTES);
+}
+
+#[test]
+fn insert_10k_entries_is_fast() {
+    let (_dir, path) = temp_db();
+    let db = Db::open(&path).unwrap();
+    let p = add_project(&db, "big");
+    let entries: Vec<_> = (0..10_000u32)
+        .map(|i| file_entry(&format!("d{:02}/f{i:05}.txt", i % 50), &i.to_le_bytes()))
+        .collect();
+    let mut nv = new_version(p, "big", entries);
+    nv.entries.sort_by(|a, b| a.path.cmp(&b.path));
+    nv.new_blobs = (0..10_000u32).map(|i| blob(&i.to_le_bytes())).collect();
+    let start = Instant::now();
+    let v = db.insert_version(&nv, &dummy_store()).unwrap();
+    let took = start.elapsed();
+    assert_eq!(db.entries(v.id).unwrap().len(), 10_000);
+    // Target is < 150 ms; the bound is generous so slow CI machines do not flake.
+    assert!(
+        took.as_millis() < 1000,
+        "inserting 10k entries took {took:?}"
+    );
+}
