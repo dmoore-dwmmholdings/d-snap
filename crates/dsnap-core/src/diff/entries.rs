@@ -815,6 +815,20 @@ mod tests {
     }
 
     #[test]
+    fn rename_ignores_dirs_and_symlinks_with_blob() {
+        // Only files pair by content, even if a dir or symlink entry carries a blob hash.
+        let blob = Some(BlobHash::of(b"same"));
+        let (mut d1, mut d2) = (dir("d1"), dir("d2"));
+        let (mut l1, mut l2) = (link("l1", "t"), link("l2", "t"));
+        for e in [&mut d1, &mut d2, &mut l1, &mut l2] {
+            e.blob = blob;
+        }
+        let got = renames(&[d1, l1], &[d2, l2], RN);
+        let want = vec![("d1", "D"), ("d2", "A"), ("l1", "D"), ("l2", "A")];
+        assert_eq!(got, owned(want));
+    }
+
+    #[test]
     fn rename_one_to_one_with_leftovers() {
         let old = [file("a", "x"), file("b", "x"), file("c", "x")];
         let new = [file("d", "x")];
@@ -877,6 +891,22 @@ mod tests {
             };
             assert_eq!(from.file_name()[1..], c.path.file_name()[1..]);
         }
+    }
+
+    #[test]
+    fn rename_large_group_fallback_prefers_lower_path_among_same_name() {
+        let n = 600;
+        let mut old: Vec<Entry> = (0..n).map(|i| file(&format!("a/o{i:04}"), "x")).collect();
+        old.extend([file("a/y/f", "x"), file("a/x/f", "x")]);
+        let mut new: Vec<Entry> = (0..n).map(|i| file(&format!("b/n{i:04}"), "x")).collect();
+        new.push(file("b/f", "x"));
+        assert!(old.len() * new.len() > MAX_RANKED_PAIRS);
+        let changes = diff_entries(&old, &new, RN);
+        let f = changes
+            .iter()
+            .find(|c| c.path.as_str() == "b/f")
+            .map(|c| &c.status);
+        assert_eq!(f, Some(&ChangeStatus::Renamed { from: p("a/x/f") }));
     }
 
     #[test]
