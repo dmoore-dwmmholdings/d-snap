@@ -10,6 +10,8 @@
 //! identical.
 //!
 //! Reads verify the hash of the decompressed bytes and return [`Error::Corrupt`] on mismatch.
+//! Dedupe trusts any non-empty object, so damage found by [`Store::verify_all`] is fixed with
+//! [`Store::repair`] / [`Store::repair_file`], which rewrite the object in place.
 //!
 //! Deleting blobs follows the blob lifetime protocol in the [`crate::db`] module docs.
 
@@ -37,8 +39,10 @@ const BUF_SIZE: usize = 256 * 1024;
 pub(crate) const TEMP_PREFIX: &str = ".tmp-";
 
 mod gc;
+mod repair;
 
 pub use gc::{SweepReport, TEMP_GRACE};
+pub use repair::RepairOutcome;
 
 /// Blob store rooted at the `objects` directory.
 #[derive(Debug)]
@@ -62,7 +66,8 @@ impl Store {
     ///
     /// Writes go to a temp file renamed into place, so a reader never sees a partial blob.
     /// An existing 0-length object is damage and is replaced. Other damage (truncation,
-    /// bitrot) is not detected here; [`Store::verify_all`] finds it.
+    /// bitrot) is not detected here; [`Store::verify_all`] finds it and [`Store::repair`]
+    /// fixes it.
     /// The no-op path is safe only because `Db::insert_version` re-checks blob presence under
     /// the write lock (see the `db` module docs).
     pub fn put(&self, bytes: &[u8]) -> Result<BlobInfo> {
@@ -75,11 +80,7 @@ impl Store {
                 stored_size,
             });
         }
-        let compressed = zstd::bulk::compress(bytes, ZSTD_LEVEL)
-            .map_err(|e| Error::Corrupt(format!("zstd compression failed: {e}")))?;
-        let mut temp = self.temp_file()?;
-        let temp_path = temp.path.clone();
-        temp.file()?.write_all(&compressed).at(&temp_path)?;
+        let temp = self.stage_bytes(bytes)?;
         let stored_size = self.persist(temp, &hash)?;
         Ok(BlobInfo {
             hash,
@@ -102,6 +103,18 @@ impl Store {
             return self.put(&bytes);
         }
 
+        let (temp, hash, size) = self.stage_reader(&mut src, path)?;
+        let stored_size = self.persist(temp, &hash)?;
+        Ok(BlobInfo {
+            hash,
+            size,
+            stored_size,
+        })
+    }
+
+    /// Compress `src` into a new temp file in one pass; returns it with the hash and size of
+    /// the bytes read. `path` names `src` in errors.
+    fn stage_reader(&self, src: &mut impl Read, path: &Path) -> Result<(TempFile, BlobHash, u64)> {
         let mut temp = self.temp_file()?;
         let temp_path = temp.path.clone();
         let mut hasher = blake3::Hasher::new();
@@ -125,13 +138,17 @@ impl Store {
             let mut out = enc.finish().at(&temp_path)?;
             out.flush().at(&temp_path)?;
         }
-        let hash = BlobHash::from(hasher.finalize());
-        let stored_size = self.persist(temp, &hash)?;
-        Ok(BlobInfo {
-            hash,
-            size,
-            stored_size,
-        })
+        Ok((temp, BlobHash::from(hasher.finalize()), size))
+    }
+
+    /// Compress `bytes` into a new temp file.
+    fn stage_bytes(&self, bytes: &[u8]) -> Result<TempFile> {
+        let compressed = zstd::bulk::compress(bytes, ZSTD_LEVEL)
+            .map_err(|e| Error::Corrupt(format!("zstd compression failed: {e}")))?;
+        let mut temp = self.temp_file()?;
+        let temp_path = temp.path.clone();
+        temp.file()?.write_all(&compressed).at(&temp_path)?;
+        Ok(temp)
     }
 
     /// Read and decompress a blob, verifying its hash ([`crate::Error::Corrupt`] on mismatch).

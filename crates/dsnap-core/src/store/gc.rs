@@ -94,7 +94,8 @@ impl Store {
     ///
     /// Bad data is [`Error::Corrupt`]. A failure to read the file is [`Error::Io`] naming the
     /// object path; such a blob may be healthy, so do not treat it as damaged. An object
-    /// deleted while the scan runs is not reported.
+    /// deleted while the scan runs is not reported. Fix a `Corrupt` entry with
+    /// [`Store::repair_file`] from a file that still holds the content.
     pub fn verify_all(&self) -> Result<Vec<(BlobHash, Error)>> {
         let mut bad = Vec::new();
         for hash in self.list_hashes()? {

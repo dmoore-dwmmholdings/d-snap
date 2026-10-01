@@ -1,4 +1,4 @@
-//! Blob store (DSNA-28, DSNA-81).
+//! Blob store (DSNA-28, DSNA-81, DSNA-94).
 #![allow(clippy::unwrap_used)] // helpers outside #[test] fns are test code too
 
 use std::fs;
@@ -6,7 +6,7 @@ use std::io::Read;
 use std::path::Path;
 use std::sync::{Arc, Barrier};
 
-use dsnap_core::store::{Store, hash_bytes, hash_file};
+use dsnap_core::store::{RepairOutcome, Store, hash_bytes, hash_file};
 use dsnap_core::{BlobHash, Error};
 use filetime::FileTime;
 use tempfile::TempDir;
@@ -408,4 +408,150 @@ fn contains_never_reports_a_partial_blob() {
     assert!(store.get(&hash).unwrap() == big);
     let info = writer.join().unwrap();
     assert_eq!(info.hash, hash);
+}
+
+/// Ways an object can be damaged on disk.
+fn damage(path: &Path, how: &str, original: &[u8]) {
+    let frame = fs::read(path).unwrap();
+    match how {
+        "truncate" => fs::write(path, &frame[..frame.len() / 2]).unwrap(),
+        "flip" => {
+            let mut f = frame;
+            let i = f.len() / 2;
+            f[i] ^= 0x40;
+            fs::write(path, f).unwrap();
+        }
+        "wrong content" => {
+            let mut other = original.to_vec();
+            other.push(b'!');
+            fs::write(path, zstd::encode_all(&other[..], 3).unwrap()).unwrap();
+        }
+        "empty" => fs::write(path, b"").unwrap(),
+        "missing" => fs::remove_file(path).unwrap(),
+        _ => unreachable!(),
+    }
+}
+
+const DAMAGE: [&str; 5] = ["truncate", "flip", "wrong content", "empty", "missing"];
+
+/// DSNA-94: repair_file rewrites a damaged object from an intact file, after which dedupe,
+/// get and verify_all all see the original bytes. Small and streamed sizes.
+#[test]
+fn repair_file_fixes_damaged_objects() {
+    let (tmp, store) = store();
+    for (i, len) in [10_000usize, 3 << 20].into_iter().enumerate() {
+        let bytes = data(len, 20 + i as u64);
+        let src = write(tmp.path(), &format!("src{i}"), &bytes);
+        let info = store.put_file(&src).unwrap();
+        let path = store.path_of(&info.hash);
+        for how in DAMAGE {
+            damage(&path, how, &bytes);
+            if how != "missing" {
+                // Dedupe trusts non-empty damage; verify_all finds it.
+                let bad = store.verify_all().unwrap();
+                assert_eq!(bad.len(), 1, "{how}");
+                assert_eq!(bad[0].0, info.hash);
+                assert!(
+                    matches!(bad[0].1, Error::Corrupt(_)),
+                    "{how}: {:?}",
+                    bad[0].1
+                );
+            }
+
+            let out = store.repair_file(&info.hash, &src).unwrap();
+            assert_eq!(
+                out,
+                RepairOutcome::Repaired {
+                    stored_size: info.stored_size
+                },
+                "{how}"
+            );
+            assert!(store.get(&info.hash).unwrap() == bytes, "{how}");
+            assert_eq!(fs::metadata(&path).unwrap().len(), info.stored_size);
+            assert!(store.verify_all().unwrap().is_empty(), "{how}");
+        }
+    }
+    assert!(census(&store).1.is_empty(), "no temp files left");
+}
+
+/// DSNA-94: repair from bytes, including the empty blob.
+#[test]
+fn repair_from_bytes() {
+    let (_tmp, store) = store();
+    for bytes in [data(50_000, 30), Vec::new()] {
+        let info = store.put(&bytes).unwrap();
+        let path = store.path_of(&info.hash);
+        for how in DAMAGE {
+            damage(&path, how, &bytes);
+            assert!(matches!(
+                store.repair(&info.hash, &bytes).unwrap(),
+                RepairOutcome::Repaired { .. }
+            ));
+            assert_eq!(store.get(&info.hash).unwrap(), bytes, "{how}");
+        }
+    }
+    assert!(census(&store).1.is_empty());
+}
+
+/// An intact object is left alone, and the source is not even read.
+#[test]
+fn repair_of_a_healthy_object_writes_nothing() {
+    let (tmp, store) = store();
+    let bytes = data(20_000, 31);
+    let info = store.put(&bytes).unwrap();
+    let path = store.path_of(&info.hash);
+    let mtime = FileTime::from_unix_time(1_000_000, 0);
+    filetime::set_file_mtime(&path, mtime).unwrap();
+
+    assert_eq!(
+        store.repair(&info.hash, b"anything").unwrap(),
+        RepairOutcome::Healthy
+    );
+    let absent = tmp.path().join("no such file");
+    assert_eq!(
+        store.repair_file(&info.hash, &absent).unwrap(),
+        RepairOutcome::Healthy
+    );
+    let meta = fs::metadata(&path).unwrap();
+    assert_eq!(FileTime::from_last_modification_time(&meta), mtime);
+    assert_eq!(meta.len(), info.stored_size);
+}
+
+/// A source that no longer holds the content is reported and nothing is written.
+#[test]
+fn repair_with_changed_source_writes_nothing() {
+    let (tmp, store) = store();
+    for len in [10_000usize, 3 << 20] {
+        let bytes = data(len, 32);
+        let info = store.put(&bytes).unwrap();
+        let path = store.path_of(&info.hash);
+        damage(&path, "truncate", &bytes);
+        let damaged = fs::read(&path).unwrap();
+
+        let mut edited = bytes.clone();
+        edited[0] ^= 1;
+        let src = write(tmp.path(), "edited", &edited);
+        let expected = RepairOutcome::SourceMismatch {
+            actual: BlobHash::of(&edited),
+        };
+        assert_eq!(store.repair_file(&info.hash, &src).unwrap(), expected);
+        assert_eq!(store.repair(&info.hash, &edited).unwrap(), expected);
+        assert_eq!(fs::read(&path).unwrap(), damaged, "object untouched");
+        assert!(!store.contains(&BlobHash::of(&edited)), "nothing stored");
+        assert!(census(&store).1.is_empty(), "no temp files left");
+    }
+}
+
+/// A missing source file on a damaged object is an I/O error and changes nothing.
+#[test]
+fn repair_from_missing_file_is_an_io_error() {
+    let (tmp, store) = store();
+    let info = store.put(b"content").unwrap();
+    let path = store.path_of(&info.hash);
+    fs::write(&path, b"junk").unwrap();
+    let err = store
+        .repair_file(&info.hash, &tmp.path().join("gone"))
+        .unwrap_err();
+    assert!(matches!(err, Error::Io { .. }), "{err:?}");
+    assert_eq!(fs::read(&path).unwrap(), b"junk");
 }
