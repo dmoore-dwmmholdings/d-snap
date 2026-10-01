@@ -1,7 +1,7 @@
 //! Shared data types used across the core API, the CLI and the app.
 //!
 //! Every serializable type uses camelCase field names. Enums with data are tagged with a
-//! `"type"` field so the TypeScript frontend can switch on it.
+//! `"kind"` field so the TypeScript frontend can switch on it.
 
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
@@ -124,10 +124,43 @@ impl<'de> Deserialize<'de> for BlobHash {
 
 /// Project-relative, `/`-separated UTF-8 path, e.g. `src/main.rs`.
 ///
-/// Never empty, never absolute, and has no `.`, `..` or empty components.
+/// Never empty, never absolute, and has no `.`, `..` or empty components, so
+/// [`RelPath::to_path`] always stays under the root it is joined to.
+///
+/// On Windows each component must also be a valid Win32 file name: no `<>:"|?*` or control
+/// characters (`:` would allow drive-relative paths like `C:x` and alternate data streams), no
+/// trailing `.` or space (Win32 strips them, so `.. ` would become `..`), and no reserved
+/// device name (`CON`, `NUL`, `COM1`, ...).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct RelPath(String);
+
+/// Whether one path component is acceptable on this platform.
+fn valid_component(c: &str) -> bool {
+    if c.is_empty() || c == "." || c == ".." || c.contains(['\\', '\0']) {
+        return false;
+    }
+    if cfg!(windows) {
+        if c.chars()
+            .any(|ch| ch < ' ' || matches!(ch, '<' | '>' | ':' | '"' | '|' | '?' | '*'))
+        {
+            return false;
+        }
+        if c.ends_with(['.', ' ']) {
+            return false;
+        }
+        let stem = c.split('.').next().unwrap_or(c).trim_end_matches(' ');
+        let device = |p: &[u8]| p.eq_ignore_ascii_case(b"COM") || p.eq_ignore_ascii_case(b"LPT");
+        let reserved = ["CON", "PRN", "AUX", "NUL"]
+            .iter()
+            .any(|r| stem.eq_ignore_ascii_case(r))
+            || matches!(stem.as_bytes(), [p @ .., b'1'..=b'9'] if device(p));
+        if reserved {
+            return false;
+        }
+    }
+    true
+}
 
 impl RelPath {
     /// Validate and wrap a `/`-separated relative path.
@@ -136,17 +169,14 @@ impl RelPath {
         if s.is_empty() {
             return Err(Error::InvalidInput("relative path is empty".into()));
         }
-        if s.contains('\\') || s.contains('\0') {
+        if s.starts_with('/') {
             return Err(Error::InvalidInput(format!(
-                "relative path has a backslash or NUL: {s}"
+                "relative path is absolute: {s}"
             )));
         }
-        if s.starts_with('/') || s.split('/').any(|c| c.is_empty() || c == "." || c == "..") {
-            return Err(Error::InvalidInput(format!("invalid relative path: {s}")));
-        }
-        if s.len() >= 2 && s.as_bytes()[1] == b':' {
+        if let Some(bad) = s.split('/').find(|c| !valid_component(c)) {
             return Err(Error::InvalidInput(format!(
-                "relative path looks like a drive path: {s}"
+                "invalid component {bad:?} in relative path {s:?}"
             )));
         }
         Ok(Self(s))
@@ -261,7 +291,7 @@ pub struct BlobInfo {
 /// What kind of filesystem object an entry is.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(
-    tag = "type",
+    tag = "kind",
     rename_all = "camelCase",
     rename_all_fields = "camelCase"
 )]
@@ -347,7 +377,7 @@ pub struct Version {
 /// Auto-snapshot mode for a project.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(
-    tag = "type",
+    tag = "kind",
     rename_all = "camelCase",
     rename_all_fields = "camelCase"
 )]
@@ -434,7 +464,7 @@ pub struct Project {
 /// How a path differs between two sides of a comparison.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(
-    tag = "type",
+    tag = "kind",
     rename_all = "camelCase",
     rename_all_fields = "camelCase"
 )]
@@ -534,7 +564,7 @@ pub struct Hunk {
 /// Content of a single-file diff.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(
-    tag = "type",
+    tag = "kind",
     rename_all = "camelCase",
     rename_all_fields = "camelCase"
 )]
@@ -583,7 +613,7 @@ pub struct FileDiff {
 
 /// One side of a comparison: a stored version or the folder as it is now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(tag = "type", content = "id", rename_all = "camelCase")]
+#[serde(tag = "kind", content = "id", rename_all = "camelCase")]
 pub enum VersionRef {
     /// A stored version.
     Version(VersionId),
@@ -594,7 +624,7 @@ pub enum VersionRef {
 /// Why a file was left out of a snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(
-    tag = "type",
+    tag = "kind",
     rename_all = "camelCase",
     rename_all_fields = "camelCase"
 )]
@@ -832,11 +862,89 @@ mod tests {
             assert_eq!(rp(ok).as_str(), ok);
         }
         for bad in [
-            "", "/a", "a/", "a//b", "./a", "a/../b", "..", "a\\b", "C:/x", "c:",
+            "", "/a", "a/", "a//b", "./a", "a/../b", "..", "a\\b", "a\0b", "x/..",
         ] {
             assert!(RelPath::new(bad).is_err(), "{bad:?} should be rejected");
         }
         assert!(serde_json::from_str::<RelPath>("\"../x\"").is_err());
+    }
+
+    /// Inputs that would escape the root or alias another file on Windows.
+    const WINDOWS_HOSTILE: &[&str] = &[
+        "C:/x",
+        "c:",
+        "x/C:evil.txt",
+        "x/c:",
+        "ab:c",
+        "a/b:stream:$DATA",
+        "x/.. /y",
+        "x/... ",
+        "a.",
+        "a ",
+        "x/a?b",
+        "x/a*b",
+        "x/a<b",
+        "x/a>b",
+        "x/a|b",
+        "x/a\"b",
+        "x/a\u{1}b",
+        "CON",
+        "x/nul.txt",
+        "Com1",
+        "x/lpt9.log",
+        "aux .txt",
+    ];
+
+    #[cfg(windows)]
+    #[test]
+    fn rel_path_rejects_windows_hostile_names() {
+        for bad in WINDOWS_HOSTILE {
+            assert!(RelPath::new(*bad).is_err(), "{bad:?} should be rejected");
+            assert!(
+                serde_json::to_string(bad)
+                    .ok()
+                    .and_then(|j| serde_json::from_str::<RelPath>(&j).ok())
+                    .is_none()
+            );
+        }
+        for ok in [
+            "COM0",
+            "com10",
+            "console",
+            "a.b",
+            "x/.hidden",
+            "LPT",
+            "nul2",
+        ] {
+            assert!(RelPath::new(ok).is_ok(), "{ok:?} should be accepted");
+        }
+    }
+
+    #[test]
+    fn to_path_always_stays_under_root() {
+        let root = std::env::temp_dir().join("dsnap-root");
+        let candidates = [
+            "a",
+            "a/b.txt",
+            "src/.hidden",
+            "dir/with space/x",
+            "ä/ö",
+            "a..b",
+            "...x",
+            "x/..y",
+        ];
+        for s in candidates.iter().chain(WINDOWS_HOSTILE) {
+            let Ok(p) = RelPath::new(*s) else { continue };
+            let abs = p.to_path(&root);
+            assert!(abs.starts_with(&root), "{s:?} -> {}", abs.display());
+            assert_eq!(
+                abs.components().count(),
+                root.components().count() + s.split('/').count(),
+                "{s:?} -> {}",
+                abs.display()
+            );
+            assert_eq!(RelPath::from_abs(&root, &abs).unwrap(), p);
+        }
     }
 
     #[test]
@@ -867,22 +975,27 @@ mod tests {
     fn json_shapes_are_camel_case_and_tagged() {
         assert_eq!(
             round_trip(&EntryKind::Symlink { target: "x".into() }),
-            r#"{"type":"symlink","target":"x"}"#
+            r#"{"kind":"symlink","target":"x"}"#
         );
-        assert_eq!(round_trip(&EntryKind::File), r#"{"type":"file"}"#);
+        assert_eq!(round_trip(&EntryKind::File), r#"{"kind":"file"}"#);
         assert_eq!(
             round_trip(&VersionRef::Version(VersionId(4))),
-            r#"{"type":"version","id":4}"#
+            r#"{"kind":"version","id":4}"#
         );
         assert_eq!(
             round_trip(&VersionRef::WorkingTree),
-            r#"{"type":"workingTree"}"#
+            r#"{"kind":"workingTree"}"#
         );
         assert_eq!(
             round_trip(&AutoSnapshot::AfterIdle { secs: 30 }),
-            r#"{"type":"afterIdle","secs":30}"#
+            r#"{"kind":"afterIdle","secs":30}"#
         );
         assert_eq!(round_trip(&VersionKind::Safety), r#""safety""#);
+        let e = round_trip(&entry("l", EntryKind::Symlink { target: "t".into() }));
+        assert!(
+            e.contains(r#""kind":{"kind":"symlink","target":"t"}"#) && e.contains(r#""mtimeNs":"#),
+            "{e}"
+        );
         let v = round_trip(&version());
         assert!(v.contains(r#""createdAtMs":1700000000000"#), "{v}");
         assert!(v.contains(r#""projectId":3"#), "{v}");
