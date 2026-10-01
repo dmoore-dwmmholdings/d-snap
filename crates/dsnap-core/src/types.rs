@@ -724,6 +724,10 @@ pub struct RetentionReport {
     pub blobs_pruned: u32,
     /// Stored bytes freed.
     pub bytes_freed: u64,
+    /// Unreferenced blobs whose files could not be deleted (e.g. locked); the next prune
+    /// retries them. A warning, not an error.
+    #[serde(default)]
+    pub blobs_failed: u32,
 }
 
 /// Phase of a long-running operation.

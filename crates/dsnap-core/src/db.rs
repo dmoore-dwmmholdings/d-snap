@@ -474,6 +474,7 @@ impl Db {
                 versions_deleted: 0,
                 blobs_pruned: u32::try_from(swept.deleted).unwrap_or(u32::MAX),
                 bytes_freed: swept.bytes_freed,
+                blobs_failed: 0,
             })
         })
     }
