@@ -1,2 +1,7 @@
 # Product spec stays local for now; the copy agents use is Andare DSNA-1.
 spec/
+
+# Build output
+target/
+node_modules/
+app/dist/

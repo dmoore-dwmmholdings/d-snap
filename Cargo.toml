@@ -1,0 +1,51 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/dsnap-core",
+    "crates/dsnap-cli",
+    "crates/dsnap-test-support",
+    # "app/src-tauri",  # added by Chain B (DSNA-5)
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/dmoore-dwmmholdings/d-snap"
+publish = false
+
+[workspace.dependencies]
+# Internal crates
+dsnap-core = { path = "crates/dsnap-core" }
+dsnap-test-support = { path = "crates/dsnap-test-support" }
+
+# Third-party
+anyhow = "1.0.100"
+blake3 = "1.8.2"
+clap = { version = "4.5.50", features = ["derive"] }
+filetime = "0.2.26"
+ignore = "0.4.24"
+notify = "8.2.0"
+rayon = "1.11.0"
+rusqlite = { version = "0.40.1", features = ["bundled"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+similar = "2.7.0"
+tempfile = "3.23.0"
+thiserror = "2.0.17"
+time = { version = "0.3.44", features = ["formatting", "local-offset", "macros"] }
+zstd = "0.13.3"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+# Non-test code must not panic. clippy.toml allows these inside #[cfg(test)] and #[test].
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+
+[profile.dev.package."*"]
+# Hashing and compression are slow unoptimised; this keeps debug test runs fast.
+opt-level = 2
