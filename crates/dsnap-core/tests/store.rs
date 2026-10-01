@@ -235,6 +235,55 @@ fn assert_corrupt(store: &Store, hash: &BlobHash) {
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
 }
 
+/// DSNA-91: an empty object is damage; a new put of the intact content replaces it.
+#[test]
+fn put_replaces_an_empty_object() {
+    let (tmp, store) = store();
+    let small = data(10_000, 5);
+    let big = data(2 << 20, 6);
+    let big_path = write(tmp.path(), "big", &big);
+    let small_path = write(tmp.path(), "small", &small);
+
+    type PutFn<'a> = Box<dyn Fn() -> dsnap_core::BlobInfo + 'a>;
+    let cases: Vec<(&[u8], PutFn<'_>, PutFn<'_>)> = vec![
+        (
+            &small,
+            Box::new(|| store.put(&small).unwrap()),
+            Box::new(|| store.put(&small).unwrap()),
+        ),
+        (
+            &small,
+            Box::new(|| store.put(&small).unwrap()),
+            Box::new(|| store.put_file(&small_path).unwrap()),
+        ),
+        (
+            &big,
+            Box::new(|| store.put_file(&big_path).unwrap()),
+            Box::new(|| store.put_file(&big_path).unwrap()),
+        ),
+        (
+            b"",
+            Box::new(|| store.put(b"").unwrap()),
+            Box::new(|| store.put(b"").unwrap()),
+        ),
+    ];
+    for (bytes, first, again) in cases {
+        let info = first();
+        let path = store.path_of(&info.hash);
+        fs::write(&path, b"").unwrap();
+        assert!(!store.contains(&info.hash), "an empty object is not stored");
+
+        let fixed = again();
+        assert_eq!(fixed, info, "same record as the first put");
+        assert!(fixed.stored_size > 0);
+        assert_eq!(fs::metadata(&path).unwrap().len(), info.stored_size);
+        assert!(store.contains(&info.hash));
+        assert_eq!(store.get(&info.hash).unwrap(), bytes);
+        store.delete(&info.hash).unwrap();
+    }
+    assert!(census(&store).1.is_empty(), "no temp files left");
+}
+
 #[test]
 fn missing_blob_is_not_found() {
     let (_tmp, store) = store();

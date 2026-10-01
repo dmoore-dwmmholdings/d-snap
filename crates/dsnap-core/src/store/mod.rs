@@ -61,6 +61,8 @@ impl Store {
     /// Store `bytes` (no-op if the hash already exists) and return its record.
     ///
     /// Writes go to a temp file renamed into place, so a reader never sees a partial blob.
+    /// An existing 0-length object is damage and is replaced. Other damage (truncation,
+    /// bitrot) is not detected here; [`Store::verify_all`] finds it.
     /// The no-op path is safe only because `Db::insert_version` re-checks blob presence under
     /// the write lock (see the `db` module docs).
     pub fn put(&self, bytes: &[u8]) -> Result<BlobInfo> {
@@ -191,7 +193,7 @@ impl Store {
     }
 
     /// Whether a blob exists. One `stat`, no read; cheap enough to call under the DB write
-    /// lock.
+    /// lock. A 0-length object (always damaged) does not count.
     pub fn contains(&self, hash: &BlobHash) -> bool {
         matches!(self.stored_size(hash), Ok(Some(_)))
     }
@@ -212,9 +214,13 @@ impl Store {
     }
 
     /// Compressed size of a stored blob, or `None` if it is not stored.
+    ///
+    /// A 0-length object counts as not stored: no zstd frame is empty, so it is damage (e.g. a
+    /// partial copy of the data dir), and the next `put` of the same content replaces it.
     fn stored_size(&self, hash: &BlobHash) -> Result<Option<u64>> {
         let path = self.path_of(hash);
         match fs::symlink_metadata(&path) {
+            Ok(m) if m.is_file() && m.len() == 0 => Ok(None),
             Ok(m) if m.is_file() => Ok(Some(m.len())),
             Ok(_) => Err(Error::Corrupt(format!(
                 "{} is not a regular file",
