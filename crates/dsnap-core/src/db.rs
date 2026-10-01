@@ -359,53 +359,40 @@ impl Db {
     /// `recount(old, new)` gets the entries of the new predecessor (empty if none) and of
     /// the survivor. Ids that do not exist are skipped. Returns the number of versions
     /// deleted. Blobs are left for [`Db::prune_unreferenced`].
-    pub fn delete_versions(
+    pub fn delete_versions(&self, ids: &[VersionId], recount: &Recount<'_>) -> Result<u32> {
+        self.write(|tx| delete_versions_tx(tx, ids, recount))
+    }
+
+    /// Retention step: delete up to `limit` of a project's oldest unpinned versions beyond
+    /// the newest `keep` unpinned ones, recomputing successor counts like
+    /// [`Db::delete_versions`]. The candidates are chosen inside the same `BEGIN IMMEDIATE`
+    /// transaction, so a version pinned or added by another process meanwhile is honored.
+    /// Returns the number deleted; call again until it returns 0.
+    pub fn delete_unpinned_beyond(
         &self,
-        ids: &[VersionId],
-        recount: &dyn Fn(&[Entry], &[Entry]) -> ChangeCounts,
+        project: ProjectId,
+        keep: u32,
+        limit: usize,
+        recount: &Recount<'_>,
     ) -> Result<u32> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         self.write(|tx| {
-            let mut deleted: Vec<(ProjectId, VersionId)> = Vec::new();
-            for &id in ids {
-                if let Some(v) = version_by_id(tx, id)? {
-                    tx.execute("DELETE FROM versions WHERE id = ?1", [id.0])?;
-                    deleted.push((v.project_id, id));
-                }
-            }
-            let mut successors = HashSet::new();
-            for &(project, id) in &deleted {
-                let next: Option<i64> = tx
-                    .query_row(
-                        "SELECT id FROM versions WHERE project_id = ?1 AND id > ?2
-                         ORDER BY id LIMIT 1",
-                        params![project.0, id.0],
-                        |r| r.get(0),
-                    )
-                    .optional()?;
-                if let Some(next) = next {
-                    successors.insert((project, VersionId(next)));
-                }
-            }
-            for (project, id) in successors {
-                let prev: Option<i64> = tx
-                    .query_row(
-                        "SELECT id FROM versions WHERE project_id = ?1 AND id < ?2
-                         ORDER BY id DESC LIMIT 1",
-                        params![project.0, id.0],
-                        |r| r.get(0),
-                    )
-                    .optional()?;
-                let old = match prev {
-                    Some(p) => entries_of(tx, VersionId(p))?,
-                    None => Vec::new(),
-                };
-                let c = recount(&old, &entries_of(tx, id)?);
-                tx.execute(
-                    "UPDATE versions SET added = ?2, modified = ?3, deleted = ?4 WHERE id = ?1",
-                    params![id.0, c.added, c.modified, c.deleted],
+            let ids = {
+                let mut stmt = tx.prepare_cached(
+                    "SELECT id FROM versions WHERE project_id = ?1 AND pinned = 0
+                     ORDER BY id DESC LIMIT -1 OFFSET ?2",
                 )?;
-            }
-            Ok(u32::try_from(deleted.len()).unwrap_or(u32::MAX))
+                stmt.query_map(params![project.0, keep], |r| r.get::<_, i64>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            // Oldest first, at most `limit`.
+            let ids: Vec<VersionId> = ids
+                .into_iter()
+                .rev()
+                .take(usize::try_from(limit).unwrap_or(usize::MAX))
+                .map(VersionId)
+                .collect();
+            delete_versions_tx(tx, &ids, recount)
         })
     }
 
@@ -729,6 +716,56 @@ fn insert_blob_tx(tx: &Transaction<'_>, b: &BlobInfo) -> Result<()> {
         u64_to_sql(b.stored_size, "blob stored size")?,
     ])?;
     Ok(())
+}
+
+/// Recomputes a version's stored counts from its predecessor's entries and its own.
+pub type Recount<'a> = dyn Fn(&[Entry], &[Entry]) -> ChangeCounts + 'a;
+
+fn delete_versions_tx(
+    tx: &Transaction<'_>,
+    ids: &[VersionId],
+    recount: &Recount<'_>,
+) -> Result<u32> {
+    let mut deleted: Vec<(ProjectId, VersionId)> = Vec::new();
+    for &id in ids {
+        if let Some(v) = version_by_id(tx, id)? {
+            tx.execute("DELETE FROM versions WHERE id = ?1", [id.0])?;
+            deleted.push((v.project_id, id));
+        }
+    }
+    let mut successors = HashSet::new();
+    for &(project, id) in &deleted {
+        let next: Option<i64> = tx
+            .query_row(
+                "SELECT id FROM versions WHERE project_id = ?1 AND id > ?2 ORDER BY id LIMIT 1",
+                params![project.0, id.0],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(next) = next {
+            successors.insert((project, VersionId(next)));
+        }
+    }
+    for (project, id) in successors {
+        let prev: Option<i64> = tx
+            .query_row(
+                "SELECT id FROM versions WHERE project_id = ?1 AND id < ?2
+                 ORDER BY id DESC LIMIT 1",
+                params![project.0, id.0],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let old = match prev {
+            Some(p) => entries_of(tx, VersionId(p))?,
+            None => Vec::new(),
+        };
+        let c = recount(&old, &entries_of(tx, id)?);
+        tx.execute(
+            "UPDATE versions SET added = ?2, modified = ?3, deleted = ?4 WHERE id = ?1",
+            params![id.0, c.added, c.modified, c.deleted],
+        )?;
+    }
+    Ok(u32::try_from(deleted.len()).unwrap_or(u32::MAX))
 }
 
 fn version_by_id(conn: &Connection, id: VersionId) -> Result<Option<Version>> {

@@ -1,21 +1,57 @@
 //! Retention and blob pruning. Owner: Chain L (DSNA-15).
-#![allow(unused_variables)] // stub signatures; remove when implemented
+//!
+//! Blob files are deleted only through `Db::prune_unreferenced` (and `Db::sweep_orphans`),
+//! under the DSNA-80 blob lifetime protocol in the [`crate::db`] module docs. That protocol
+//! replaces the "only sweep objects older than 10 minutes" guard first planned in DSNA-55: a
+//! snapshot that deduplicated against a blob being pruned gets `Error::BlobMissing` from
+//! `Db::insert_version` and stores it again, so no age guard is needed.
 
 use crate::db::PRUNE_BATCH;
 use crate::error::{Error, Result};
 use crate::facade::Dsnap;
 use crate::types::{ProjectId, RetentionReport};
+use crate::versions::version_counts;
+
+/// Versions deleted per write transaction during retention, so the write lock is released
+/// between batches (a concurrent `dsnap snap` waits at most the 5 s busy timeout).
+pub const RETENTION_BATCH: usize = 32;
 
 impl Dsnap {
-    /// Keep pinned versions plus the newest `retention_keep`; delete the rest and prune blobs.
+    /// Keep every pinned version plus the newest `retention_keep` unpinned ones (global
+    /// setting, default 200); delete the rest, oldest first, recomputing the stored counts
+    /// of the versions that follow them; then prune unreferenced blobs.
+    ///
+    /// The versions to delete are chosen inside each delete transaction, so a version pinned
+    /// by another process meanwhile is kept. Blob files that cannot be deleted end the prune
+    /// as a warning (`blobs_failed`), not an error.
     pub fn apply_retention(&self, project: ProjectId) -> Result<RetentionReport> {
-        todo!("DSNA-15")
+        self.db.get_project(project)?;
+        let keep = self.db.global_settings()?.retention_keep.max(1);
+        let mut versions_deleted = 0u32;
+        loop {
+            let n =
+                self.db
+                    .delete_unpinned_beyond(project, keep, RETENTION_BATCH, &version_counts)?;
+            if n == 0 {
+                break;
+            }
+            versions_deleted = versions_deleted.saturating_add(n);
+        }
+        let mut report = self.prune_unreferenced_all()?;
+        report.versions_deleted = versions_deleted;
+        Ok(report)
+    }
+
+    /// Hook for snapshot (Chain K): call after a new version is committed. Runs
+    /// [`Dsnap::apply_retention`] for `project`.
+    pub fn after_snapshot(&self, project: ProjectId) -> Result<RetentionReport> {
+        self.apply_retention(project)
     }
 
     /// Delete blobs no version references, by calling `Db::prune_unreferenced` in batches.
     /// Never delete store files directly (see the `db` module docs, DSNA-80).
     pub fn prune_blobs(&self) -> Result<RetentionReport> {
-        todo!("DSNA-15")
+        self.prune_unreferenced_all()
     }
 
     /// Call [`crate::db::Db::prune_unreferenced`] with [`PRUNE_BATCH`] until it frees
