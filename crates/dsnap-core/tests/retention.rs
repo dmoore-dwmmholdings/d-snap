@@ -161,3 +161,124 @@ fn uncommitted_object_survives_retention() {
     assert_eq!(r.blobs_pruned, 1);
     assert_eq!(ds.read_blob(&in_flight.hash).unwrap(), b"in flight");
 }
+
+/// DSNA-84: a prune running while another handle commits versions that reuse an otherwise
+/// unreferenced blob never leaves a committed version without its blob.
+#[test]
+fn concurrent_prune_never_loses_a_reused_blob() {
+    let (home, _d, ds, cli, p) = setup();
+    let content: &[u8] = b"reused across versions";
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                ds.prune_blobs().unwrap();
+            }
+        });
+        let reader = common::Cli::open(home.path());
+        let mut retries = 0;
+        for _ in 0..150 {
+            // Snapshot-style commit: put is a no-op while the file exists (dedupe), and the
+            // prune may delete it before insert_version takes the lock.
+            let v = loop {
+                let info = cli.store.put(content).unwrap();
+                match cli.db.insert_version(
+                    &dsnap_core::db::NewVersion {
+                        project_id: p,
+                        label: "v".into(),
+                        created_at_ms: 0,
+                        kind: dsnap_core::VersionKind::Cli,
+                        unstable: false,
+                        counts: Default::default(),
+                        entries: vec![dsnap_core::Entry {
+                            path: dsnap_core::RelPath::new("f").unwrap(),
+                            kind: dsnap_core::EntryKind::File,
+                            blob: Some(info.hash),
+                            size: info.size,
+                            mtime_ns: 0,
+                            readonly: false,
+                        }],
+                        new_blobs: vec![info],
+                    },
+                    &cli.store,
+                ) {
+                    Ok(v) => break v,
+                    Err(Error::BlobMissing(_)) => retries += 1,
+                    Err(e) => panic!("{e}"),
+                }
+            };
+            assert_eq!(reader.store.get(&hash_bytes(content)).unwrap(), content);
+            // Make it unreferenced again for the next round.
+            cli.db.delete_version(v.id).unwrap();
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        eprintln!("BlobMissing retries: {retries}");
+    });
+}
+
+/// Hold `path` so it cannot be deleted until the guard drops.
+#[cfg(windows)]
+fn hold_undeletable(path: &std::path::Path) -> impl Drop + use<> {
+    use std::os::windows::fs::OpenOptionsExt;
+    struct Guard(#[allow(dead_code)] std::fs::File);
+    impl Drop for Guard {
+        fn drop(&mut self) {}
+    }
+    Guard(
+        std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(path)
+            .unwrap(),
+    )
+}
+
+/// Make the directory holding `path` read-only so the file cannot be unlinked.
+#[cfg(unix)]
+fn hold_undeletable(path: &std::path::Path) -> impl Drop + use<> {
+    use std::os::unix::fs::PermissionsExt;
+    struct Guard(std::path::PathBuf);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+    let dir = path.parent().unwrap().to_path_buf();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    Guard(dir)
+}
+
+/// The prune loop ends with an error once only undeletable blobs remain; retention keeps
+/// the bytes already freed and reports the rest as `blobs_failed`.
+#[test]
+fn undeletable_blob_is_a_warning_not_an_error() {
+    let (_h, _d, ds, cli, p) = setup();
+    // Two blobs in different shard directories (the unix guard locks a whole shard).
+    let a: &[u8] = b"locked";
+    let a_hash = hash_bytes(a);
+    let b = (0..)
+        .map(|i| format!("free {i}"))
+        .find(|c| hash_bytes(c.as_bytes()).0[0] != a_hash.0[0])
+        .unwrap();
+    cli.commit(p, &[("a", a), ("b", b.as_bytes())]);
+    cli.commit_one(p, b"latest");
+    set_keep(&ds, 1);
+
+    let guard = hold_undeletable(&cli.store.path_of(&a_hash));
+    let r = ds.apply_retention(p).unwrap();
+    assert_eq!(r.versions_deleted, 1);
+    assert_eq!(r.blobs_pruned, 1);
+    assert!(r.bytes_freed > 0);
+    assert_eq!(r.blobs_failed, 1);
+    assert!(ds.read_blob(&hash_bytes(b.as_bytes())).is_err());
+    assert_eq!(ds.read_blob(&hash_bytes(b"latest")).unwrap(), b"latest");
+
+    // Only the undeletable blob is left: still a warning.
+    let r = ds.prune_blobs().unwrap();
+    assert_eq!((r.blobs_pruned, r.blobs_failed), (0, 1));
+
+    drop(guard);
+    let r = ds.prune_blobs().unwrap();
+    assert_eq!((r.blobs_pruned, r.blobs_failed), (1, 0));
+    assert!(ds.read_blob(&a_hash).is_err());
+}
