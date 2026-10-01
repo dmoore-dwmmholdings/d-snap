@@ -326,3 +326,113 @@ fn unreadable_dir_is_skipped() {
     ));
     assert!(paths(&out.entries).contains(&"ok"));
 }
+
+/// Windows specifics (DSNA-35).
+#[cfg(windows)]
+mod windows {
+    use super::*;
+    use std::os::windows::fs::MetadataExt;
+    use std::process::Command;
+
+    /// Create an NTFS junction (needs no privilege, unlike symlinks).
+    fn junction(link: &Path, target: &Path) {
+        let status = Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()
+            .unwrap();
+        assert!(status.status.success(), "{status:?}");
+    }
+
+    #[test]
+    fn junction_is_recorded_and_not_followed() {
+        let fx = FixtureProject::new()
+            .file("real/inner.txt", "x")
+            .file("real/node_modules/pkg.js", "")
+            .build();
+        junction(&fx.path("jn"), &fx.path("real"));
+        // A junction back to the root would loop forever if followed.
+        junction(&fx.path("real/loop"), fx.root());
+        let out = run(fx.root(), &WalkOptions::default());
+        assert_eq!(paths(&out.entries), ["jn", "real/inner.txt", "real/loop"]);
+        for p in ["jn", "real/loop"] {
+            let e = find(&out, p);
+            let EntryKind::Symlink { target } = &e.kind else {
+                panic!("{p} is {:?}", e.kind);
+            };
+            assert!(!target.is_empty(), "{p}");
+        }
+        let EntryKind::Symlink { target } = &find(&out, "jn").kind else {
+            unreachable!()
+        };
+        assert!(target.ends_with("real"), "{target}");
+        assert!(out.skipped.is_empty(), "{:?}", out.skipped);
+    }
+
+    #[test]
+    fn junction_is_not_ignored_as_a_dir() {
+        let fx = FixtureProject::new().file("real/a", "").build();
+        junction(&fx.path("dist"), &fx.path("real"));
+        let out = run(fx.root(), &WalkOptions::default());
+        assert_eq!(paths(&out.entries), ["dist", "real/a"]);
+    }
+
+    #[test]
+    fn long_path_is_walked() {
+        let fx = FixtureProject::new().build();
+        let mut rel = String::new();
+        for i in 0..12 {
+            if !rel.is_empty() {
+                rel.push('/');
+            }
+            rel.push_str(&format!("{i:02}_{}", "d".repeat(22)));
+        }
+        let file_rel = format!("{rel}/file_{}.txt", "f".repeat(20));
+        let abs = fx.path(&file_rel);
+        assert!(abs.as_os_str().len() > 300, "{}", abs.as_os_str().len());
+        std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+        std::fs::write(&abs, "deep").unwrap();
+        std::fs::create_dir(fx.path(&format!("{rel}/empty_{}", "e".repeat(20)))).unwrap();
+
+        let out = run(fx.root(), &WalkOptions::default());
+        assert!(out.skipped.is_empty(), "{:?}", out.skipped);
+        let ps = paths(&out.entries);
+        assert_eq!(ps.len(), 2, "{ps:?}");
+        assert!(ps.contains(&file_rel.as_str()));
+        assert!(ps.iter().all(|p| !p.contains('\\') && !p.starts_with("//")));
+        assert_eq!(find(&out, &file_rel).size, 4);
+    }
+
+    #[test]
+    fn long_path_gitignore_is_read() {
+        let fx = FixtureProject::new().build();
+        let deep = format!("{}/{}", "a".repeat(150), "b".repeat(150));
+        std::fs::create_dir_all(fx.path(&deep)).unwrap();
+        std::fs::write(fx.path(&format!("{deep}/.gitignore")), "*.tmp\n").unwrap();
+        std::fs::write(fx.path(&format!("{deep}/x.tmp")), "").unwrap();
+        std::fs::write(fx.path(&format!("{deep}/x.txt")), "").unwrap();
+        let out = run(fx.root(), &WalkOptions::default());
+        assert_eq!(
+            paths(&out.entries),
+            [format!("{deep}/.gitignore"), format!("{deep}/x.txt")]
+        );
+    }
+
+    #[test]
+    fn readonly_attribute_is_captured() {
+        const FILE_ATTRIBUTE_READONLY: u32 = 0x1;
+        let fx = FixtureProject::new()
+            .file("ro.txt", "r")
+            .file("rw.txt", "w")
+            .readonly("ro.txt")
+            .build();
+        let attrs = std::fs::metadata(fx.path("ro.txt"))
+            .unwrap()
+            .file_attributes();
+        assert_ne!(attrs & FILE_ATTRIBUTE_READONLY, 0);
+        let out = run(fx.root(), &WalkOptions::default());
+        assert!(find(&out, "ro.txt").readonly);
+        assert!(!find(&out, "rw.txt").readonly);
+    }
+}

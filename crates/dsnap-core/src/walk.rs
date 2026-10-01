@@ -5,6 +5,16 @@
 //! The walk goes level by level (no recursion, so deep trees cannot overflow the stack) and
 //! lists the directories of one level in parallel. Ignored directories are never entered.
 //! Output is sorted by path, so it does not depend on thread scheduling.
+//!
+//! Windows specifics:
+//! - NTFS junctions, like symlinks, are name-surrogate reparse points; both are recorded as
+//!   links and never entered. Other reparse points (deduplicated or cloud-synced files and
+//!   folders) are ordinary files and directories.
+//! - Online-only cloud files (OneDrive placeholders) are skipped as unreadable without being
+//!   opened, so a walk never downloads them.
+//! - Paths longer than `MAX_PATH` work: std adds the `\\?\` prefix to long absolute paths
+//!   itself, and stored [`RelPath`]s never carry it.
+//! - `readonly` is the `FILE_ATTRIBUTE_READONLY` bit.
 
 use std::collections::HashSet;
 use std::fs::{self, DirEntry, Metadata};
@@ -266,7 +276,12 @@ impl Walker<'_> {
         } else {
             let size = meta.len();
             let cap = self.opts.size_cap_bytes;
-            if cap > 0 && size > cap {
+            if let Some(msg) = offline_file(&meta) {
+                out.skipped.push(SkippedFile {
+                    path: rel.into(),
+                    reason: SkipReason::Unreadable { msg },
+                });
+            } else if cap > 0 && size > cap {
                 out.skipped.push(SkippedFile {
                     path: rel.into(),
                     reason: SkipReason::TooLarge { size },
@@ -276,6 +291,38 @@ impl Walker<'_> {
             }
         }
     }
+}
+
+/// Windows file attributes that mark a cloud placeholder whose data is not on disk.
+#[cfg(windows)]
+mod attrs {
+    pub const OFFLINE: u32 = 0x0000_1000;
+    pub const RECALL_ON_OPEN: u32 = 0x0004_0000;
+    pub const RECALL_ON_DATA_ACCESS: u32 = 0x0040_0000;
+    pub const DATA_NOT_LOCAL: u32 = OFFLINE | RECALL_ON_OPEN | RECALL_ON_DATA_ACCESS;
+}
+
+/// Why a file must not be read, if it is an online-only cloud file (OneDrive and other cloud
+/// sync providers). Reading it would download ("hydrate") it, so the walk skips it instead.
+///
+/// The attributes come from the directory listing, so checking them opens nothing.
+#[cfg(windows)]
+fn offline_file(meta: &Metadata) -> Option<String> {
+    use std::os::windows::fs::MetadataExt;
+    offline_reason(meta.file_attributes())
+}
+
+#[cfg(not(windows))]
+fn offline_file(_meta: &Metadata) -> Option<String> {
+    None
+}
+
+#[cfg(windows)]
+fn offline_reason(attributes: u32) -> Option<String> {
+    (attributes & attrs::DATA_NOT_LOCAL != 0).then(|| {
+        "online-only cloud file (not downloaded); make it available offline to snapshot it"
+            .to_owned()
+    })
 }
 
 fn entry(path: RelPath, kind: EntryKind, size: u64, meta: &Metadata) -> Entry {
@@ -354,4 +401,27 @@ fn empty_dirs(files: &[Entry], mut dirs: Vec<Entry>) -> Vec<Entry> {
         }
     }
     out
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cloud_placeholder_attributes_are_offline() {
+        const NORMAL: u32 = 0x80;
+        const REPARSE_POINT: u32 = 0x400;
+        const PINNED: u32 = 0x0008_0000;
+        assert!(offline_reason(NORMAL).is_none());
+        // A hydrated cloud file is still a reparse point, but its data is local.
+        assert!(offline_reason(REPARSE_POINT | PINNED).is_none());
+        for a in [
+            attrs::OFFLINE,
+            attrs::RECALL_ON_OPEN,
+            REPARSE_POINT | attrs::RECALL_ON_DATA_ACCESS,
+        ] {
+            let msg = offline_reason(a).unwrap();
+            assert!(msg.contains("online-only"), "{msg}");
+        }
+    }
 }
