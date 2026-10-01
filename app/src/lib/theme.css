@@ -1,0 +1,99 @@
+/* D-Snap design tokens. Light by default, dark via prefers-color-scheme. */
+:root {
+  color-scheme: light dark;
+
+  --font-sans:
+    system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif;
+  --font-mono:
+    ui-monospace, 'Cascadia Code', 'Cascadia Mono', Consolas, 'SF Mono', Menlo, 'Liberation Mono',
+    monospace;
+
+  --text-xs: 11px;
+  --text-sm: 12px;
+  --text-md: 13px;
+  --text-lg: 15px;
+  --text-xl: 18px;
+
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+
+  --radius-sm: 4px;
+  --radius-md: 6px;
+
+  --bg: #ffffff;
+  --surface-1: #f6f7f9;
+  --surface-2: #eceef2;
+  --border: #d9dde3;
+  --text: #1c2026;
+  --text-muted: #5d6673;
+  --accent: #2463eb;
+  --accent-text: #ffffff;
+  --focus: #2463eb;
+
+  --status-added: #1a7f37;
+  --status-modified: #9a6700;
+  --status-deleted: #cf222e;
+  --status-renamed: #8250df;
+
+  --diff-insert-bg: #e6ffec;
+  --diff-insert-gutter: #ccffd8;
+  --diff-delete-bg: #ffebe9;
+  --diff-delete-gutter: #ffd7d5;
+  --diff-hunk-bg: #ddf4ff;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #16181d;
+    --surface-1: #1d2027;
+    --surface-2: #262a33;
+    --border: #353a45;
+    --text: #e3e6eb;
+    --text-muted: #9aa3b0;
+    --accent: #5b8def;
+    --accent-text: #0d1117;
+    --focus: #79a6ff;
+
+    --status-added: #3fb950;
+    --status-modified: #d29922;
+    --status-deleted: #f85149;
+    --status-renamed: #a371f7;
+
+    --diff-insert-bg: #12261a;
+    --diff-insert-gutter: #1b3a25;
+    --diff-delete-bg: #2d1416;
+    --diff-delete-gutter: #4a1d20;
+    --diff-hunk-bg: #142338;
+  }
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-sans);
+  font-size: var(--text-md);
+}
+
+code,
+pre,
+.mono {
+  font-family: var(--font-mono);
+}
+
+:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 1px;
+}

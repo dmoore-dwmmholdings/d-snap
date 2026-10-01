@@ -1,0 +1,49 @@
+name: app
+
+on:
+  push:
+    branches: [main, 'chain/**']
+  pull_request:
+
+concurrency:
+  group: app-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  frontend:
+    name: frontend (ubuntu)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+      - run: npm ci
+      - run: npm run check
+      - run: npm run lint
+      - run: npm test
+      - run: npm run build
+
+  tauri:
+    name: cargo build dsnap-app (windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # tauri::generate_context! embeds frontendDist, so the frontend must be built first.
+      - run: npm ci
+        working-directory: app
+      - run: npm run build
+        working-directory: app
+      - run: cargo build -p dsnap-app --locked

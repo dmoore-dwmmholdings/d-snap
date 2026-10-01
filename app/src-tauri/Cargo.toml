@@ -1,0 +1,28 @@
+[package]
+name = "dsnap-app"
+description = "D-Snap desktop app (Tauri 2 shell)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+name = "dsnap_app_lib"
+# Desktop only: no mobile targets, so no staticlib/cdylib (cdylib also fails
+# to link on windows-gnu: "export ordinal too large").
+crate-type = ["rlib"]
+
+[build-dependencies]
+tauri-build = { workspace = true }
+
+[dependencies]
+tauri = { workspace = true }
+tauri-plugin-dialog = { workspace = true }
+tauri-plugin-opener = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true
