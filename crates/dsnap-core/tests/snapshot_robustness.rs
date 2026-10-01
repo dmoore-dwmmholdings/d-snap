@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
-use dsnap_core::{ChangeCounts, EntryKind, Error, SnapshotOptions};
+use dsnap_core::{EntryKind, Error, SnapshotOptions};
 use dsnap_test_support::FixtureProject;
 
 use project::{Env, rp, snap, versions};
@@ -87,7 +87,7 @@ fn locked_file_is_skipped_and_its_previous_entry_carried_forward() {
     use std::os::windows::fs::OpenOptionsExt;
     use std::time::Instant;
 
-    use dsnap_core::SkipReason;
+    use dsnap_core::{ChangeCounts, SkipReason};
 
     let fx = FixtureProject::new()
         .file("locked.txt", "v1")
