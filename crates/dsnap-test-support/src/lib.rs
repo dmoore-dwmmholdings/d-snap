@@ -64,8 +64,8 @@ enum Op {
 
 /// Builder for a project folder. Paths are `/`-separated and project-relative.
 ///
-/// [`FixtureProject::build`] applies writes first (in call order), then mtimes, then read-only
-/// flags, so the order of builder calls does not matter for those.
+/// [`FixtureProject::build`] applies files and dirs first (in call order), then symlinks, then
+/// mtimes, then read-only flags, so the order of builder calls does not matter across those.
 #[derive(Debug, Clone, Default)]
 #[must_use]
 pub struct FixtureProject {
@@ -104,7 +104,7 @@ impl FixtureProject {
         self
     }
 
-    /// Mark a file read-only.
+    /// Mark a file or directory read-only.
     pub fn readonly(mut self, path: &str) -> Self {
         self.ops.push(Op::Readonly(rel(path)));
         self
@@ -149,9 +149,17 @@ impl FixtureProject {
         }
     }
 
-    fn apply(self, root: &Path) -> Vec<RelPath> {
+    fn apply(mut self, root: &Path) -> Vec<RelPath> {
+        // Phases: files/dirs, then symlinks (so a Windows link sees whether its target is a
+        // dir), then mtimes, then read-only (setting times on a read-only file fails on
+        // Windows). The sort is stable, so call order holds within a phase.
+        self.ops.sort_by_key(|op| match op {
+            Op::File(..) | Op::Dir(_) => 0,
+            Op::Symlink(..) => 1,
+            Op::Mtime(..) => 2,
+            Op::Readonly(_) => 3,
+        });
         let mut skipped = Vec::new();
-        let mut later = Vec::new();
         for op in self.ops {
             match op {
                 Op::File(p, bytes) => {
@@ -170,20 +178,12 @@ impl FixtureProject {
                         skipped.push(p);
                     }
                 }
-                other => later.push(other),
-            }
-        }
-        // mtimes before read-only: setting times on a read-only file fails on Windows.
-        later.sort_by_key(|op| matches!(op, Op::Readonly(_)));
-        for op in later {
-            match op {
                 Op::Mtime(p, t) => filetime::set_file_mtime(
                     p.to_path(root),
                     filetime::FileTime::from_system_time(t),
                 )
                 .unwrap_or_else(|e| panic!("set mtime {p}: {e}")),
                 Op::Readonly(p) => set_readonly(&p.to_path(root), true),
-                _ => {}
             }
         }
         skipped
@@ -330,8 +330,14 @@ pub fn tree_dirs(root: &Path) -> BTreeSet<RelPath> {
 struct Rng(u64);
 
 impl Rng {
+    /// Seed via splitmix64, a bijection, so distinct seeds give distinct states.
     fn new(seed: u64) -> Self {
-        Self(seed ^ 0x9E37_79B9_7F4A_7C15 | 1)
+        let mut z = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        // xorshift needs a non-zero state; exactly one seed maps to 0.
+        Self(if z == 0 { 0x9E37_79B9_7F4A_7C15 } else { z })
     }
 
     fn next(&mut self) -> u64 {
@@ -444,15 +450,42 @@ mod tests {
         assert_eq!(md.modified().unwrap(), t);
     }
 
+    /// A read-only directory with content is what blocks deletion on unix; without
+    /// `clear_readonly` in `Drop` this test fails there. (On Windows `remove_dir_all` ignores
+    /// the read-only attribute, so it passes either way.)
     #[test]
     fn readonly_fixture_is_cleaned_up_on_drop() {
         let fx = FixtureProject::new()
             .file("d/ro.txt", "x")
+            .file("d/sub/f", "y")
             .readonly("d/ro.txt")
+            .readonly("d/sub")
+            .readonly("d")
             .build();
+        assert!(fs::metadata(fx.path("d")).unwrap().permissions().readonly());
         let root = fx.root().to_path_buf();
         drop(fx);
         assert!(!root.exists(), "fixture dir left behind");
+    }
+
+    #[test]
+    fn symlink_to_dir_declared_before_the_dir() {
+        if !symlinks_supported() {
+            eprintln!("symlinks unsupported here; skipping");
+            return;
+        }
+        let fx = FixtureProject::new()
+            .symlink("link", "dir")
+            .file("dir/a", "1")
+            .build();
+        let ft = fs::symlink_metadata(fx.path("link")).unwrap().file_type();
+        assert!(ft.is_symlink());
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::FileTypeExt;
+            assert!(ft.is_symlink_dir(), "created as a file symlink");
+        }
+        assert!(fx.path("link").join("a").is_file());
     }
 
     #[test]
@@ -494,6 +527,16 @@ mod tests {
         assert_eq!(ta.keys().cloned().collect::<Vec<_>>(), paths);
         assert_eq!(ta, tree_bytes(b.path()));
         assert_ne!(ta, tree_bytes(c.path()));
+    }
+
+    #[test]
+    fn adjacent_seeds_give_different_trees() {
+        let mut seen = std::collections::HashSet::new();
+        for seed in [0u64, 1, 2, 3, 6, 7, u64::MAX - 1, u64::MAX] {
+            let tmp = tempfile::tempdir().unwrap();
+            generate_tree(tmp.path(), 20, seed);
+            assert!(seen.insert(tree_bytes(tmp.path())), "seed {seed} collides");
+        }
     }
 
     #[test]
