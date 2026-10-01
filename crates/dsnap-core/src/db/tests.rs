@@ -30,8 +30,8 @@ fn table_names(db: &Db) -> Vec<String> {
 fn fresh_db_gets_schema_v1() {
     let (_dir, path) = temp_db();
     let db = Db::open(&path).unwrap();
-    assert_eq!(schema::user_version(&db.conn()).unwrap(), 1);
-    assert_eq!(schema::SCHEMA_VERSION, 1);
+    assert_eq!(schema::user_version(&db.conn()).unwrap(), 2);
+    assert_eq!(schema::SCHEMA_VERSION, 2);
     assert_eq!(
         table_names(&db),
         ["blobs", "entries", "projects", "settings", "versions"]
@@ -41,7 +41,7 @@ fn fresh_db_gets_schema_v1() {
 #[test]
 fn in_memory_db_gets_schema_v1() {
     let db = Db::open_in_memory().unwrap();
-    assert_eq!(schema::user_version(&db.conn()).unwrap(), 1);
+    assert_eq!(schema::user_version(&db.conn()).unwrap(), 2);
 }
 
 #[test]
@@ -61,7 +61,7 @@ fn pragmas_are_set() {
     assert_eq!(q("PRAGMA journal_mode"), "wal");
     assert_eq!(q("PRAGMA foreign_keys"), "1");
     assert_eq!(q("PRAGMA busy_timeout"), "5000");
-    assert_eq!(q("PRAGMA synchronous"), "1"); // NORMAL
+    assert_eq!(q("PRAGMA synchronous"), "2"); // FULL: reference removals are durable
 }
 
 #[test]
@@ -77,7 +77,7 @@ fn reopen_is_a_noop() {
             .unwrap();
     }
     let db = Db::open(&path).unwrap();
-    assert_eq!(schema::user_version(&db.conn()).unwrap(), 1);
+    assert_eq!(schema::user_version(&db.conn()).unwrap(), 2);
     let v: String = db
         .conn()
         .query_row(
@@ -113,7 +113,7 @@ fn concurrent_open_of_fresh_file_migrates_once() {
         h.join().unwrap().unwrap();
     }
     let db = Db::open(&path).unwrap();
-    assert_eq!(schema::user_version(&db.conn()).unwrap(), 1);
+    assert_eq!(schema::user_version(&db.conn()).unwrap(), 2);
 }
 
 #[test]
@@ -812,24 +812,86 @@ fn prune_of_rows_whose_files_are_gone_frees_zero_bytes() {
     assert_eq!(count(&db, "blobs"), 0);
 }
 
-#[test]
-fn failed_store_delete_rolls_back_the_batch() {
-    struct Failing;
-    impl BlobFiles for Failing {
-        fn contains(&self, _: &BlobHash) -> bool {
-            true
-        }
-        fn delete(&self, _: &BlobHash) -> crate::Result<u64> {
+/// Store whose delete always fails for one hash (e.g. a file held open by a scanner).
+struct FailingFor(BlobHash, FakeFiles);
+
+impl BlobFiles for FailingFor {
+    fn contains(&self, h: &BlobHash) -> bool {
+        self.1.contains(h)
+    }
+    fn delete(&self, h: &BlobHash) -> crate::Result<u64> {
+        if *h == self.0 {
             Err(Error::io("objects/xx", std::io::Error::other("denied")))
+        } else {
+            self.1.delete(h)
         }
     }
+}
+
+#[test]
+fn failed_store_delete_keeps_the_row_and_reports_the_error() {
     let db = Db::open_in_memory().unwrap();
     db.insert_blob(&blob(b"a")).unwrap();
+    let files = FailingFor(BlobHash::of(b"a"), FakeFiles::with(&[BlobHash::of(b"a")]));
     assert!(matches!(
-        db.prune_unreferenced_with(&Failing, PRUNE_BATCH),
+        db.prune_unreferenced_with(&files, PRUNE_BATCH),
         Err(Error::Io { .. })
     ));
     assert_eq!(count(&db, "blobs"), 1);
+    assert!(files.1.has(&BlobHash::of(b"a")));
+}
+
+#[test]
+fn undeletable_blob_does_not_block_later_batches() {
+    let db = Db::open_in_memory().unwrap();
+    let hashes: Vec<_> = (0..4u8).map(|i| BlobHash::of(&[i])).collect();
+    for i in 0..4u8 {
+        db.insert_blob(&blob(&[i])).unwrap();
+    }
+    // Make the first blob in hash order the stuck one.
+    let stuck = *hashes.iter().min().unwrap();
+    let files = FailingFor(stuck, FakeFiles::with(&hashes));
+
+    // Batch 1 picks only the stuck blob: error, failure counted, row kept.
+    assert!(db.prune_unreferenced_with(&files, 1).is_err());
+    // Later batches move past it.
+    let mut pruned = 0;
+    for _ in 0..3 {
+        pruned += db.prune_unreferenced_with(&files, 1).unwrap().blobs_pruned;
+    }
+    assert_eq!(pruned, 3);
+    assert_eq!(count(&db, "blobs"), 1);
+    assert!(files.1.has(&stuck));
+
+    // A batch mixing a failure and successes commits the successes.
+    db.insert_blob(&blob(b"new")).unwrap();
+    files.1.present.lock().unwrap().insert(BlobHash::of(b"new"));
+    let r = db.prune_unreferenced_with(&files, PRUNE_BATCH).unwrap();
+    assert_eq!(r.blobs_pruned, 1);
+    assert_eq!(count(&db, "blobs"), 1);
+}
+
+#[test]
+fn migration_from_v1_adds_prune_failures() {
+    let (_dir, path) = temp_db();
+    {
+        // Build a v1 database by hand.
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE blobs (hash BLOB PRIMARY KEY, size INTEGER NOT NULL,
+                                 stored_size INTEGER NOT NULL);
+             INSERT INTO blobs VALUES (x'00', 1, 1);
+             PRAGMA user_version = 1;",
+        )
+        .unwrap();
+    }
+    let db = Db::open(&path).unwrap();
+    assert_eq!(schema::user_version(&db.conn()).unwrap(), 2);
+    let f: i64 = db
+        .conn()
+        .query_row("SELECT prune_failures FROM blobs", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(f, 0);
 }
 
 // ---- DSNA-88: sweep orphan blob files ----

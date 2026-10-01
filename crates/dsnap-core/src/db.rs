@@ -9,9 +9,12 @@
 //! against a blob (`Store::put` is a no-op when the file exists) that retention is about to
 //! prune. To make that safe, the SQLite write lock is the single lock for blob lifetime:
 //!
-//! 1. **Only [`Db::prune_unreferenced`] deletes blob files**, and it does so inside one
-//!    `BEGIN IMMEDIATE` transaction: select unreferenced blobs, delete each store file
-//!    ([`Store::delete`]), delete their rows, commit. No other code calls `Store::delete`.
+//! 1. **Only [`Db::prune_unreferenced`] and [`Db::sweep_orphans`] delete blob files**, each
+//!    inside one `BEGIN IMMEDIATE` transaction that also reads which blobs are referenced:
+//!    prune selects unreferenced blob rows, deletes each store file ([`Store::delete`]) and
+//!    its row; sweep reads every referenced hash and calls [`Store::sweep`] with that set.
+//!    No other code calls `Store::delete` or `Store::sweep`, and a referenced set read in an
+//!    earlier transaction must never be used to delete.
 //! 2. **[`Db::insert_version`] verifies before committing.** Inside its own `BEGIN IMMEDIATE`
 //!    transaction, for every distinct blob in the new entries that no existing entry row
 //!    references, it checks [`Store::contains`]. If one is missing it rolls back and returns
@@ -25,6 +28,10 @@
 //! files. Those rows are unreferenced, so step 2 catches any reuse and the next prune removes
 //! them (`Store::delete` of a missing file returns `Ok(0)`). Keep prune batches small (see
 //! `limit`) so the write lock is not held for longer than the busy timeout.
+//!
+//! Every connection runs with `synchronous=FULL`, so a commit that removes references
+//! (`delete_version`, `delete_project`) is on disk before a later prune deletes the files;
+//! with `NORMAL` a power loss could bring the version back without its blobs.
 mod codec;
 mod schema;
 #[cfg(test)]
@@ -90,7 +97,7 @@ pub struct NewVersion {
 impl Db {
     /// Open or create the database at `path` and apply migrations.
     ///
-    /// Uses WAL, `foreign_keys=ON`, `synchronous=NORMAL` and a busy timeout so the CLI and the
+    /// Uses WAL, `foreign_keys=ON`, `synchronous=FULL` and a busy timeout so the CLI and the
     /// app can use the same file at once.
     pub fn open(path: &Path) -> Result<Self> {
         Self::setup(Connection::open(path)?, true)
@@ -371,8 +378,11 @@ impl Db {
     /// Returns `versions_deleted: 0` plus the blobs and bytes freed.
     ///
     /// Call it repeatedly with [`PRUNE_BATCH`] until `blobs_pruned` is 0 to prune everything.
-    /// If a store delete fails, the transaction rolls back and the error is returned; files
-    /// already deleted leave unreferenced rows that the next prune removes.
+    ///
+    /// A blob whose store delete fails keeps its row, and its failure count moves it behind
+    /// every other candidate, so a file that cannot be deleted never blocks later batches.
+    /// The batch still commits the blobs it did delete. If nothing in the batch could be
+    /// deleted, the first delete error is returned (after committing the failure counts).
     pub fn prune_unreferenced(&self, store: &Store, limit: usize) -> Result<RetentionReport> {
         self.prune_unreferenced_with(store, limit)
     }
@@ -384,12 +394,12 @@ impl Db {
         limit: usize,
     ) -> Result<RetentionReport> {
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
-        self.write(|tx| {
+        let (report, first_err) = self.write(|tx| {
             let hashes = {
                 let mut stmt = tx.prepare_cached(
                     "SELECT hash FROM blobs b
                      WHERE NOT EXISTS (SELECT 1 FROM entries e WHERE e.blob_hash = b.hash)
-                     ORDER BY hash LIMIT ?1",
+                     ORDER BY prune_failures, hash LIMIT ?1",
                 )?;
                 let rows = stmt
                     .query_map([limit], |r| r.get::<_, Vec<u8>>(0))?
@@ -399,14 +409,30 @@ impl Db {
                     .collect::<Result<Vec<_>>>()?
             };
             let mut report = RetentionReport::default();
+            let mut first_err = None;
             let mut delete_row = tx.prepare_cached("DELETE FROM blobs WHERE hash = ?1")?;
+            let mut count_failure = tx.prepare_cached(
+                "UPDATE blobs SET prune_failures = prune_failures + 1 WHERE hash = ?1",
+            )?;
             for hash in &hashes {
-                report.bytes_freed = report.bytes_freed.saturating_add(files.delete(hash)?);
-                delete_row.execute([hash.0.as_slice()])?;
-                report.blobs_pruned = report.blobs_pruned.saturating_add(1);
+                match files.delete(hash) {
+                    Ok(freed) => {
+                        delete_row.execute([hash.0.as_slice()])?;
+                        report.bytes_freed = report.bytes_freed.saturating_add(freed);
+                        report.blobs_pruned = report.blobs_pruned.saturating_add(1);
+                    }
+                    Err(e) => {
+                        count_failure.execute([hash.0.as_slice()])?;
+                        first_err.get_or_insert(e);
+                    }
+                }
             }
-            Ok(report)
-        })
+            Ok((report, first_err))
+        })?;
+        match first_err {
+            Some(e) if report.blobs_pruned == 0 => Err(e),
+            _ => Ok(report),
+        }
     }
 
     /// Delete every blob file no entry references, including orphans with no `blobs` row

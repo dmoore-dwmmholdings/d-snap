@@ -61,6 +61,11 @@ const MIGRATIONS: &[&str] = &[
         value_json TEXT NOT NULL
     );
     ",
+    // v2 (DSNA-82 review): failed store deletes move a blob to the back of the prune queue,
+    // so one undeletable file cannot block every later batch.
+    "
+    ALTER TABLE blobs ADD COLUMN prune_failures INTEGER NOT NULL DEFAULT 0;
+    ",
 ];
 
 /// Newest schema version this build knows.
@@ -103,7 +108,11 @@ fn configure(conn: &Connection, file: bool) -> Result<()> {
         }
     }
     conn.pragma_update(None, "foreign_keys", "ON")?;
-    conn.pragma_update(None, "synchronous", "NORMAL")?;
+    // FULL, not NORMAL: in WAL mode NORMAL does not sync the WAL at commit, so a commit that
+    // removes blob references (delete_version, delete_project) could be lost on power loss
+    // after a prune already deleted the blob files. FULL makes every commit durable before
+    // the next transaction can act on it (Rule 1, DSNA-82 review).
+    conn.pragma_update(None, "synchronous", "FULL")?;
     Ok(())
 }
 
