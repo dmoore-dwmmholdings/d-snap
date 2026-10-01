@@ -475,7 +475,8 @@ pub enum ChangeStatus {
     Modified,
     /// Only on the old side.
     Deleted,
-    /// Moved from `from` with matching content.
+    /// Moved from `from`. Content matches, except for a case-only rename in case-insensitive
+    /// mode, where `old` and `new` may also differ in content, kind or flags (DSNA-89).
     Renamed {
         /// Old path.
         from: RelPath,

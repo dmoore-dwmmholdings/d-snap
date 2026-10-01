@@ -14,8 +14,9 @@ use crate::types::{
 /// Options for [`diff_entries`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct EntryDiffOptions {
-    /// Treat paths that differ only in case as the same file. When content is identical, the
-    /// change is a [`ChangeStatus::Renamed`] instead of a delete plus an add. Default:
+    /// Treat paths that differ only in case as the same file: a deleted and an added path that
+    /// differ only in case become one [`ChangeStatus::Renamed`], even when the content or kind
+    /// also changed (on a case-insensitive file system both names are one file). Default:
     /// `cfg!(windows)`.
     pub case_insensitive: bool,
     /// Pair a deleted and an added file with the same non-empty content as a
@@ -46,7 +47,9 @@ const MAX_RANKED_PAIRS: usize = 512 * 512;
 /// - File content is compared by blob hash. When either side has no hash (an unhashed walk
 ///   result), size and mtime are compared instead, so callers should hash first.
 /// - With [`EntryDiffOptions::case_insensitive`], a deleted and an added path that differ only
-///   in case and have identical content become one [`ChangeStatus::Renamed`].
+///   in case become one [`ChangeStatus::Renamed`], whatever their content or kind; compare
+///   the change's `old` and `new` entries to see what else changed. Among several candidates
+///   identical content wins, then the same kind, then path order.
 /// - With [`EntryDiffOptions::detect_renames`], a remaining deleted and added file with the
 ///   same blob hash become one [`ChangeStatus::Renamed`]. Matching is one-to-one. Among
 ///   several candidates the same file name wins, then the nearest directory, then path order.
@@ -172,9 +175,12 @@ fn renamed(o: &Entry, n: &Entry) -> FileChange {
     )
 }
 
-/// Pair deleted and added entries whose paths differ only in case and whose content matches.
-/// Paired entries are removed from `deleted` and `added`. Pairing is one-to-one and follows
-/// path order, so it is deterministic.
+/// Pair deleted and added entries whose paths differ only in case, whatever their content or
+/// kind (DSNA-89: on a case-insensitive file system both names are one file, so a delete plus
+/// an add would be wrong). Paired entries are removed from `deleted` and `added`.
+///
+/// Pairing is one-to-one. For each added path (in path order) the best free candidate wins:
+/// identical content, then the same kind, then old path order. So it is deterministic.
 fn pair_case_renames<'a>(
     deleted: &mut Vec<&'a Entry>,
     added: &mut Vec<&'a Entry>,
@@ -193,9 +199,19 @@ fn pair_case_renames<'a>(
         let Some(cands) = by_key.get(&fold(&n.path)) else {
             continue;
         };
-        if let Some(&i) = cands
+        let rank = |i: usize| {
+            let o = deleted[i];
+            (
+                !same_content(o, n),
+                std::mem::discriminant(&o.kind) != std::mem::discriminant(&n.kind),
+                i,
+            )
+        };
+        if let Some(i) = cands
             .iter()
-            .find(|&&i| !used_old[i] && same_content(deleted[i], n))
+            .copied()
+            .filter(|&i| !used_old[i])
+            .min_by_key(|&i| rank(i))
         {
             used_old[i] = true;
             used_new[j] = true;
@@ -464,6 +480,8 @@ mod tests {
         unhashed_same.blob = None;
         let mut unhashed_grown = unhashed_same.clone();
         unhashed_grown.size = 5;
+        let mut ro_foo = file("foo.rs", "x");
+        ro_foo.readonly = true;
 
         #[rustfmt::skip]
         let cases: Vec<Case> = vec![
@@ -514,7 +532,35 @@ mod tests {
                 vec![file("Foo.rs", "x")],
                 vec![file("foo.rs", "y")],
                 CI,
+                vec![("foo.rs", "R<-Foo.rs")],
+            ),
+            (
+                "case rename with content change, case-sensitive",
+                vec![file("Foo.rs", "x")],
+                vec![file("foo.rs", "y")],
+                CS,
                 vec![("Foo.rs", "D"), ("foo.rs", "A")],
+            ),
+            (
+                "case rename with read-only change",
+                vec![file("Foo.rs", "x")],
+                vec![ro_foo],
+                CI,
+                vec![("foo.rs", "R<-Foo.rs")],
+            ),
+            (
+                "case rename with kind change",
+                vec![file("Foo", "x")],
+                vec![dir("foo")],
+                CI,
+                vec![("foo", "R<-Foo")],
+            ),
+            (
+                "case rename of symlink with new target",
+                vec![link("L", "x")],
+                vec![link("l", "y")],
+                CI,
+                vec![("l", "R<-L")],
             ),
             (
                 "case rename of directory part",
@@ -583,6 +629,43 @@ mod tests {
         let new = vec![file("foo", "x")];
         let got = summary(&diff_entries(&old, &new, CI));
         assert_eq!(got, owned(vec![("Foo", "D"), ("foo", "R<-FOO")]));
+    }
+
+    #[test]
+    fn case_rename_with_edit_carries_both_blobs() {
+        let changes = diff_entries(&[file("Foo.rs", "x")], &[file("foo.rs", "y")], CI);
+        let [c] = changes.as_slice() else {
+            panic!("want one change, got {changes:?}");
+        };
+        assert_eq!(c.status, ChangeStatus::Renamed { from: p("Foo.rs") });
+        assert_eq!(
+            c.old.as_ref().and_then(|e| e.blob),
+            Some(BlobHash::of(b"x"))
+        );
+        assert_eq!(
+            c.new.as_ref().and_then(|e| e.blob),
+            Some(BlobHash::of(b"y"))
+        );
+        assert_eq!(count_changes(&changes).modified, 1);
+    }
+
+    #[test]
+    fn case_pairing_prefers_same_content_then_same_kind() {
+        // Several old paths fold to `foo` (possible after a snapshot on a case-sensitive FS).
+        let old = vec![dir("FOO"), file("FoO", "edited"), file("fOO", "x")];
+        let new = vec![file("foo", "x")];
+        let got = summary(&diff_entries(&old, &new, CI));
+        assert_eq!(
+            got,
+            owned(vec![("FOO", "D"), ("FoO", "D"), ("foo", "R<-fOO")])
+        );
+
+        let old = vec![dir("FOO"), file("FoO", "y"), file("fOO", "z")];
+        let got = summary(&diff_entries(&old, &new, CI));
+        assert_eq!(
+            got,
+            owned(vec![("FOO", "D"), ("fOO", "D"), ("foo", "R<-FoO")])
+        );
     }
 
     #[test]
