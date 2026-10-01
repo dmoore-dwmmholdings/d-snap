@@ -418,9 +418,13 @@ impl Db {
     /// has not committed yet is safe: the blob is new to the database, so its
     /// [`Db::insert_version`] re-checks it and returns [`Error::BlobMissing`].
     ///
-    /// Not public yet: the real sweeper is `Store::sweep` (DSNA-29, Chain C), which is not on
-    /// `main`; `Db::sweep_orphans(&Store)` is a one-line wrapper once it lands.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Reports blob files deleted and bytes freed (blobs and temp files); `versions_deleted`
+    /// is 0.
+    pub fn sweep_orphans(&self, store: &Store) -> Result<RetentionReport> {
+        self.sweep_orphans_with(store)
+    }
+
+    /// [`Db::sweep_orphans`] against any [`BlobSweep`] (tests use a fake store).
     pub(crate) fn sweep_orphans_with(&self, files: &dyn BlobSweep) -> Result<RetentionReport> {
         self.write(|tx| {
             let referenced = {
@@ -521,7 +525,6 @@ impl BlobFiles for Store {
 }
 
 /// What a store sweep removed.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct Swept {
     /// Blob files deleted.
     pub(crate) deleted: u64,
@@ -530,12 +533,20 @@ pub(crate) struct Swept {
 }
 
 /// Whole-store sweep used by [`Db::sweep_orphans_with`]: delete every blob file whose hash
-/// is not in `referenced` (and stale temp files). `Store::sweep` (DSNA-29) implements it once
-/// Chain C is merged.
-#[cfg_attr(not(test), allow(dead_code))]
+/// is not in `referenced` (and stale temp files). [`Store::sweep`] is the real implementation.
 pub(crate) trait BlobSweep {
     /// Delete unreferenced blob files.
     fn sweep(&self, referenced: &HashSet<BlobHash>) -> Result<Swept>;
+}
+
+impl BlobSweep for Store {
+    fn sweep(&self, referenced: &HashSet<BlobHash>) -> Result<Swept> {
+        let r = Store::sweep(self, referenced)?;
+        Ok(Swept {
+            deleted: r.deleted,
+            bytes_freed: r.bytes_freed,
+        })
+    }
 }
 
 /// Protocol step 2 (module docs): every blob the new entries use that no committed entry

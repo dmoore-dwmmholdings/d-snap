@@ -158,7 +158,7 @@ use std::time::Instant;
 
 use crate::types::{AutoSnapshot, EntryKind};
 
-/// In-memory stand-in for the blob store (Chain C's `Store` is not on main yet).
+/// In-memory stand-in for the blob store, so tests can control which blob files exist.
 #[derive(Default)]
 struct FakeFiles {
     /// `contains` is always true (for tests that do not exercise the blob check).
