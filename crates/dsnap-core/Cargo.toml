@@ -33,5 +33,9 @@ tempfile.workspace = true
 name = "line_diff"
 harness = false
 
+[[bench]]
+name = "snapshot"
+harness = false
+
 [lints]
 workspace = true

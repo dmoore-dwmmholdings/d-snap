@@ -37,6 +37,8 @@ jobs:
         run: cargo test --workspace --locked
       - name: Diff performance (release, DSNA-40)
         run: cargo test -p dsnap-core --release --locked --test diff_perf -- --ignored --nocapture
+      - name: Snapshot performance (release, DSNA-52)
+        run: cargo test -p dsnap-core --release --locked --test snapshot_perf -- --ignored --nocapture
       - name: Docs
         if: matrix.os == 'ubuntu-latest'
         run: cargo doc --workspace --no-deps --locked

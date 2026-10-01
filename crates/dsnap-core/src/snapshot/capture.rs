@@ -4,13 +4,15 @@
 //! 1. Walk the project with one [`IgnoreRules`] and the global size cap.
 //! 2. Fast path: a file whose kind, size and mtime match its entry in the latest version
 //!    reuses that entry's hash without being opened.
-//! 3. Every other file is hashed (and, in [`Mode::Store`], stored) in parallel on the rayon
-//!    pool, which is bounded by the CPU count.
+//! 3. Every other file is hashed in parallel on the global rayon pool (CPU count). Storing
+//!    ([`Mode::Store`]) mostly waits on fsync and renames, so it uses a wider pool of at
+//!    least [`MIN_STORE_THREADS`] threads.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -232,19 +234,27 @@ impl Dsnap {
 
         let total = to_hash.len() as u64;
         let done = AtomicU64::new(0);
-        let results: Vec<Result<Hashed>> = to_hash
-            .par_iter()
-            .map(|&i| {
-                hooks.check_cancel()?;
-                let e = &entries[i];
-                let out = capture_file(read, &e.path.to_path(&root), e, rules_for);
-                let n = done.fetch_add(1, Ordering::Relaxed) + 1;
-                if n % HASH_PROGRESS_EVERY == 0 {
-                    hooks.report(Stage::Hash, n, Some(total), Some(&e.path));
-                }
-                out
-            })
-            .collect();
+        let run = || -> Vec<Result<Hashed>> {
+            to_hash
+                .par_iter()
+                .map(|&i| {
+                    hooks.check_cancel()?;
+                    let e = &entries[i];
+                    let out = capture_file(read, &e.path.to_path(&root), e, rules_for);
+                    let n = done.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n % HASH_PROGRESS_EVERY == 0 {
+                        hooks.report(Stage::Hash, n, Some(total), Some(&e.path));
+                    }
+                    out
+                })
+                .collect()
+        };
+        // Storing waits on fsync and renames far more than on the CPU, so it runs on a wider
+        // pool; hashing alone stays on the global (CPU-sized) pool.
+        let results = match (mode, store_pool()) {
+            (Mode::Store, Some(pool)) => pool.install(run),
+            _ => run(),
+        };
         hooks.check_cancel()?;
         if total > 0 {
             hooks.report(Stage::Hash, total, Some(total), None);
@@ -305,6 +315,24 @@ impl Dsnap {
             new_blobs,
         })
     }
+}
+
+/// Threads for storing files: at least [`MIN_STORE_THREADS`], or the CPU count if higher.
+pub(crate) const MIN_STORE_THREADS: usize = 16;
+
+/// The pool that captures files in [`Mode::Store`], built on first use (`None` if the OS
+/// refuses the threads; the global pool is used then).
+fn store_pool() -> Option<&'static rayon::ThreadPool> {
+    static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
+    POOL.get_or_init(|| {
+        let cpus = std::thread::available_parallelism().map_or(1, |n| n.get());
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(cpus.max(MIN_STORE_THREADS))
+            .thread_name(|i| format!("dsnap-store-{i}"))
+            .build()
+            .ok()
+    })
+    .as_ref()
 }
 
 /// Reads one file: stores it ([`Mode::Store`]) or only hashes it.
