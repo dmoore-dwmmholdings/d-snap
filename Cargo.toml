@@ -27,6 +27,7 @@ clap = { version = "4.5.50", features = ["derive"] }
 filetime = "0.2.26"
 ignore = "0.4.24"
 notify = "8.2.0"
+proptest = "1.9.0"
 rayon = "1.11.0"
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 serde = { version = "1.0.228", features = ["derive"] }
