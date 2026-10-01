@@ -172,7 +172,13 @@ fn concurrent_prune_never_loses_a_reused_blob() {
     std::thread::scope(|s| {
         s.spawn(|| {
             while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                ds.prune_blobs().unwrap();
+                // Both sides hammer the write lock in tight loops, so a busy timeout can
+                // occur under a loaded test run; it is not what this test checks.
+                match ds.prune_blobs() {
+                    Ok(_) => {}
+                    Err(e) if is_busy(&e) => {}
+                    Err(e) => panic!("{e}"),
+                }
             }
         });
         let reader = common::Cli::open(home.path());
@@ -204,16 +210,23 @@ fn concurrent_prune_never_loses_a_reused_blob() {
                 ) {
                     Ok(v) => break v,
                     Err(Error::BlobMissing(_)) => retries += 1,
+                    Err(e) if is_busy(&e) => {}
                     Err(e) => panic!("{e}"),
                 }
             };
             assert_eq!(reader.store.get(&hash_bytes(content)).unwrap(), content);
             // Make it unreferenced again for the next round.
-            cli.db.delete_version(v.id).unwrap();
+            while let Err(e) = cli.db.delete_version(v.id) {
+                assert!(is_busy(&e), "{e}");
+            }
         }
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         eprintln!("BlobMissing retries: {retries}");
     });
+}
+
+fn is_busy(e: &Error) -> bool {
+    matches!(e, Error::Db(d) if d.sqlite_error_code() == Some(rusqlite::ErrorCode::DatabaseBusy))
 }
 
 /// Hold `path` so it cannot be deleted until the guard drops.
@@ -281,4 +294,99 @@ fn undeletable_blob_is_a_warning_not_an_error() {
     let r = ds.prune_blobs().unwrap();
     assert_eq!((r.blobs_pruned, r.blobs_failed), (1, 0));
     assert!(ds.read_blob(&a_hash).is_err());
+}
+
+/// DSNA-98: only the manual prune sweeps orphan files (no `blobs` row). Retention, version
+/// delete and project removal leave them alone.
+#[test]
+fn only_manual_prune_sweeps_orphans() {
+    let (_h, _d, ds, cli, p) = setup();
+    set_keep(&ds, 1);
+    cli.commit_one(p, b"a");
+    let v = cli.commit(p, &[("f", b"b")]);
+    cli.commit_one(p, b"c");
+    let orphan = cli.store.put(b"orphan").unwrap();
+
+    ds.delete_version(v.id).unwrap();
+    ds.apply_retention(p).unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let q = ds.add_project(other.path(), None).unwrap().id;
+    ds.remove_project(q, true).unwrap();
+    assert!(cli.store.contains(&orphan.hash));
+
+    let r = ds.prune_blobs().unwrap();
+    assert_eq!(r.blobs_pruned, 1);
+    assert_eq!(r.bytes_freed, orphan.stored_size);
+    assert!(!cli.store.contains(&orphan.hash));
+    assert_eq!(ds.read_blob(&hash_bytes(b"c")).unwrap(), b"c");
+}
+
+/// DSNA-98 measurement: `Db::sweep_orphans` (via `prune_blobs`) on a 100k-object store.
+/// Run with `cargo test -p dsnap-core --release --test retention -- --ignored --nocapture`.
+#[test]
+#[ignore = "slow; measurement for DSNA-98"]
+fn sweep_timing_100k_objects() {
+    use std::time::Instant;
+    const N: usize = 100_000;
+    const ORPHANS: usize = 1_000;
+    let (_h, _d, ds, cli, p) = setup();
+
+    let t = Instant::now();
+    let mut entries = Vec::with_capacity(N);
+    let mut blobs = Vec::with_capacity(N);
+    for i in 0..N + ORPHANS {
+        // Sweep looks only at file names, so write placeholder objects directly (a real
+        // `put` fsyncs each one and takes far longer to set up).
+        let content = format!("object {i}");
+        let hash = hash_bytes(content.as_bytes());
+        let path = cli.store.path_of(&hash);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"placeholder").unwrap();
+        let info = dsnap_core::BlobInfo {
+            hash,
+            size: content.len() as u64,
+            stored_size: 11,
+        };
+        if i < N {
+            blobs.push(info);
+            entries.push(dsnap_core::Entry {
+                path: dsnap_core::RelPath::new(format!("d{}/f{i}", i % 100)).unwrap(),
+                kind: dsnap_core::EntryKind::File,
+                blob: Some(info.hash),
+                size: info.size,
+                mtime_ns: 0,
+                readonly: false,
+            });
+        }
+    }
+    entries.sort_by(|a, b| a.path.cmp(&b.path));
+    cli.db
+        .insert_version(
+            &dsnap_core::db::NewVersion {
+                project_id: p,
+                label: "big".into(),
+                created_at_ms: 0,
+                kind: dsnap_core::VersionKind::Cli,
+                unstable: false,
+                counts: Default::default(),
+                entries,
+                new_blobs: blobs,
+            },
+            &cli.store,
+        )
+        .unwrap();
+    eprintln!("setup: {:?}", t.elapsed());
+
+    let t = Instant::now();
+    let r = ds.prune_blobs().unwrap();
+    eprintln!(
+        "prune_blobs with {ORPHANS} orphans: {:?} ({r:?})",
+        t.elapsed()
+    );
+    assert_eq!(r.blobs_pruned as usize, ORPHANS);
+
+    let t = Instant::now();
+    let r = ds.prune_blobs().unwrap();
+    eprintln!("prune_blobs on a clean store: {:?} ({r:?})", t.elapsed());
+    assert_eq!(r.blobs_pruned, 0);
 }

@@ -48,10 +48,28 @@ impl Dsnap {
         self.apply_retention(project)
     }
 
-    /// Delete blobs no version references, by calling `Db::prune_unreferenced` in batches.
-    /// Never delete store files directly (see the `db` module docs, DSNA-80).
+    /// Manual full prune: delete blobs no version references by calling
+    /// `Db::prune_unreferenced` in batches, then run `Db::sweep_orphans` to remove blob files
+    /// with no database row (left by snapshots that never committed) and stale temp files.
+    ///
+    /// The sweep walks the whole store while holding the database write lock, so a
+    /// concurrent snapshot may wait or fail with a busy error; that is why only this manual
+    /// action sweeps, never retention, version delete or project removal (DSNA-98). Blob
+    /// files that cannot be deleted are reported in `blobs_failed`, not as an error. Never
+    /// delete store files directly (see the `db` module docs, DSNA-80).
     pub fn prune_blobs(&self) -> Result<RetentionReport> {
-        self.prune_unreferenced_all()
+        let mut total = self.prune_unreferenced_all()?;
+        match self.db.sweep_orphans(&self.store) {
+            Ok(r) => {
+                total.blobs_pruned = total.blobs_pruned.saturating_add(r.blobs_pruned);
+                total.bytes_freed = total.bytes_freed.saturating_add(r.bytes_freed);
+            }
+            // The sweep stops at the first file it cannot delete and rolls back; what it
+            // deleted is gone either way and the next sweep retries the rest.
+            Err(Error::Io { .. }) => total.blobs_failed = total.blobs_failed.max(1),
+            Err(e) => return Err(e),
+        }
+        Ok(total)
     }
 
     /// Call [`crate::db::Db::prune_unreferenced`] with [`PRUNE_BATCH`] until it frees
