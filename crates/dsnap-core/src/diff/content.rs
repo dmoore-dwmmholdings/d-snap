@@ -34,13 +34,14 @@ pub enum ContentClass {
 ///
 /// Images are recognised by magic number (PNG, JPEG, GIF, WebP, BMP, ICO), and SVG by a
 /// `.svg` extension plus an `<svg` tag near the start. Otherwise content with a UTF-16 byte
-/// order mark is text, content with a NUL byte is binary, and everything else is text.
+/// order mark that decodes plausibly (see [`plausible_utf16`]) is text, content with a NUL
+/// byte is binary, and everything else is text.
 pub fn classify(path: &RelPath, bytes: &[u8]) -> ContentClass {
     let head = &bytes[..bytes.len().min(SNIFF_BYTES)];
     if let Some(mime) = image_mime(head) {
         return ContentClass::Image(mime.to_owned());
     }
-    if lines::has_utf16_bom(head) {
+    if plausible_utf16(head, bytes.len() > head.len()) {
         return ContentClass::Text;
     }
     if head.contains(&0) {
@@ -66,12 +67,76 @@ fn image_mime(head: &[u8]) -> Option<&'static str> {
         // "BM" alone is too weak (plain text can start with it); the reserved header fields
         // of a real bitmap are zero.
         Some("image/bmp")
-    } else if head.len() >= 6 && head.starts_with(&[0, 0, 1, 0]) && head[4..6] != [0, 0] {
-        // ICONDIR: reserved 0, type 1, image count > 0.
+    } else if is_ico(head) {
         Some("image/x-icon")
     } else {
         None
     }
+}
+
+/// ICONDIR (reserved 0, type 1, image count > 0) plus a sane first ICONDIRENTRY: reserved
+/// byte 0, colour planes 0 or 1, and image data after the directory.
+fn is_ico(head: &[u8]) -> bool {
+    let [
+        0,
+        0,
+        1,
+        0,
+        c0,
+        c1,
+        _,
+        _,
+        _,
+        reserved,
+        p0,
+        p1,
+        _,
+        _,
+        _,
+        _,
+        _,
+        _,
+        o0,
+        o1,
+        o2,
+        o3,
+        ..,
+    ] = *head
+    else {
+        return false;
+    };
+    let count = u64::from(u16::from_le_bytes([c0, c1]));
+    let planes = u16::from_le_bytes([p0, p1]);
+    let offset = u64::from(u32::from_le_bytes([o0, o1, o2, o3]));
+    count > 0 && reserved == 0 && planes <= 1 && offset >= 6 + 16 * count
+}
+
+/// True when `head` starts with a UTF-16 byte order mark and the code units after it look
+/// like text: no NUL units, no C0 control characters other than tab, LF, VT, FF, CR and ESC,
+/// and no unpaired surrogates (a high surrogate cut off by the end of the sniff window is
+/// allowed when `truncated`). Binary data that happens to start with `FF FE` or `FE FF`
+/// fails this and falls through to the NUL check.
+pub fn plausible_utf16(head: &[u8], truncated: bool) -> bool {
+    type Unit = fn([u8; 2]) -> u16;
+    let (body, unit): (&[u8], Unit) = match head {
+        [0xFF, 0xFE, rest @ ..] => (rest, u16::from_le_bytes),
+        [0xFE, 0xFF, rest @ ..] => (rest, u16::from_be_bytes),
+        _ => return false,
+    };
+    let mut units = body.chunks_exact(2).map(|c| unit([c[0], c[1]]));
+    while let Some(u) = units.next() {
+        match u {
+            0x0000..=0x0008 | 0x000E..=0x001A | 0x001C..=0x001F => return false,
+            0xD800..=0xDBFF => match units.next() {
+                Some(0xDC00..=0xDFFF) => {}
+                None if truncated => {}
+                _ => return false,
+            },
+            0xDC00..=0xDFFF => return false,
+            _ => {}
+        }
+    }
+    true
 }
 
 fn is_svg(path: &RelPath, head: &[u8]) -> bool {
@@ -257,6 +322,59 @@ mod tests {
         assert_eq!(classify(&a, &late_nul), ContentClass::Binary);
     }
 
+    fn utf16(be: bool, s: &str) -> Vec<u8> {
+        let mut b = if be {
+            vec![0xFE, 0xFF]
+        } else {
+            vec![0xFF, 0xFE]
+        };
+        for u in s.encode_utf16() {
+            b.extend(if be { u.to_be_bytes() } else { u.to_le_bytes() });
+        }
+        b
+    }
+
+    #[test]
+    fn utf16_bom_needs_plausible_text() {
+        let a = p("a.txt");
+        for be in [false, true] {
+            assert_eq!(
+                classify(&a, &utf16(be, "héllo\r\n\tworld 🌍\n")),
+                ContentClass::Text
+            );
+            // NUL code unit, C0 control, lone surrogates: binary after a BOM.
+            let mut nul = utf16(be, "ab");
+            nul.extend([0, 0]);
+            assert_eq!(classify(&a, &nul), ContentClass::Binary, "be={be}");
+            assert_eq!(classify(&a, &utf16(be, "a\u{1}b")), ContentClass::Binary);
+            let lone_low: Vec<u8> = if be {
+                vec![0xFE, 0xFF, 0xDC, 0x00]
+            } else {
+                vec![0xFF, 0xFE, 0x00, 0xDC]
+            };
+            assert!(!plausible_utf16(&lone_low, false));
+            let high_then_a: Vec<u8> = if be {
+                vec![0xFE, 0xFF, 0xD8, 0x3D, 0x00, 0x61]
+            } else {
+                vec![0xFF, 0xFE, 0x3D, 0xD8, 0x61, 0x00]
+            };
+            assert!(!plausible_utf16(&high_then_a, false));
+            // A high surrogate cut off by the sniff window is fine; at the true end it is not.
+            let cut = &high_then_a[..4];
+            assert!(plausible_utf16(cut, true));
+            assert!(!plausible_utf16(cut, false));
+        }
+        // Binary that happens to start with a BOM (e.g. random bytes with NULs).
+        let mut blob = vec![0xFF, 0xFE, 0x10, 0x00, 0x00, 0x00, 0x00, 0x7F];
+        blob.extend([0u8; 32]);
+        assert_eq!(classify(&a, &blob), ContentClass::Binary);
+        // A long UTF-16 file cut mid-pair at 8 KiB stays text.
+        let mut long = utf16(false, &"x".repeat(SNIFF_BYTES / 2 - 2));
+        long.extend("🌍 tail".encode_utf16().flat_map(u16::to_le_bytes));
+        assert_eq!(long[..SNIFF_BYTES].len(), SNIFF_BYTES);
+        assert_eq!(classify(&a, &long), ContentClass::Text);
+    }
+
     #[test]
     fn classifies_images_by_magic_number() {
         let x = p("no_extension");
@@ -271,10 +389,21 @@ mod tests {
         let mut bmp = b"BM\x3a\0\0\0\0\0\0\0\x36\0\0\0".to_vec();
         bmp.extend([0u8; 16]);
         assert_eq!(classify(&x, &bmp), image("image/bmp"));
+        // ICONDIR (1 image) + ICONDIRENTRY: 16x16, 0 colours, reserved 0, 1 plane, 32 bpp,
+        // 0x68 bytes at offset 22.
+        let ico = b"\0\0\x01\0\x01\0\x10\x10\0\0\x01\0\x20\0\x68\0\0\0\x16\0\0\0";
+        assert_eq!(classify(&x, ico), image("image/x-icon"));
+        // Same 4-byte prefix without a sane directory entry: not an icon.
         assert_eq!(
             classify(&x, b"\0\0\x01\0\x01\0\x10\x10\0\0"),
-            image("image/x-icon")
+            ContentClass::Binary
         );
+        let mut bad = ico.to_vec();
+        bad[9] = 7; // reserved byte
+        assert_eq!(classify(&x, &bad), ContentClass::Binary);
+        let mut bad = ico.to_vec();
+        bad[18] = 4; // image data inside the directory
+        assert_eq!(classify(&x, &bad), ContentClass::Binary);
         // Text that merely starts with "BM" stays text.
         assert_eq!(
             classify(&x, b"BMW owners manual, chapter one: getting started\n"),

@@ -554,11 +554,13 @@ pub struct DiffLine {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Hunk {
-    /// 1-based first old line (0 when the old range is empty).
+    /// 1-based first old line. When the old range is empty, the line after which the new
+    /// lines go (0 = before the first line), as in unified diffs.
     pub old_start: u32,
     /// Number of old lines.
     pub old_len: u32,
-    /// 1-based first new line (0 when the new range is empty).
+    /// 1-based first new line. When the new range is empty, the line after which the old
+    /// lines were (0 = before the first line), as in unified diffs.
     pub new_start: u32,
     /// Number of new lines.
     pub new_len: u32,

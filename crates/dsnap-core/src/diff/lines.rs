@@ -211,8 +211,8 @@ impl<'a> Prepared<'a> {
         let old_keys = keys(&old_raw);
         let new_keys = keys(&new_raw);
         Self {
-            old_lines: old_raw.into_iter().map(strip_eol).collect(),
-            new_lines: new_raw.into_iter().map(strip_eol).collect(),
+            old_lines: display_lines(old_raw),
+            new_lines: display_lines(new_raw),
             old_keys,
             new_keys,
         }
@@ -502,6 +502,22 @@ fn normalize_ops(ops: Vec<DiffOp>) -> Vec<DiffOp> {
     out
 }
 
+/// Lines as shown: no line ending, and no UTF-8 BOM (U+FEFF) on the first line. The BOM stays
+/// in the comparison key, so adding or removing it still marks line 1 as changed.
+fn display_lines(raw: Vec<&str>) -> Vec<&str> {
+    raw.into_iter()
+        .enumerate()
+        .map(|(i, l)| {
+            let l = strip_eol(l);
+            if i == 0 {
+                l.strip_prefix('\u{FEFF}').unwrap_or(l)
+            } else {
+                l
+            }
+        })
+        .collect()
+}
+
 fn strip_eol(line: &str) -> &str {
     let line = line.strip_suffix('\n').unwrap_or(line);
     line.strip_suffix('\r').unwrap_or(line)
@@ -617,9 +633,14 @@ fn span(mut ranges: impl Iterator<Item = Range<usize>>) -> Range<usize> {
     ranges.fold(first, |acc, r| acc.start.min(r.start)..acc.end.max(r.end))
 }
 
-/// 1-based first line of a range, or 0 when the range is empty.
+/// 1-based first line of a range. For an empty range, the line before the gap (0 at the
+/// top), as in unified diffs.
 fn start_no(r: &Range<usize>) -> u32 {
-    if r.is_empty() { 0 } else { line_no(r.start) }
+    if r.is_empty() {
+        saturating_u32(r.start)
+    } else {
+        line_no(r.start)
+    }
 }
 
 fn line_no(index: usize) -> u32 {
@@ -834,6 +855,37 @@ mod tests {
         let new = b"a\nb\n";
         assert_eq!(line_counts_bytes(old, new, &opts()), (1, 1));
         assert_eq!(line_counts_bytes(old, new, &ws()), (0, 0));
+        // The BOM is not part of the displayed text.
+        let hunks = diff_bytes(old, b"a\nB\n", &opts());
+        assert!(hunks[0].lines.iter().all(|l| !l.text.contains('\u{FEFF}')));
+        assert_eq!(render(&hunks), "@@ -1,2 +1,2 @@\n-a\n-b\n+a\n+B\n");
+    }
+
+    #[test]
+    fn empty_side_start_is_the_line_before_the_gap() {
+        let zero = DiffOptions {
+            context: 0,
+            ..opts()
+        };
+        let old = numbered(10);
+        // Pure delete of lines 4-5: the new side resumes after new line 3.
+        let new = old.replace("line 4\nline 5\n", "");
+        assert_eq!(
+            render(&diff_text(&old, &new, &zero)),
+            "@@ -4,2 +3,0 @@\n-line 4\n-line 5\n"
+        );
+        // Pure insert after old line 7.
+        let new = old.replace("line 7\n", "line 7\nx\n");
+        assert_eq!(
+            render(&diff_text(&old, &new, &zero)),
+            "@@ -7,0 +8,1 @@\n+x\n"
+        );
+        // At the top of the file the line before the gap is 0.
+        let new = old.replace("line 1\n", "");
+        assert_eq!(
+            render(&diff_text(&old, &new, &zero)),
+            "@@ -1,1 +0,0 @@\n-line 1\n"
+        );
     }
 
     type CellView<'a> = Option<(u32, &'a str, bool)>;
