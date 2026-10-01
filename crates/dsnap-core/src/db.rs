@@ -27,8 +27,12 @@
 //! `limit`) so the write lock is not held for longer than the busy timeout.
 #![allow(unused_variables)] // stub signatures; remove when implemented
 
+mod schema;
+#[cfg(test)]
+mod tests;
+
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 use rusqlite::Connection;
 
@@ -43,7 +47,7 @@ use crate::types::{
 /// Database handle. Thread-safe; serialises access to one connection.
 #[derive(Debug)]
 pub struct Db {
-    #[allow(dead_code)] // used once Chain D implements the db
+    #[cfg_attr(not(test), allow(dead_code))] // read by the repository methods (DSNA-31)
     pub(crate) conn: Mutex<Connection>,
 }
 
@@ -70,13 +74,30 @@ pub struct NewVersion {
 
 impl Db {
     /// Open or create the database at `path` and apply migrations.
+    ///
+    /// Uses WAL, `foreign_keys=ON`, `synchronous=NORMAL` and a busy timeout so the CLI and the
+    /// app can use the same file at once.
     pub fn open(path: &Path) -> Result<Self> {
-        todo!("DSNA-7")
+        Self::setup(Connection::open(path)?, true)
     }
 
     /// Open a private in-memory database (tests).
     pub fn open_in_memory() -> Result<Self> {
-        todo!("DSNA-7")
+        Self::setup(Connection::open_in_memory()?, false)
+    }
+
+    fn setup(mut conn: Connection, file: bool) -> Result<Self> {
+        schema::prepare(&mut conn, file)?;
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))] // used by the repository methods (DSNA-31)
+    /// Lock the connection. A panic while holding the lock drops any open transaction (which
+    /// rolls it back), so a poisoned lock still guards a consistent connection.
+    fn conn(&self) -> MutexGuard<'_, Connection> {
+        self.conn.lock().unwrap_or_else(|p| p.into_inner())
     }
 
     /// Insert a project and return its id.
