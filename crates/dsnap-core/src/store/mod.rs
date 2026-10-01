@@ -151,45 +151,25 @@ impl Store {
     /// Open a streaming, hash-verifying reader over a blob's decompressed bytes.
     ///
     /// The hash is checked when the reader reaches the end; a mismatch or a bad zstd frame is
-    /// an [`io::ErrorKind::InvalidData`] error from `read`. Do not trust the bytes read until
-    /// the reader has returned `Ok(0)`. A missing blob is [`crate::Error::NotFound`].
+    /// an [`io::ErrorKind::InvalidData`] error from `read`. A failure to read the object file
+    /// itself keeps its own kind (see [`BlobReader::io_failed`]). Do not trust the bytes read
+    /// until the reader has returned `Ok(0)`. A missing blob is [`crate::Error::NotFound`].
     pub fn open_reader(&self, hash: &BlobHash) -> Result<BlobReader> {
         let path = self.path_of(hash);
         let file = File::open(&path).map_err(|e| open_error(hash, &path, e))?;
-        let decoder =
-            zstd::Decoder::with_buffer(BufReader::with_capacity(BUF_SIZE, file)).at(&path)?;
-        Ok(BlobReader {
-            decoder,
-            hasher: blake3::Hasher::new(),
-            expected: *hash,
-            verified: false,
-        })
+        BlobReader::new(Box::new(file), path, *hash)
     }
 
     /// Decompress a blob into `writer`, verifying its hash; returns the bytes written.
     ///
     /// Bad data is [`crate::Error::Corrupt`]. Some bytes may already be written by then, so
-    /// write to a temp file and discard it on error. A write failure is [`crate::Error::Io`]
-    /// with the path `<output>`; callers that know the destination path can use
-    /// [`Store::open_reader`] with their own copy loop.
+    /// write to a temp file and discard it on error. A failure to read the object file is
+    /// [`crate::Error::Io`] with the object's path (the blob may be fine; retry later). A
+    /// write failure is [`crate::Error::Io`] with the path `<output>`; callers that know the
+    /// destination path can use [`Store::open_reader`] with their own copy loop.
     pub fn copy_to<W: Write + ?Sized>(&self, hash: &BlobHash, writer: &mut W) -> Result<u64> {
         let mut reader = self.open_reader(hash)?;
-        let mut buf = vec![0u8; BUF_SIZE];
-        let mut total = 0u64;
-        loop {
-            let n = match reader.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => n,
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(Error::Corrupt(format!("blob {hash}: {e}"))),
-            };
-            writer
-                .write_all(buf.get(..n).unwrap_or_default())
-                .at("<output>")?;
-            total += n as u64;
-        }
-        writer.flush().at("<output>")?;
-        Ok(total)
+        copy_reader(&mut reader, writer)
     }
 
     /// Whether a blob exists. One `stat`, no read; cheap enough to call under the DB write
@@ -329,12 +309,78 @@ pub fn hash_bytes(bytes: &[u8]) -> BlobHash {
     BlobHash::of(bytes)
 }
 
+/// Copy loop behind [`Store::copy_to`].
+fn copy_reader<W: Write + ?Sized>(reader: &mut BlobReader, writer: &mut W) -> Result<u64> {
+    let mut buf = vec![0u8; BUF_SIZE];
+    let mut total = 0u64;
+    loop {
+        let n = match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) if reader.io_failed() => return Err(Error::io(&reader.path, e)),
+            Err(e) => return Err(Error::Corrupt(format!("blob {}: {e}", reader.expected))),
+        };
+        writer
+            .write_all(buf.get(..n).unwrap_or_default())
+            .at("<output>")?;
+        total += n as u64;
+    }
+    writer.flush().at("<output>")?;
+    Ok(total)
+}
+
+/// The object file under a [`BlobReader`]'s decoder. Records the last real I/O error, so
+/// it is not reported as bad data after the decoder wraps it.
+struct ErrorTap {
+    inner: Box<dyn Read + Send>,
+    last: Option<io::Error>,
+}
+
+impl Read for ErrorTap {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.inner.read(buf).inspect_err(|e| {
+            if e.kind() != io::ErrorKind::Interrupted {
+                self.last = Some(io::Error::new(e.kind(), e.to_string()));
+            }
+        })
+    }
+}
+
 /// Streaming reader over a blob's decompressed bytes; see [`Store::open_reader`].
 pub struct BlobReader {
-    decoder: zstd::Decoder<'static, BufReader<File>>,
+    decoder: zstd::Decoder<'static, BufReader<ErrorTap>>,
     hasher: blake3::Hasher,
     expected: BlobHash,
+    path: PathBuf,
     verified: bool,
+    io_failed: bool,
+}
+
+impl BlobReader {
+    fn new(source: Box<dyn Read + Send>, path: PathBuf, expected: BlobHash) -> Result<Self> {
+        let tap = ErrorTap {
+            inner: source,
+            last: None,
+        };
+        let decoder =
+            zstd::Decoder::with_buffer(BufReader::with_capacity(BUF_SIZE, tap)).at(&path)?;
+        Ok(Self {
+            decoder,
+            hasher: blake3::Hasher::new(),
+            expected,
+            path,
+            verified: false,
+            io_failed: false,
+        })
+    }
+
+    /// Whether the last error from `read` came from reading the object file (an I/O
+    /// failure, with its original kind) rather than from bad data
+    /// ([`io::ErrorKind::InvalidData`]).
+    pub fn io_failed(&self) -> bool {
+        self.io_failed
+    }
 }
 
 impl std::fmt::Debug for BlobReader {
@@ -351,16 +397,22 @@ impl Read for BlobReader {
         if buf.is_empty() {
             return Ok(0);
         }
-        let n = self.decoder.read(buf).map_err(|e| {
-            if e.kind() == io::ErrorKind::Interrupted {
-                e
-            } else {
-                io::Error::new(
+        self.io_failed = false;
+        self.decoder.get_mut().get_mut().last = None;
+        let n = match self.decoder.read(buf) {
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => return Err(e),
+            Err(e) => {
+                if let Some(io_err) = self.decoder.get_mut().get_mut().last.take() {
+                    self.io_failed = true;
+                    return Err(io_err);
+                }
+                return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!("cannot decompress: {e}"),
-                )
+                ));
             }
-        })?;
+        };
         if n == 0 {
             if !self.verified {
                 if BlobHash::from(self.hasher.finalize()) != self.expected {
@@ -550,5 +602,90 @@ mod tests {
         assert_eq!(calls.get(), 6, "first try plus 5 retries");
         assert!(!store.contains(&hash));
         assert!(!temp_path.exists());
+    }
+
+    /// Yields `data`, then fails with `kind`.
+    struct FailAfter {
+        data: io::Cursor<Vec<u8>>,
+        kind: io::ErrorKind,
+    }
+
+    impl Read for FailAfter {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            match self.data.read(buf)? {
+                0 => Err(io::Error::new(self.kind, "device error")),
+                n => Ok(n),
+            }
+        }
+    }
+
+    /// A reader over the first half of `bytes`' zstd frame, then `kind`.
+    fn failing_reader(bytes: &[u8], kind: io::ErrorKind) -> BlobReader {
+        let frame = zstd::bulk::compress(bytes, ZSTD_LEVEL).unwrap();
+        let half = frame.get(..frame.len() / 2).unwrap().to_vec();
+        let source = FailAfter {
+            data: io::Cursor::new(half),
+            kind,
+        };
+        BlobReader::new(
+            Box::new(source),
+            PathBuf::from("objects/ab/cd"),
+            BlobHash::of(bytes),
+        )
+        .unwrap()
+    }
+
+    fn noisy(len: usize) -> Vec<u8> {
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        (0..len)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x.to_le_bytes()[0]
+            })
+            .collect()
+    }
+
+    /// DSNA-93: an I/O error under the decoder keeps its kind and is not reported as Corrupt.
+    #[test]
+    fn io_error_while_reading_is_not_corrupt() {
+        let bytes = noisy(1 << 20);
+        for kind in [
+            io::ErrorKind::Other,
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::UnexpectedEof,
+        ] {
+            let mut reader = failing_reader(&bytes, kind);
+            let err = reader.read_to_end(&mut Vec::new()).unwrap_err();
+            assert_eq!(err.kind(), kind);
+            assert!(reader.io_failed());
+
+            let mut reader = failing_reader(&bytes, kind);
+            match copy_reader(&mut reader, &mut io::sink()) {
+                Err(Error::Io { path, source }) => {
+                    assert_eq!(path, PathBuf::from("objects/ab/cd"));
+                    assert_eq!(source.kind(), kind);
+                }
+                other => panic!("expected Io, got {other:?}"),
+            }
+        }
+    }
+
+    /// Bad data from a healthy file is still Corrupt.
+    #[test]
+    fn truncated_frame_is_corrupt() {
+        let bytes = noisy(1 << 20);
+        let frame = zstd::bulk::compress(&bytes, ZSTD_LEVEL).unwrap();
+        let half = frame.get(..frame.len() / 2).unwrap().to_vec();
+        let mut reader = BlobReader::new(
+            Box::new(io::Cursor::new(half)),
+            PathBuf::from("x"),
+            BlobHash::of(&bytes),
+        )
+        .unwrap();
+        let err = copy_reader(&mut reader, &mut io::sink()).unwrap_err();
+        assert!(matches!(err, Error::Corrupt(_)), "{err:?}");
+        assert!(!reader.io_failed());
     }
 }

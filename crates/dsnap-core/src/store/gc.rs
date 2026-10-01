@@ -92,7 +92,9 @@ impl Store {
 
     /// Read and verify every object; returns the ones that fail, with the error.
     ///
-    /// An object deleted while the scan runs is not reported.
+    /// Bad data is [`Error::Corrupt`]. A failure to read the file is [`Error::Io`] naming the
+    /// object path; such a blob may be healthy, so do not treat it as damaged. An object
+    /// deleted while the scan runs is not reported.
     pub fn verify_all(&self) -> Result<Vec<(BlobHash, Error)>> {
         let mut bad = Vec::new();
         for hash in self.list_hashes()? {
