@@ -374,15 +374,18 @@ impl Dsnap {
     ///
     /// `from = None` means the version before `to` (for [`VersionRef::WorkingTree`], the latest
     /// version); an empty list is used when there is none. Working-tree entries come from
-    /// [`Dsnap::working_entries`].
-    #[allow(unused_variables)] // stub; implemented by Chain K (DSNA-51)
+    /// [`Dsnap::working_entries`], and paths now ignored are left out of the old side.
+    ///
+    /// `lines_added`/`lines_removed` are filled when every present side is a text file of at
+    /// most 1 MiB, including renames whose content changed. Both versions must belong to
+    /// `project` ([`crate::Error::NotFound`] otherwise). Implemented in `status.rs` (Chain K).
     pub fn changes(
         &self,
         project: ProjectId,
         from: Option<VersionId>,
         to: VersionRef,
     ) -> Result<Vec<FileChange>> {
-        todo!("DSNA-51")
+        self.changes_impl(project, from, to)
     }
 }
 

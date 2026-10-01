@@ -70,10 +70,8 @@ impl Hooks {
 #[derive(Debug)]
 pub(crate) struct Capture {
     /// The project folder.
-    #[allow(dead_code)] // used by status (DSNA-51)
     pub(crate) root: PathBuf,
     /// The rules the walk used (reuse them to decide other paths in the same operation).
-    #[allow(dead_code)] // used by status (DSNA-51)
     pub(crate) rules: IgnoreRules,
     /// The project's newest version when the capture started.
     pub(crate) latest: Option<Version>,

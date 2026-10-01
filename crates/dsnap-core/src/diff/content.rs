@@ -255,8 +255,12 @@ impl<'a> Side<'a> {
 }
 
 impl Dsnap {
-    /// Diff one file between `from` (default: version before `to`) and `to`.
-    #[allow(unused_variables)] // stub: implemented by Chain K (DSNA-51)
+    /// Diff one file between `from` (default: version before `to`; for the working tree, the
+    /// latest version) and `to`.
+    ///
+    /// When `path` is the new path of a rename, the old side is loaded from the rename's old
+    /// path. Working-tree content is read from disk. [`crate::Error::NotFound`] if `path` is
+    /// on neither side. Implemented in `status.rs` (Chain K).
     pub fn file_diff(
         &self,
         project: ProjectId,
@@ -265,7 +269,7 @@ impl Dsnap {
         path: &RelPath,
         opts: &DiffOptions,
     ) -> Result<FileDiff> {
-        todo!("DSNA-51")
+        self.file_diff_impl(project, from, to, path, opts)
     }
 }
 
