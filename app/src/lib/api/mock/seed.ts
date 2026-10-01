@@ -114,7 +114,7 @@ class Seeder {
     flags: { pinned?: boolean; unstable?: boolean } = {},
   ): void {
     this.now += HOUR + Math.floor(this.rand() * 3 * HOUR);
-    const entries: Tree = new Map(this.state.capturable(rec.tree).kept);
+    const entries: Tree = new Map(this.state.capturable(rec).kept);
     const prev = rec.versions[rec.versions.length - 1]?.entries ?? null;
     const counts = countChanges(compareTrees(this.state, prev, entries, false));
     rec.versions.push({

@@ -63,3 +63,19 @@ export function timestampLabel(ms: number): string {
   const p = (n: number) => String(n).padStart(2, '0');
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
 }
+
+/**
+ * Minimal ignore matcher for the mock: `dir/` matches a directory prefix,
+ * `*.ext` matches a file-name suffix, anything else matches the exact path
+ * or a path prefix. The real app uses gitignore semantics (Chain E).
+ */
+export function isIgnored(path: string, patterns: string[]): boolean {
+  const name = path.slice(path.lastIndexOf('/') + 1);
+  return patterns.some((raw) => {
+    const p = raw.trim();
+    if (!p) return false;
+    if (p.endsWith('/')) return path.startsWith(p) || `${path}/` === p;
+    if (p.startsWith('*.')) return name.endsWith(p.slice(1));
+    return path === p || path.startsWith(`${p}/`);
+  });
+}

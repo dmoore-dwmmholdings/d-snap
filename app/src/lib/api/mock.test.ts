@@ -1,4 +1,5 @@
 import { ApiError, type Api } from './api';
+import { defaultApiKind, selectApi } from './index';
 import { COMMANDS, EVENTS } from './commands';
 import { createMockApi, MockApi } from './mock';
 import { DEFAULT_DIFF_OPTIONS, type Project, type Version } from './types';
@@ -154,6 +155,30 @@ describe('status and snapshot', () => {
     await rejectsWith(api.cancelOperation('op-999'), 'not_found');
   });
 
+  it('runs operations on one project one at a time and reports the queue', async () => {
+    const { api, shop } = await setup();
+    const events: string[] = [];
+    api.onProgress((p) => events.push(`${p.opId}:${p.phase}`));
+    const first = (await api.listVersions(shop.id)).at(-1)!.id;
+    const a = api.snapshot(shop.id, 'a');
+    const b = api.restoreProject(shop.id, first);
+    const c = api.snapshot(shop.id, 'c');
+    // Every call announced itself before returning.
+    expect(events).toEqual(['op-1:walk', 'op-2:queued', 'op-3:queued']);
+    await api.cancelOperation('op-3');
+    await a;
+    await b;
+    await rejectsWith(c, 'cancelled');
+    expect(events.slice(3)).toEqual([
+      'op-1:hash',
+      'op-1:done',
+      'op-2:walk',
+      'op-2:restore',
+      'op-2:done',
+      'op-3:walk',
+    ]);
+  });
+
   it('rejects snapshot and status on a missing project', async () => {
     const { api, notes } = await setup();
     await rejectsWith(api.snapshot(notes.id), 'project_missing');
@@ -235,6 +260,24 @@ describe('changes and diffs', () => {
 });
 
 describe('restore', () => {
+  /** Asserts `report.safetyVersion` is a new safety version labelled for `targetLabel`. */
+  async function expectSafety(
+    api: MockApi,
+    projectId: number,
+    before: Version[],
+    safetyVersion: number,
+    targetLabel: string,
+  ) {
+    const after = await api.listVersions(projectId);
+    expect(after.length).toBe(before.length + 1);
+    expect(before.some((x) => x.id === safetyVersion)).toBe(false);
+    expect(after[0]).toMatchObject({
+      id: safetyVersion,
+      kind: 'safety',
+      label: `Before restore to ${targetLabel}`,
+    });
+  }
+
   it('plans and restores a whole project behind a safety version', async () => {
     const { api, shop } = await setup();
     const versions = await api.listVersions(shop.id);
@@ -244,19 +287,17 @@ describe('restore', () => {
     expect(plan.write).toContain('docs/old-notes.md');
     expect(plan.delete).toContain('src/generated/schema.ts');
     expect(plan.createDirs).toEqual(['logs/archive']);
+    // The 80 MB video is over the size cap: no safety snapshot can hold it.
+    expect(plan.uncaptured).toEqual(['videos/demo.mp4']);
 
     const report = await api.restoreProject(shop.id, first.id);
     expect(report.written).toEqual(plan.write);
     expect(report.deleted).toEqual(plan.delete);
     expect(report.failed).toEqual([]);
+    expect(report.uncaptured).toEqual(['videos/demo.mp4']);
+    expect(api.mockReadFile(shop.id, 'videos/demo.mp4')).toBe('simulated 80 MB video');
 
-    const after = await api.listVersions(shop.id);
-    expect(after.length).toBe(versions.length + 1);
-    expect(after[0]).toMatchObject({
-      id: report.safetyVersion,
-      kind: 'safety',
-      label: 'Before restore to Initial import',
-    });
+    await expectSafety(api, shop.id, versions, report.safetyVersion, 'Initial import');
     // The folder now matches the first version.
     expect(await api.changes(shop.id, first.id, WT)).toEqual([]);
     // The safety version holds the pre-restore state, so the restore is undoable.
@@ -264,42 +305,149 @@ describe('restore', () => {
     expect(api.mockReadFile(shop.id, 'src/config.ts')).toContain('API_URL');
   });
 
-  it('restores a single deleted file', async () => {
+  it('never overwrites or deletes a file over the size cap (Rule 1)', async () => {
+    const { api, tool } = await setup();
+    api.mockWriteFile(tool.id, 'data.bin', 'small v1\n');
+    const v1 = (await api.snapshot(tool.id, 'v1')).version!;
+    // The folder copy grows past the 50 MiB cap.
+    api.mockWriteFile(tool.id, 'data.bin', 'huge user data', 60 * 1024 * 1024);
+    api.mockWriteFile(tool.id, 'big-new.bin', 'also huge', 60 * 1024 * 1024);
+
+    const plan = await api.restorePlan(tool.id, v1.id);
+    expect(plan.write).not.toContain('data.bin');
+    expect(plan.delete).not.toContain('big-new.bin');
+    expect(plan.uncaptured).toEqual(['big-new.bin', 'data.bin']);
+
+    const report = await api.restoreProject(tool.id, v1.id);
+    expect(report.uncaptured).toEqual(['big-new.bin', 'data.bin']);
+    expect(api.mockReadFile(tool.id, 'data.bin')).toBe('huge user data');
+    expect(api.mockReadFile(tool.id, 'big-new.bin')).toBe('also huge');
+
+    const file = await api.restoreFile(tool.id, v1.id, 'data.bin');
+    expect(file).toMatchObject({ written: [], uncaptured: ['data.bin'] });
+    expect(api.mockReadFile(tool.id, 'data.bin')).toBe('huge user data');
+  });
+
+  it('never touches paths that are ignored now (F20)', async () => {
+    const { api, tool } = await setup();
+    api.mockWriteFile(tool.id, 'secrets/key.txt', 'old key\n');
+    api.mockWriteFile(tool.id, 'notes.log', 'old log\n');
+    const v1 = (await api.snapshot(tool.id, 'v1')).version!;
+    const settings = await api.getProjectSettings(tool.id);
+    await api.setProjectSettings(tool.id, { ...settings, extraIgnore: ['secrets/', '*.log'] });
+    api.mockWriteFile(tool.id, 'secrets/key.txt', 'new key\n');
+    api.mockWriteFile(tool.id, 'notes.log', null);
+    api.mockWriteFile(tool.id, 'secrets/extra.txt', 'extra\n');
+
+    const plan = await api.restorePlan(tool.id, v1.id);
+    expect(plan.uncaptured).toEqual(['notes.log', 'secrets/extra.txt', 'secrets/key.txt']);
+    expect([...plan.write, ...plan.delete]).toEqual([]);
+
+    await api.restoreProject(tool.id, v1.id);
+    expect(api.mockReadFile(tool.id, 'secrets/key.txt')).toBe('new key\n');
+    expect(api.mockReadFile(tool.id, 'secrets/extra.txt')).toBe('extra\n');
+    expect(api.mockReadFile(tool.id, 'notes.log')).toBeNull();
+    const file = await api.restoreFile(tool.id, v1.id, 'secrets/key.txt');
+    expect(file.uncaptured).toEqual(['secrets/key.txt']);
+    expect(api.mockReadFile(tool.id, 'secrets/key.txt')).toBe('new key\n');
+  });
+
+  it('restores a single deleted file behind a safety version', async () => {
     const { api, shop } = await setup();
-    const latest = (await api.listVersions(shop.id))[0]!;
+    const versions = await api.listVersions(shop.id);
+    const latest = versions[0]!;
+    api.mockWriteFile(shop.id, 'src/cart.ts', 'unsaved edit\n');
     expect(api.mockReadFile(shop.id, 'src/payment.ts')).toBeNull();
+
     const report = await api.restoreFile(shop.id, latest.id, 'src/payment.ts');
-    expect(report.written).toEqual(['src/payment.ts']);
+    expect(report).toMatchObject({ written: ['src/payment.ts'], uncaptured: [] });
     expect(api.mockReadFile(shop.id, 'src/payment.ts')).toContain('payment0');
+    await expectSafety(api, shop.id, versions, report.safetyVersion, latest.label);
+
+    // The safety version holds the pre-restore folder: restoring it brings the file deletion back.
+    const safety = await api.changes(shop.id, latest.id, v(report.safetyVersion));
+    expect(safety.find((c) => c.path === 'src/payment.ts')?.status.kind).toBe('deleted');
+    await api.restoreFile(shop.id, report.safetyVersion, 'src/cart.ts');
+    expect(api.mockReadFile(shop.id, 'src/cart.ts')).toBe('unsaved edit\n');
+
     await rejectsWith(api.restoreFile(shop.id, latest.id, 'nope.txt'), 'not_found');
   });
 
-  it('reverts a single hunk in the working tree', async () => {
+  it('reverts a single hunk behind a safety version', async () => {
     const { api, tool } = await setup();
-    const latest = (await api.listVersions(tool.id))[0]!.id;
+    const versions = await api.listVersions(tool.id);
+    const latest = versions[0]!;
     const original = api.mockReadFile(tool.id, 'src/lib.rs')!;
     const lines = original.split('\n');
     lines[1] = '// change one';
     lines[lines.length - 3] = '// change two';
-    api.mockWriteFile(tool.id, 'src/lib.rs', lines.join('\n'));
+    const edited = lines.join('\n');
+    api.mockWriteFile(tool.id, 'src/lib.rs', edited);
 
-    const before = await api.fileDiff(tool.id, latest, WT, 'src/lib.rs', DEFAULT_DIFF_OPTIONS);
+    const before = await api.fileDiff(tool.id, latest.id, WT, 'src/lib.rs', DEFAULT_DIFF_OPTIONS);
     expect(before.body.kind === 'text' && before.body.hunks.length).toBe(2);
 
-    const report = await api.revertHunk(tool.id, latest, WT, 'src/lib.rs', 0);
+    const report = await api.revertHunk(
+      tool.id,
+      latest.id,
+      WT,
+      'src/lib.rs',
+      0,
+      DEFAULT_DIFF_OPTIONS,
+    );
     expect(report.written).toEqual(['src/lib.rs']);
     const text = api.mockReadFile(tool.id, 'src/lib.rs')!;
     expect(text).not.toContain('// change one');
     expect(text).toContain('// change two');
+    await expectSafety(api, tool.id, versions, report.safetyVersion, latest.label);
 
-    await rejectsWith(api.revertHunk(tool.id, latest, v(latest), 'src/lib.rs', 0), 'invalid_input');
-    await rejectsWith(api.revertHunk(tool.id, latest, WT, 'src/lib.rs', 5), 'invalid_input');
+    // Undo: the safety version holds both edits.
+    await api.restoreFile(tool.id, report.safetyVersion, 'src/lib.rs');
+    expect(api.mockReadFile(tool.id, 'src/lib.rs')).toBe(edited);
   });
 
-  it('refuses to restore a missing project', async () => {
+  it('reverts the hunk the caller saw, using its diff options', async () => {
+    const { api, tool } = await setup();
+    const lines = Array.from({ length: 12 }, (_, i) => `line ${i}`);
+    api.mockWriteFile(tool.id, 'src/x.rs', lines.join('\n') + '\n');
+    const base = (await api.snapshot(tool.id, 'base')).version!.id;
+    lines[2] = 'edit a';
+    lines[8] = 'edit b';
+    api.mockWriteFile(tool.id, 'src/x.rs', lines.join('\n') + '\n');
+
+    // With context 3 the edits merge into one hunk; with context 0 they are two.
+    const opts = { ignoreWhitespace: false, context: 0 };
+    const diff = await api.fileDiff(tool.id, base, WT, 'src/x.rs', opts);
+    expect(diff.body.kind === 'text' && diff.body.hunks.length).toBe(2);
+    await api.revertHunk(tool.id, base, WT, 'src/x.rs', 1, opts);
+    const text = api.mockReadFile(tool.id, 'src/x.rs')!;
+    expect(text).toContain('edit a');
+    expect(text).not.toContain('edit b');
+  });
+
+  it('rejects invalid hunk reverts', async () => {
+    const { api, tool } = await setup();
+    const latest = (await api.listVersions(tool.id))[0]!.id;
+    const o = DEFAULT_DIFF_OPTIONS;
+    api.mockWriteFile(tool.id, 'src/lib.rs', 'changed\n');
+    await rejectsWith(
+      api.revertHunk(tool.id, latest, v(latest), 'src/lib.rs', 0, o),
+      'invalid_input',
+    );
+    await rejectsWith(api.revertHunk(tool.id, latest, WT, 'src/lib.rs', 5, o), 'invalid_input');
+  });
+
+  it('refuses every restore on a missing project, writing no safety version', async () => {
     const { api, notes } = await setup();
-    const latest = (await api.listVersions(notes.id))[0]!.id;
+    const versions = await api.listVersions(notes.id);
+    const latest = versions[0]!.id;
     await rejectsWith(api.restoreProject(notes.id, latest), 'project_missing');
+    await rejectsWith(api.restoreFile(notes.id, latest, 'todo.md'), 'project_missing');
+    await rejectsWith(
+      api.revertHunk(notes.id, latest, WT, 'todo.md', 0, DEFAULT_DIFF_OPTIONS),
+      'project_missing',
+    );
+    expect((await api.listVersions(notes.id)).length).toBe(versions.length);
   });
 });
 
@@ -410,5 +558,26 @@ describe('contract tables', () => {
     }
     for (const name of Object.values(COMMANDS)) expect(name).toMatch(/^[a-z]+(_[a-z]+)*$/);
     expect(new Set(Object.values(COMMANDS)).size).toBe(Object.keys(COMMANDS).length);
+  });
+});
+
+describe('ApiError.from', () => {
+  it('keeps known codes and maps unknown ones to internal', () => {
+    expect(ApiError.from({ code: 'not_found', message: 'x' }).code).toBe('not_found');
+    const unknown = ApiError.from({ code: 'teapot', message: 'short and stout' });
+    expect(unknown.code).toBe('internal');
+    expect(unknown.message).toBe('teapot: short and stout');
+    expect(ApiError.from(new Error('boom'))).toMatchObject({ code: 'internal', message: 'boom' });
+    expect(ApiError.from('plain')).toMatchObject({ code: 'internal', message: 'plain' });
+  });
+});
+
+describe('selectApi', () => {
+  it('defaults to the mock only in dev and test builds', () => {
+    expect(defaultApiKind(true)).toBe('mock');
+    expect(defaultApiKind(false)).toBe('tauri');
+    expect(selectApi('mock')).toBeInstanceOf(MockApi);
+    expect(() => selectApi('tauri')).toThrow(/not implemented/);
+    expect(() => selectApi('bogus')).toThrow(/Unknown/);
   });
 });

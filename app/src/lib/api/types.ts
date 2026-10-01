@@ -194,6 +194,12 @@ export interface RestorePlan {
   write: RelPath[];
   delete: RelPath[];
   createDirs: RelPath[];
+  /**
+   * Paths the restore would change but leaves alone, because their current
+   * content cannot be in the safety snapshot: ignored now, or over the size cap
+   * (Rule 1, F20). The confirm dialog must list them.
+   */
+  uncaptured: RelPath[];
 }
 
 /** Result of a restore (project, file or hunk). */
@@ -204,10 +210,19 @@ export interface RestoreReport {
   deleted: RelPath[];
   /** Files not written, as `[path, error message]`. */
   failed: [RelPath, string][];
+  /** Paths left untouched because the safety snapshot could not hold them (see `RestorePlan`). */
+  uncaptured: RelPath[];
 }
 
 /** Long-running operation kind that reports progress. */
 export type ProgressOp = 'snapshot' | 'restore';
+
+/**
+ * Progress phase. `walk`, `hash` and `restore` mirror core `ProgressEvent.stage`;
+ * `queued` (waiting for another operation on the same project) and `done` are
+ * added by the app layer.
+ */
+export type ProgressPhase = 'queued' | 'walk' | 'hash' | 'restore' | 'done';
 
 /** Progress event for a snapshot or restore (`dsnap://progress`). */
 export interface Progress {
@@ -215,8 +230,7 @@ export interface Progress {
   opId: string;
   projectId: ProjectId;
   op: ProgressOp;
-  /** Current phase, e.g. `walk`, `hash`, `write`. */
-  phase: string;
+  phase: ProgressPhase;
   done: number;
   /** `null` while the total is unknown (still walking). */
   total: number | null;
@@ -237,16 +251,20 @@ export interface VersionsChangedEvent {
 }
 
 /** Stable error codes (DSNA-66 maps `dsnap_core::Error` to these). */
-export type ApiErrorCode =
-  | 'not_found'
-  | 'project_missing'
-  | 'safety_snapshot_failed'
-  | 'cancelled'
-  | 'io'
-  | 'invalid_input'
-  | 'corrupt'
-  | 'db'
-  | 'internal';
+export const API_ERROR_CODES = [
+  'not_found',
+  'project_missing',
+  'safety_snapshot_failed',
+  'cancelled',
+  'io',
+  'invalid_input',
+  'corrupt',
+  'db',
+  'internal',
+] as const;
+
+/** One of `API_ERROR_CODES`. */
+export type ApiErrorCode = (typeof API_ERROR_CODES)[number];
 
 /** Default diff options used by the UI. */
 export const DEFAULT_DIFF_OPTIONS: DiffOptions = { ignoreWhitespace: false, context: 3 };

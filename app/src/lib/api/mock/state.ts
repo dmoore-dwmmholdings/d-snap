@@ -12,7 +12,7 @@ import type {
 } from '../types';
 import { DEFAULT_DIFF_OPTIONS } from '../types';
 import { lineDiff } from './lines';
-import { bytesToBase64, fakeHash, imageMime, utf8Length } from './util';
+import { bytesToBase64, fakeHash, imageMime, isIgnored, utf8Length } from './util';
 
 /** Stored content. Binary data is base64. `size` may exceed the data (simulated huge files). */
 export interface BlobData {
@@ -102,15 +102,25 @@ export class MockState {
     return undefined;
   }
 
-  /** Files in `tree` that a snapshot would capture (under the size cap). */
-  capturable(tree: Tree): { kept: Tree; tooLarge: Entry[] } {
+  /** Whether a path is ignored by the project's current rules. */
+  ignored(rec: ProjectRecord, path: RelPath): boolean {
+    return isIgnored(path, rec.project.settings.extraIgnore);
+  }
+
+  /**
+   * Splits the project folder into what a snapshot would capture (`kept`) and
+   * what it would not: ignored paths and files over the size cap.
+   */
+  capturable(rec: ProjectRecord): { kept: Tree; tooLarge: Entry[]; ignored: Entry[] } {
     const kept: Tree = new Map();
     const tooLarge: Entry[] = [];
-    for (const [p, e] of tree) {
-      if (e.kind.kind === 'file' && e.size > this.global.sizeCapBytes) tooLarge.push(e);
+    const ignored: Entry[] = [];
+    for (const [p, e] of rec.tree) {
+      if (this.ignored(rec, p)) ignored.push(e);
+      else if (e.kind.kind === 'file' && e.size > this.global.sizeCapBytes) tooLarge.push(e);
       else kept.set(p, e);
     }
-    return { kept, tooLarge };
+    return { kept, tooLarge, ignored };
   }
 
   /** Recomputes every version's counts against the version before it. */

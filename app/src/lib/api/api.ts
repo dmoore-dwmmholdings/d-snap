@@ -1,3 +1,4 @@
+import { API_ERROR_CODES } from './types';
 import type {
   ApiErrorCode,
   BlobHash,
@@ -30,16 +31,27 @@ export class ApiError extends Error {
     this.code = code;
   }
 
-  /** Wraps any thrown value as an `ApiError` (`internal` unless it already is one). */
+  /**
+   * Wraps any thrown value as an `ApiError`. A `{ code, message }` object keeps its
+   * code only if it is a known `ApiErrorCode`; anything else becomes `internal`.
+   */
   static from(err: unknown): ApiError {
     if (err instanceof ApiError) return err;
-    if (isApiErrorShape(err)) return new ApiError(err.code, err.message);
+    if (isErrorShape(err)) {
+      if (isApiErrorCode(err.code)) return new ApiError(err.code, err.message);
+      return new ApiError('internal', `${err.code}: ${err.message}`);
+    }
     const message = err instanceof Error ? err.message : String(err);
     return new ApiError('internal', message);
   }
 }
 
-function isApiErrorShape(v: unknown): v is { code: ApiErrorCode; message: string } {
+/** Whether `code` is a known `ApiErrorCode`. */
+export function isApiErrorCode(code: unknown): code is ApiErrorCode {
+  return (API_ERROR_CODES as readonly unknown[]).includes(code);
+}
+
+function isErrorShape(v: unknown): v is { code: string; message: string } {
   return (
     typeof v === 'object' &&
     v !== null &&
@@ -82,7 +94,15 @@ export interface Api {
   snapshot(projectId: ProjectId, label?: string): Promise<SnapshotReport>;
   /** Changes in the folder since the latest version ("Unsaved changes", badge count). */
   status(projectId: ProjectId): Promise<FileChange[]>;
-  /** Cancels a running snapshot or restore by `Progress.opId`. Rejects `not_found` if not running. */
+  /**
+   * Cancels a queued or running snapshot or restore by `Progress.opId`. Rejects
+   * `not_found` if it already finished.
+   *
+   * Correlation rule: operations on one project run one at a time (later calls
+   * queue). Each call emits its first `Progress` event (phase `queued` or `walk`)
+   * before the method returns its promise, so the latest `Progress` with this
+   * `projectId` and `op` carries the call's `opId`.
+   */
   cancelOperation(opId: string): Promise<void>;
 
   // Versions (F10, F11)
@@ -110,15 +130,23 @@ export interface Api {
   /** Blob content as a `data:` URL, for image previews. */
   readBlobAsDataUrl(hash: BlobHash, mime: string): Promise<string>;
 
-  // Restore (F19–F22). Each takes a safety snapshot first.
-  /** What `restoreProject` would write, delete and create. Writes nothing. */
+  // Restore (F19–F22). Each takes a safety snapshot first; if that fails the
+  // call rejects `safety_snapshot_failed` and writes nothing. Paths the safety
+  // snapshot cannot hold (ignored, over the size cap) are never written or
+  // deleted; they come back in `uncaptured`.
+  /** What `restoreProject` would write, delete and create, and what it leaves (`uncaptured`). Writes nothing. */
   restorePlan(projectId: ProjectId, versionId: VersionId): Promise<RestorePlan>;
   restoreProject(projectId: ProjectId, versionId: VersionId): Promise<RestoreReport>;
-  /** Restores one file (also a deleted one). Rejects `not_found` if the version lacks it. */
+  /**
+   * Restores one file (also a deleted one). Rejects `not_found` if the version
+   * lacks it. If the path is uncaptured, nothing is written and the report's
+   * `uncaptured` holds the path.
+   */
   restoreFile(projectId: ProjectId, versionId: VersionId, path: RelPath): Promise<RestoreReport>;
   /**
-   * Reverts hunk `hunkIndex` of `fileDiff(projectId, from, to, path, DEFAULT_DIFF_OPTIONS)`
-   * in the folder. `to` must be the working tree, else `invalid_input`.
+   * Reverts hunk `hunkIndex` of `fileDiff(projectId, from, to, path, opts)` in the
+   * folder; pass the same `opts` the diff view used. `to` must be the working
+   * tree, else `invalid_input`. Ignored or over-cap paths reject `not_found`.
    */
   revertHunk(
     projectId: ProjectId,
@@ -126,6 +154,7 @@ export interface Api {
     to: VersionRef,
     path: RelPath,
     hunkIndex: number,
+    opts: DiffOptions,
   ): Promise<RestoreReport>;
 
   // Events

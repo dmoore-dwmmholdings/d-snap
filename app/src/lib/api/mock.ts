@@ -8,6 +8,7 @@ import type {
   GlobalSettings,
   Progress,
   ProgressOp,
+  ProgressPhase,
   Project,
   ProjectChangedEvent,
   ProjectId,
@@ -23,7 +24,6 @@ import type {
   VersionRef,
   VersionsChangedEvent,
 } from './types';
-import { DEFAULT_DIFF_OPTIONS } from './types';
 import { lineDiff, revertHunkText } from './mock/lines';
 import { seedState } from './mock/seed';
 import {
@@ -62,6 +62,7 @@ export class MockApi implements Api {
   private pickResult: string | null | undefined = undefined;
   private opCounter = 0;
   private readonly ops = new Map<string, { cancelled: boolean }>();
+  private readonly projectOps = new Map<ProjectId, Promise<unknown>>();
   private readonly projectListeners = new Set<Listener<ProjectChangedEvent>>();
   private readonly versionListeners = new Set<Listener<VersionsChangedEvent>>();
   private readonly progressListeners = new Set<Listener<Progress>>();
@@ -84,12 +85,15 @@ export class MockApi implements Api {
     this.pickResult = path;
   }
 
-  /** Simulates an edit in the project folder. `null` deletes the file. Emits `onProjectChanged`. */
-  mockWriteFile(projectId: ProjectId, path: RelPath, content: string | null): void {
+  /**
+   * Simulates an edit in the project folder. `null` deletes the file. `size`
+   * fakes a larger file (e.g. over the size cap). Emits `onProjectChanged`.
+   */
+  mockWriteFile(projectId: ProjectId, path: RelPath, content: string | null, size?: number): void {
     const rec = this.rec(projectId);
     if (content === null) rec.tree.delete(path);
     else {
-      const hash = this.state.putText(content);
+      const hash = this.state.putText(content, size);
       rec.tree.set(path, this.state.fileEntry(path, hash, this.now() * 1_000_000));
     }
     this.emitProjectChanged(rec);
@@ -342,7 +346,13 @@ export class MockApi implements Api {
         if (e) rec.tree.set(p, { ...e, mtimeNs: t });
       }
       this.emitProjectChanged(rec);
-      return { safetyVersion: safety, written: plan.write, deleted: plan.delete, failed: [] };
+      return {
+        safetyVersion: safety,
+        written: plan.write,
+        deleted: plan.delete,
+        failed: [],
+        uncaptured: plan.uncaptured,
+      };
     });
   }
 
@@ -354,10 +364,14 @@ export class MockApi implements Api {
       const e = target.entries.get(path);
       if (!e)
         throw new ApiError('not_found', `${path} is not in version "${target.version.label}".`);
+      const plan = this.planOf(rec, new Map([[path, e]]), versionId);
       const safety = this.safetySnapshot(rec, target.version.label);
+      if (plan.uncaptured.includes(path)) {
+        return { safetyVersion: safety, written: [], deleted: [], failed: [], uncaptured: [path] };
+      }
       rec.tree.set(path, { ...e, mtimeNs: this.now() * 1_000_000 });
       this.emitProjectChanged(rec);
-      return { safetyVersion: safety, written: [path], deleted: [], failed: [] };
+      return { safetyVersion: safety, written: [path], deleted: [], failed: [], uncaptured: [] };
     });
   }
 
@@ -367,6 +381,7 @@ export class MockApi implements Api {
     to: VersionRef,
     path: RelPath,
     hunkIndex: number,
+    opts: DiffOptions,
   ): Promise<RestoreReport> {
     return this.call(() => {
       const rec = this.rec(projectId);
@@ -374,7 +389,7 @@ export class MockApi implements Api {
         throw new ApiError('invalid_input', 'Only changes in the folder can be reverted.');
       }
       if (rec.project.missing) throw missing(rec);
-      const diff = this.diffOf(rec, from, to, path, DEFAULT_DIFF_OPTIONS);
+      const diff = this.diffOf(rec, from, to, path, opts);
       if (diff.body.kind !== 'text') {
         throw new ApiError('invalid_input', `${path} has no text hunks.`);
       }
@@ -391,7 +406,7 @@ export class MockApi implements Api {
       const hash = this.state.putText(text);
       rec.tree.set(path, this.state.fileEntry(path, hash, this.now() * 1_000_000));
       this.emitProjectChanged(rec);
-      return { safetyVersion: safety, written: [path], deleted: [], failed: [] };
+      return { safetyVersion: safety, written: [path], deleted: [], failed: [], uncaptured: [] };
     });
   }
 
@@ -431,26 +446,41 @@ export class MockApi implements Api {
     const opId = `op-${++this.opCounter}`;
     const handle = { cancelled: false };
     this.ops.set(opId, handle);
-    const emit = (phase: string, done: number, total: number | null) => {
+    const emit = (phase: ProgressPhase, done: number, total: number | null) => {
       const p: Progress = { opId, projectId, op, phase, done, total, path: null };
       for (const cb of this.progressListeners) cb(clone(p));
     };
-    try {
-      const rec = this.rec(projectId);
-      const total = rec.tree.size;
-      emit('walk', 0, null);
-      if (this.latencyMs > 0) await new Promise((r) => setTimeout(r, this.latencyMs));
-      else await Promise.resolve();
-      if (handle.cancelled) throw new ApiError('cancelled', `${op} cancelled.`);
-      emit(op === 'snapshot' ? 'hash' : 'write', Math.floor(total / 2), total);
-      const result = fn(rec);
-      emit('done', total, total);
-      return clone(result);
-    } catch (err) {
-      throw ApiError.from(err);
-    } finally {
-      this.ops.delete(opId);
-    }
+    // One operation per project at a time: later calls wait for earlier ones.
+    // The first event fires synchronously, so callers learn the opId at once.
+    const previous = this.projectOps.get(projectId);
+    emit(previous ? 'queued' : 'walk', 0, null);
+    const run = (async () => {
+      if (previous) {
+        await previous.catch(() => undefined);
+        emit('walk', 0, null);
+      }
+      try {
+        const rec = this.rec(projectId);
+        const total = rec.tree.size;
+        if (this.latencyMs > 0) await new Promise((r) => setTimeout(r, this.latencyMs));
+        else await Promise.resolve();
+        if (handle.cancelled) throw new ApiError('cancelled', `${op} cancelled.`);
+        emit(op === 'snapshot' ? 'hash' : 'restore', Math.floor(total / 2), total);
+        const result = fn(rec);
+        emit('done', total, total);
+        return clone(result);
+      } catch (err) {
+        throw ApiError.from(err);
+      } finally {
+        this.ops.delete(opId);
+      }
+    })();
+    this.projectOps.set(projectId, run);
+    const clear = () => {
+      if (this.projectOps.get(projectId) === run) this.projectOps.delete(projectId);
+    };
+    run.then(clear, clear);
+    return run;
   }
 
   private rec(id: ProjectId): ProjectRecord {
@@ -480,7 +510,7 @@ export class MockApi implements Api {
   private target(rec: ProjectRecord, to: VersionRef): Tree {
     if (to.kind === 'version') return this.versionIn(rec, to.id).entries;
     if (rec.project.missing) throw missing(rec);
-    return this.state.capturable(rec.tree).kept;
+    return this.state.capturable(rec).kept;
   }
 
   private latest(rec: ProjectRecord): Tree | null {
@@ -488,12 +518,7 @@ export class MockApi implements Api {
   }
 
   private statusOf(rec: ProjectRecord, withLines: boolean): FileChange[] {
-    return compareTrees(
-      this.state,
-      this.latest(rec),
-      this.state.capturable(rec.tree).kept,
-      withLines,
-    );
+    return compareTrees(this.state, this.latest(rec), this.state.capturable(rec).kept, withLines);
   }
 
   private pair(rec: ProjectRecord, from: VersionId | null, to: VersionRef, path: RelPath) {
@@ -540,25 +565,39 @@ export class MockApi implements Api {
     return { path, body: { kind: 'text', hunks: d.hunks } };
   }
 
+  /**
+   * Restore plan. Paths whose current content no safety snapshot can hold
+   * (ignored now, or over the size cap) and that the restore would change go to
+   * `uncaptured` and are never written or deleted (Rule 1, DSNA-87).
+   */
   private planOf(rec: ProjectRecord, target: Tree, versionId: VersionId): RestorePlan {
     const write: RelPath[] = [];
     const del: RelPath[] = [];
     const createDirs: RelPath[] = [];
-    const { kept } = this.state.capturable(rec.tree);
+    const uncaptured = new Set<RelPath>();
+    const { kept } = this.state.capturable(rec);
+    const protectedPath = (p: RelPath) =>
+      this.state.ignored(rec, p) || (rec.tree.has(p) && !kept.has(p));
     for (const [p, e] of target) {
-      const cur = kept.get(p);
-      if (e.kind.kind === 'dir') {
+      const cur = rec.tree.get(p);
+      if (cur && sameContent(cur, e)) continue;
+      if (protectedPath(p)) {
+        if (e.kind.kind !== 'dir' || !cur) uncaptured.add(p);
+      } else if (e.kind.kind === 'dir') {
         if (!cur) createDirs.push(p);
-      } else if (!cur || !sameContent(cur, e)) write.push(p);
+      } else write.push(p);
     }
-    for (const [p, e] of kept) {
-      if (!target.has(p) && e.kind.kind !== 'dir') del.push(p);
+    for (const [p, e] of rec.tree) {
+      if (target.has(p) || e.kind.kind === 'dir') continue;
+      if (protectedPath(p)) uncaptured.add(p);
+      else del.push(p);
     }
     return {
       target: versionId,
       write: write.sort(),
       delete: del.sort(),
       createDirs: createDirs.sort(),
+      uncaptured: [...uncaptured].sort(),
     };
   }
 
@@ -569,7 +608,7 @@ export class MockApi implements Api {
     label: string | null,
     force: boolean,
   ): SnapshotReport {
-    const { kept, tooLarge } = this.state.capturable(rec.tree);
+    const { kept, tooLarge } = this.state.capturable(rec);
     const skipped: SkippedFile[] = tooLarge.map((e) => ({
       path: e.path,
       reason: { kind: 'tooLarge', size: e.size },
