@@ -54,6 +54,8 @@ fn snapshot_10k_files_with_49_changes_under_1s_and_status_under_500ms() {
     assert!(env.dsnap.status(env.project).unwrap().is_empty());
     let clean = t.elapsed();
 
+    diagnose(&env);
+
     let (snap_med, status_med) = (median(snaps.clone()), median(statuses.clone()));
     eprintln!("snapshot with {CHANGED} changes: median {snap_med:?} of {snaps:?}");
     eprintln!("status with {CHANGED} changes: median {status_med:?} of {statuses:?}");
@@ -62,5 +64,54 @@ fn snapshot_10k_files_with_49_changes_under_1s_and_status_under_500ms() {
     assert!(
         status_med < Duration::from_millis(500),
         "status {status_med:?}"
+    );
+}
+
+/// Print where a snapshot's time goes beyond the walk and hashing that `status()` covers:
+/// the index insert of a 10k-entry version, and storing 49 new blobs. Informational only.
+fn diagnose(env: &Env) {
+    use dsnap_core::db::NewVersion;
+    use dsnap_core::store::Store;
+    use rayon::prelude::*;
+
+    let latest = env.db.latest_version(env.project).unwrap().unwrap();
+    let entries = env.db.entries(latest.id).unwrap();
+    let store = Store::open(env.home.path().join("objects")).unwrap();
+    let nv = NewVersion {
+        project_id: env.project,
+        label: "diagnose".into(),
+        created_at_ms: 0,
+        kind: dsnap_core::VersionKind::Manual,
+        unstable: false,
+        counts: dsnap_core::ChangeCounts::default(),
+        entries,
+        new_blobs: Vec::new(),
+    };
+    let t = Instant::now();
+    env.db.insert_version(&nv, &store).unwrap();
+    eprintln!(
+        "diagnose: insert_version of {} entries: {:?}",
+        nv.entries.len(),
+        t.elapsed()
+    );
+
+    let blobs: Vec<Vec<u8>> = (0..CHANGED)
+        .map(|i| {
+            format!(
+                "diagnose blob {i} {:?}
+",
+                Instant::now()
+            )
+            .repeat(20)
+            .into_bytes()
+        })
+        .collect();
+    let t = Instant::now();
+    blobs.par_iter().for_each(|b| {
+        store.put(b).unwrap();
+    });
+    eprintln!(
+        "diagnose: {CHANGED} new blobs stored in parallel: {:?}",
+        t.elapsed()
     );
 }
