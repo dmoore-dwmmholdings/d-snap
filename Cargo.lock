@@ -237,6 +237,7 @@ name = "dsnap-core"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "dsnap-test-support",
  "filetime",
  "ignore",
  "notify",
@@ -255,6 +256,8 @@ dependencies = [
 name = "dsnap-test-support"
 version = "0.1.0"
 dependencies = [
+ "dsnap-core",
+ "filetime",
  "tempfile",
 ]
 
