@@ -223,16 +223,102 @@ fn cancel_before_start() {
 #[test]
 fn cancel_during_walk() {
     let fx = FixtureProject::new().build();
-    generate_tree(fx.root(), 1000, 3);
+    generate_tree(fx.root(), 3000, 3);
     let cancel = CancelToken::new();
     let trigger = cancel.clone();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let sink = seen.clone();
     let opts = WalkOptions {
         cancel: Some(cancel),
-        progress: Some(Progress::new(move |_| trigger.cancel())),
+        progress: Some(Progress::new(move |e| {
+            sink.lock().unwrap().push(e.done);
+            trigger.cancel();
+        })),
         ..Default::default()
     };
     let err = walk(fx.root(), &rules(fx.root()), &opts).unwrap_err();
     assert!(matches!(err, Error::Cancelled), "{err}");
+    // The walk stopped right after the first event instead of finishing the tree: another
+    // periodic event would need PROGRESS_EVERY more entries after the cancel.
+    assert_eq!(*seen.lock().unwrap(), [PROGRESS_EVERY]);
+}
+
+/// Hold `path` open with no sharing (Windows) or remove read access (unix). `None` if reads
+/// cannot be blocked (unix root). On Windows the returned handle must be kept alive.
+fn block_reads(path: &Path) -> Option<Option<std::fs::File>> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(path)
+            .unwrap();
+        Some(Some(f))
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(path).is_ok() {
+            return None; // running as root
+        }
+        Some(None)
+    }
+}
+
+#[test]
+fn unreadable_gitignore_aborts_the_walk() {
+    // Walking on would list `secret.env` and `cache/big`; a restore could then delete them
+    // as "added since".
+    let fx = FixtureProject::new()
+        .file("a.txt", "")
+        .file("secret.env", "")
+        .file("cache/big", "")
+        .file("sub/.gitignore", "*.tmp\n")
+        .gitignore(&["*.env", "cache/"])
+        .build();
+    let ok = run(fx.root(), &WalkOptions::default());
+    assert_eq!(
+        paths(&ok.entries),
+        [".gitignore", "a.txt", "sub/.gitignore"]
+    );
+    for locked in [".gitignore", "sub/.gitignore"] {
+        let Some(_held) = block_reads(&fx.path(locked)) else {
+            return;
+        };
+        let err = walk(fx.root(), &rules(fx.root()), &WalkOptions::default()).unwrap_err();
+        assert!(matches!(err, Error::Io { .. }), "{locked}: {err}");
+        assert!(err.to_string().contains(".gitignore"), "{err}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(fx.path(locked), std::fs::Permissions::from_mode(0o644))
+                .unwrap();
+        }
+    }
+    // Without .gitignore support the files are never read, so the walk goes on.
+    let no_gi = ProjectSettings {
+        respect_gitignore: false,
+        ..ProjectSettings::default()
+    };
+    let _held = block_reads(&fx.path(".gitignore"));
+    let out = walk(
+        fx.root(),
+        &IgnoreRules::new(fx.root(), &no_gi).unwrap(),
+        &WalkOptions::default(),
+    )
+    .unwrap();
+    assert!(paths(&out.entries).contains(&"secret.env"));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            fx.path(".gitignore"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+    }
 }
 
 #[test]
@@ -325,6 +411,36 @@ fn unreadable_dir_is_skipped() {
         SkipReason::Unreadable { .. }
     ));
     assert!(paths(&out.entries).contains(&"ok"));
+}
+
+/// Pins the `Dir` contract: a dir whose only child is unlistable is recorded as `Dir` even
+/// though it is not empty on disk (restore must use non-recursive `remove_dir`).
+#[cfg(unix)]
+#[test]
+fn dir_holding_only_an_unlistable_dir_is_recorded_as_dir() {
+    use std::os::unix::fs::PermissionsExt;
+    let fx = FixtureProject::new()
+        .file("a/locked/secret", "x")
+        .file("big/huge.bin", vec![0u8; 64])
+        .build();
+    let locked = fx.path("a/locked");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::read_dir(&locked).is_ok() {
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        return;
+    }
+    let out = run(
+        fx.root(),
+        &WalkOptions {
+            size_cap_bytes: 10,
+            ..Default::default()
+        },
+    );
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(paths(&out.entries), ["a", "big"]);
+    assert!(out.entries.iter().all(|e| e.kind == EntryKind::Dir));
+    let skipped: Vec<_> = out.skipped.iter().map(|s| s.path.as_str()).collect();
+    assert_eq!(skipped, ["a/locked", "big/huge.bin"]);
 }
 
 /// Windows specifics (DSNA-35).

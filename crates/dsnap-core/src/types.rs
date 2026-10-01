@@ -303,7 +303,11 @@ pub enum EntryKind {
         /// Link target exactly as read from the link.
         target: String,
     },
-    /// Directory (recorded so empty directories can be restored).
+    /// Directory with no other entry beneath it, recorded so it can be restored.
+    ///
+    /// On disk it may still hold ignored, skipped or unlistable paths, so it is not
+    /// necessarily empty. Restore removes a directory only with a non-recursive `remove_dir`,
+    /// once it is really empty, so ignored files inside are never deleted.
     Dir,
 }
 

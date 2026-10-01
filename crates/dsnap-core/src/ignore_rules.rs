@@ -21,8 +21,10 @@
 
 use std::collections::HashMap;
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use ignore::Match;
 use ignore::gitignore::{Gitignore, GitignoreBuilder, Glob};
@@ -35,6 +37,13 @@ use crate::types::{ProjectSettings, RelPath};
 /// `.git` also matches a file (a worktree or submodule `.git` file) and cannot be re-included.
 pub const BUILTIN_IGNORES: &[&str] = &[".git", "node_modules", "target", "dist", ".venv"];
 
+/// Pauses between attempts to read a `.gitignore` that exists but fails to open.
+const READ_RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_millis(20),
+    Duration::from_millis(50),
+    Duration::from_millis(100),
+];
+
 /// Name of the per-directory ignore file.
 const GITIGNORE: &str = ".gitignore";
 
@@ -43,16 +52,24 @@ const CASE_INSENSITIVE: bool = cfg!(windows);
 /// Compiled ignore rules for one project.
 ///
 /// `.gitignore` files are read lazily, the first time a path below their directory is checked,
-/// and cached for the life of this value. Build a new `IgnoreRules` per operation to pick up
-/// edits. Safe to share between threads.
+/// and cached for the life of this value. So the rules for a directory reflect its
+/// `.gitignore` at the moment of that first check, not at [`IgnoreRules::new`]. Build a new
+/// `IgnoreRules` per operation, and decide every path before the operation writes anything
+/// (a restore that rewrites a `.gitignore` must not query new paths afterwards). Safe to
+/// share between threads.
+///
+/// A `.gitignore` that exists but cannot be read (locked, permission denied) is retried
+/// briefly and then fails safe: [`IgnoreRules::try_is_ignored`] returns the error, and
+/// [`IgnoreRules::is_ignored`] treats every path it would govern as ignored. A missing
+/// `.gitignore`, or one that is not a regular file, is absent. So is one reached through a
+/// symlinked or junctioned directory: rules are never read from outside the project.
 pub struct IgnoreRules {
     root: PathBuf,
     builtin: Gitignore,
     extra: Gitignore,
     respect_gitignore: bool,
     /// Parsed `.gitignore` per directory (key: project-relative dir, `""` for the root).
-    /// `None` when the directory has no usable `.gitignore`.
-    gitignores: Mutex<HashMap<String, Option<Arc<Gitignore>>>>,
+    gitignores: Mutex<HashMap<String, Loaded>>,
 }
 
 impl std::fmt::Debug for IgnoreRules {
@@ -62,6 +79,27 @@ impl std::fmt::Debug for IgnoreRules {
             .field("extra_patterns", &self.extra.len())
             .field("respect_gitignore", &self.respect_gitignore)
             .finish_non_exhaustive()
+    }
+}
+
+/// A directory's `.gitignore`, as read on first use.
+#[derive(Clone)]
+enum Loaded {
+    /// No usable `.gitignore` (missing, not a regular file, or no patterns).
+    Absent,
+    Rules(Arc<Gitignore>),
+    /// Exists but could not be read: path and error.
+    Unreadable(PathBuf, io::ErrorKind, String),
+}
+
+impl Loaded {
+    fn error(&self) -> Option<Error> {
+        match self {
+            Loaded::Unreadable(path, kind, msg) => {
+                Some(Error::io(path.clone(), io::Error::new(*kind, msg.clone())))
+            }
+            _ => None,
+        }
     }
 }
 
@@ -154,14 +192,22 @@ impl IgnoreRules {
 
     /// Whether `path` (a directory if `is_dir`) is ignored, including via an ignored parent.
     ///
-    /// Usable on its own (no walk needed): restore uses it to never touch ignored paths.
-    /// A symlink or junction counts as a file (`is_dir = false`), as in git.
+    /// Usable on its own (no walk needed). A symlink or junction counts as a file
+    /// (`is_dir = false`), as in git. Fails safe: if a `.gitignore` that applies cannot be
+    /// read, the path counts as ignored, so a restore leaves it alone. Use
+    /// [`IgnoreRules::try_is_ignored`] to see that error.
     pub fn is_ignored(&self, path: &RelPath, is_dir: bool) -> bool {
+        self.try_is_ignored(path, is_dir).unwrap_or(true)
+    }
+
+    /// Like [`IgnoreRules::is_ignored`], but returns [`Error::Io`] when a `.gitignore` that
+    /// applies to `path` exists and cannot be read (after brief retries).
+    pub fn try_is_ignored(&self, path: &RelPath, is_dir: bool) -> Result<bool> {
         let s = path.as_str();
         // Every proper prefix is a directory; check from the top down.
         for (i, _) in s.match_indices('/') {
-            if self.is_ignored_here(&s[..i], true) {
-                return true;
+            if self.is_ignored_here(&s[..i], true)? {
+                return Ok(true);
             }
         }
         self.is_ignored_here(s, is_dir)
@@ -169,19 +215,34 @@ impl IgnoreRules {
 
     /// Whether `path` itself is ignored, assuming no parent directory is ignored.
     ///
-    /// For a top-down walk that never descends into an ignored directory.
-    pub(crate) fn is_ignored_entry(&self, path: &RelPath, is_dir: bool) -> bool {
+    /// For a top-down walk that never descends into an ignored directory. Errors as
+    /// [`IgnoreRules::try_is_ignored`].
+    pub(crate) fn is_ignored_entry(&self, path: &RelPath, is_dir: bool) -> Result<bool> {
         self.is_ignored_here(path.as_str(), is_dir)
     }
 
-    fn is_ignored_here(&self, path: &str, is_dir: bool) -> bool {
+    /// Read the `.gitignore` of `dir` (project-relative, `None` = root) now.
+    ///
+    /// The walker calls this before listing a directory so an unreadable `.gitignore` aborts
+    /// the walk even when the directory holds nothing it would match.
+    pub(crate) fn load_dir(&self, dir: Option<&RelPath>) -> Result<()> {
+        if !self.respect_gitignore {
+            return Ok(());
+        }
+        match self.gitignore(dir.map_or("", RelPath::as_str)).error() {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
+    fn is_ignored_here(&self, path: &str, is_dir: bool) -> Result<bool> {
         // Checking every component keeps `is_ignored_entry` safe on its own.
         if path.split('/').any(is_dot_git) {
-            return true;
+            return Ok(true);
         }
         match Verdict::from(self.extra.matched(path, is_dir)) {
-            Verdict::Ignore => return true,
-            Verdict::Keep => return false,
+            Verdict::Ignore => return Ok(true),
+            Verdict::Keep => return Ok(false),
             Verdict::Undecided => {}
         }
         if self.respect_gitignore {
@@ -189,9 +250,9 @@ impl IgnoreRules {
             let mut dir = path;
             loop {
                 let parent = dir.rsplit_once('/').map_or("", |(p, _)| p);
-                match self.gitignore_verdict(parent, path, is_dir) {
-                    Verdict::Ignore => return true,
-                    Verdict::Keep => return false,
+                match self.gitignore_verdict(parent, path, is_dir)? {
+                    Verdict::Ignore => return Ok(true),
+                    Verdict::Keep => return Ok(false),
                     Verdict::Undecided => {}
                 }
                 if parent.is_empty() {
@@ -200,27 +261,31 @@ impl IgnoreRules {
                 dir = parent;
             }
         }
-        matches!(
+        Ok(matches!(
             Verdict::from(self.builtin.matched(path, is_dir)),
             Verdict::Ignore
-        )
+        ))
     }
 
     /// Check `path` against the `.gitignore` in `dir` (project-relative, `""` = root).
-    fn gitignore_verdict(&self, dir: &str, path: &str, is_dir: bool) -> Verdict {
-        let Some(gi) = self.gitignore(dir) else {
-            return Verdict::Undecided;
+    fn gitignore_verdict(&self, dir: &str, path: &str, is_dir: bool) -> Result<Verdict> {
+        let loaded = self.gitignore(dir);
+        if let Some(e) = loaded.error() {
+            return Err(e);
+        }
+        let Loaded::Rules(gi) = loaded else {
+            return Ok(Verdict::Undecided);
         };
         let rel = if dir.is_empty() {
             path
         } else {
             path.get(dir.len() + 1..).unwrap_or(path)
         };
-        Verdict::from(gi.matched(rel, is_dir))
+        Ok(Verdict::from(gi.matched(rel, is_dir)))
     }
 
-    /// The parsed `.gitignore` of `dir`, read on first use.
-    fn gitignore(&self, dir: &str) -> Option<Arc<Gitignore>> {
+    /// The `.gitignore` of `dir`, read on first use.
+    fn gitignore(&self, dir: &str) -> Loaded {
         {
             let cache = self.gitignores.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(hit) = cache.get(dir) {
@@ -229,25 +294,50 @@ impl IgnoreRules {
         }
         // Read outside the lock so a parallel walk does not serialize on file reads. Two
         // threads may parse the same file; the first insert wins.
-        let loaded = self.load_gitignore(dir).map(Arc::new);
+        let loaded = self.load_gitignore(dir);
         let mut cache = self.gitignores.lock().unwrap_or_else(|e| e.into_inner());
         cache.entry(dir.to_owned()).or_insert(loaded).clone()
     }
 
-    fn load_gitignore(&self, dir: &str) -> Option<Gitignore> {
+    fn load_gitignore(&self, dir: &str) -> Loaded {
         let mut path = self.root.clone();
-        if !dir.is_empty() {
-            path.extend(dir.split('/'));
+        // Every directory from the root down to `dir` must be a real directory, not a link:
+        // never read rules from outside the project.
+        for component in dir.split('/').filter(|c| !c.is_empty()) {
+            path.push(component);
+            match fs::symlink_metadata(&path) {
+                Ok(m) if m.is_dir() && !m.file_type().is_symlink() => {}
+                _ => return Loaded::Absent,
+            }
         }
         path.push(GITIGNORE);
         // Only a regular file counts; a symlinked `.gitignore` is not followed (git >= 2.32
-        // refuses them too). An unreadable file is treated as absent.
-        let meta = fs::symlink_metadata(&path).ok()?;
-        if !meta.is_file() {
-            return None;
+        // refuses them too).
+        match fs::symlink_metadata(&path) {
+            Ok(m) if m.is_file() => {}
+            Ok(_) => return Loaded::Absent,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Loaded::Absent,
+            Err(e) => return Loaded::Unreadable(path, e.kind(), e.to_string()),
         }
-        let bytes = fs::read(&path).ok()?;
-        parse_gitignore(&String::from_utf8_lossy(&bytes))
+        let mut result = fs::read(&path);
+        for delay in READ_RETRY_DELAYS {
+            match &result {
+                Err(e) if e.kind() != io::ErrorKind::NotFound => {
+                    std::thread::sleep(delay);
+                    result = fs::read(&path);
+                }
+                _ => break,
+            }
+        }
+        match result {
+            Ok(bytes) => match parse_gitignore(&String::from_utf8_lossy(&bytes)) {
+                Some(gi) => Loaded::Rules(Arc::new(gi)),
+                None => Loaded::Absent,
+            },
+            // Deleted between the stat and the read.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Loaded::Absent,
+            Err(e) => Loaded::Unreadable(path, e.kind(), e.to_string()),
+        }
     }
 }
 
@@ -315,7 +405,7 @@ mod tests {
         assert!(r.is_ignored(&rp(".git/config"), false));
         assert!(r.is_ignored(&rp("sub/.git"), false));
         assert!(r.is_ignored(&rp("sub/.git/HEAD"), false));
-        assert!(r.is_ignored_entry(&rp("sub/.git/HEAD"), false));
+        assert!(r.is_ignored_entry(&rp("sub/.git/HEAD"), false).unwrap());
         assert!(!r.is_ignored(&rp(".github/ci.yml"), false));
         assert!(!r.is_ignored(&rp(".gitignore"), false));
     }
@@ -492,6 +582,91 @@ mod tests {
         assert!(r.is_ignored(&rp("secret/x"), false));
         assert!(r.is_ignored(&rp("Node_Modules/x"), false));
         assert!(r.is_ignored(&rp(".GIT/config"), false));
+    }
+
+    #[test]
+    fn gitignore_through_a_linked_dir_is_not_read() {
+        let outside = project(&[(".gitignore", "*.txt\n")]);
+        let root = project(&[("real/a.txt", "")]);
+        #[cfg(unix)]
+        let made = std::os::unix::fs::symlink(outside.path(), root.path().join("link")).is_ok();
+        #[cfg(windows)]
+        let made = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(root.path().join("link"))
+            .arg(outside.path())
+            .output()
+            .is_ok_and(|o| o.status.success());
+        assert!(made);
+        let r = rules(root.path(), &[], true);
+        assert!(!r.try_is_ignored(&rp("link/a.txt"), false).unwrap());
+        assert!(!r.try_is_ignored(&rp("real/a.txt"), false).unwrap());
+    }
+
+    /// Blocks reads of a file until dropped.
+    struct ReadBlock {
+        #[cfg(windows)]
+        _held: fs::File,
+        #[cfg(unix)]
+        path: PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl Drop for ReadBlock {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&self.path, fs::Permissions::from_mode(0o644));
+        }
+    }
+
+    /// Hold `path` open with no sharing (Windows) or remove read access (unix). `None` if
+    /// reads cannot be blocked (unix root).
+    fn block_reads(path: &Path) -> Option<ReadBlock> {
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            let f = fs::OpenOptions::new()
+                .read(true)
+                .share_mode(0)
+                .open(path)
+                .unwrap();
+            Some(ReadBlock { _held: f })
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o000)).unwrap();
+            let g = ReadBlock {
+                path: path.to_path_buf(),
+            };
+            if fs::read(path).is_ok() {
+                return None; // running as root
+            }
+            Some(g)
+        }
+    }
+
+    #[test]
+    fn unreadable_gitignore_fails_safe() {
+        let root = project(&[(".gitignore", "*.env\n"), ("sub/.gitignore", "*.tmp\n")]);
+        let Some(_block) = block_reads(&root.path().join("sub").join(".gitignore")) else {
+            return;
+        };
+        let r = rules(root.path(), &[], true);
+        // Outside the unreadable file's reach: normal answers.
+        assert!(r.try_is_ignored(&rp("a.env"), false).unwrap());
+        assert!(!r.try_is_ignored(&rp("a.txt"), false).unwrap());
+        // Under it: an error, and `is_ignored` says "ignored" so nothing gets touched.
+        let err = r.try_is_ignored(&rp("sub/x.txt"), false).unwrap_err();
+        assert!(matches!(err, Error::Io { .. }), "{err}");
+        assert!(err.to_string().contains(".gitignore"), "{err}");
+        assert!(r.is_ignored(&rp("sub/x.txt"), false));
+        assert!(r.load_dir(Some(&rp("sub"))).is_err());
+        assert!(r.load_dir(None).is_ok());
+        // Without .gitignore support the file is never read.
+        let r = rules(root.path(), &[], false);
+        assert!(!r.try_is_ignored(&rp("sub/x.txt"), false).unwrap());
+        assert!(r.load_dir(Some(&rp("sub"))).is_ok());
     }
 
     #[test]

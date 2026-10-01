@@ -50,8 +50,10 @@ pub struct WalkOptions {
 pub struct WalkOutput {
     /// Files, symlinks and directories, sorted by path, with `blob: None`.
     ///
-    /// A directory is listed only when no other entry lies beneath it (it is empty, or holds
-    /// only ignored or skipped paths); other directories are implied by their contents.
+    /// A [`EntryKind::Dir`] entry means the directory exists and no other entry lies beneath
+    /// it. On disk it may still hold ignored, skipped or unlistable paths, so it is not
+    /// necessarily empty; other directories are implied by their contents. Restore must
+    /// remove a directory only with a non-recursive `remove_dir`, once it is really empty.
     pub entries: Vec<Entry>,
     /// Paths left out (too large, non-UTF-8 name, unreadable), sorted by path.
     pub skipped: Vec<SkippedFile>,
@@ -62,9 +64,10 @@ pub struct WalkOutput {
 /// `rules` should be built for the same `root`. Symlinks and junctions are recorded, never
 /// followed. Entries have `blob: None`; nothing is hashed or opened here.
 ///
-/// Errors: [`Error::Io`] if `root` is missing, not a directory or cannot be listed;
-/// [`Error::Cancelled`] once `opts.cancel` is set. Problems below the root become
-/// [`WalkOutput::skipped`] entries instead.
+/// Errors: [`Error::Io`] if `root` is missing, not a directory or cannot be listed, or if a
+/// `.gitignore` the walk needs exists but cannot be read (walking on would capture, and let a
+/// restore delete, paths the user ignored); [`Error::Cancelled`] once `opts.cancel` is set.
+/// Other problems below the root become [`WalkOutput::skipped`] entries instead.
 pub fn walk(root: &Path, rules: &IgnoreRules, opts: &WalkOptions) -> Result<WalkOutput> {
     let walker = Walker {
         rules,
@@ -173,7 +176,8 @@ impl Walker<'_> {
         }
     }
 
-    /// List one directory. Errors only for cancellation or an unreadable project root.
+    /// List one directory. Errors for cancellation, an unreadable project root or an
+    /// unreadable `.gitignore`.
     fn list(&self, dir: &PendingDir) -> Result<Listing> {
         self.check_cancel()?;
         let mut out = Listing::default();
@@ -188,10 +192,11 @@ impl Walker<'_> {
                 }
             },
         };
+        self.rules.load_dir(dir.rel.as_ref())?;
         for item in read {
             self.check_cancel()?;
             match item {
-                Ok(item) => self.visit(dir, &item, &mut out),
+                Ok(item) => self.visit(dir, &item, &mut out)?,
                 Err(e) => {
                     let at = dir.rel.as_ref().map_or("", RelPath::as_str);
                     out.skipped.push(unreadable(at, &e));
@@ -202,14 +207,14 @@ impl Walker<'_> {
     }
 
     /// Classify one directory item into `out`.
-    fn visit(&self, dir: &PendingDir, item: &DirEntry, out: &mut Listing) {
+    fn visit(&self, dir: &PendingDir, item: &DirEntry, out: &mut Listing) -> Result<()> {
         let name = item.file_name();
         let Some(name) = name.to_str() else {
             out.skipped.push(SkippedFile {
                 path: lossy_path(dir.rel.as_ref(), &item.path(), &dir.abs),
                 reason: SkipReason::NonUtf8Name,
             });
-            return;
+            return Ok(());
         };
         let joined = match &dir.rel {
             None => RelPath::new(name),
@@ -226,7 +231,7 @@ impl Walker<'_> {
                     path: display(),
                     reason: SkipReason::Unreadable { msg: e.to_string() },
                 });
-                return;
+                return Ok(());
             }
         };
         // `DirEntry::metadata` does not follow links (lstat; on Windows the directory
@@ -236,18 +241,18 @@ impl Walker<'_> {
             Err(e) => {
                 // Without metadata we cannot tell a dir from a file; an ignored path must
                 // still not be reported, so check both ways.
-                if !self.rules.is_ignored_entry(&rel, false)
-                    && !self.rules.is_ignored_entry(&rel, true)
+                if !self.rules.is_ignored_entry(&rel, false)?
+                    && !self.rules.is_ignored_entry(&rel, true)?
                 {
                     out.skipped.push(unreadable(rel.as_str(), &e));
                 }
-                return;
+                return Ok(());
             }
         };
         let ft = meta.file_type();
         let is_dir = ft.is_dir() && !ft.is_symlink();
-        if self.rules.is_ignored_entry(&rel, is_dir) {
-            return;
+        if self.rules.is_ignored_entry(&rel, is_dir)? {
+            return Ok(());
         }
         self.tick(&rel);
 
@@ -290,6 +295,7 @@ impl Walker<'_> {
                 out.files.push(entry(rel, EntryKind::File, size, &meta));
             }
         }
+        Ok(())
     }
 }
 
