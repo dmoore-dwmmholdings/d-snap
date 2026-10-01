@@ -170,7 +170,6 @@ impl IgnoreRules {
     /// Whether `path` itself is ignored, assuming no parent directory is ignored.
     ///
     /// For a top-down walk that never descends into an ignored directory.
-    #[allow(dead_code)] // used by walk (DSNA-34)
     pub(crate) fn is_ignored_entry(&self, path: &RelPath, is_dir: bool) -> bool {
         self.is_ignored_here(path.as_str(), is_dir)
     }
