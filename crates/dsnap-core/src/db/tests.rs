@@ -546,3 +546,49 @@ fn insert_10k_entries_is_fast() {
         "inserting 10k entries took {took:?}"
     );
 }
+
+// ---- DSNA-32: change token ----
+
+#[test]
+fn change_token_is_stable_when_idle() {
+    let (_dir, path) = temp_db();
+    let db = Db::open(&path).unwrap();
+    add_project(&db, "p");
+    let t = db.change_token().unwrap();
+    // Reads do not change it.
+    db.list_projects().unwrap();
+    assert_eq!(db.change_token().unwrap(), t);
+    assert_eq!(db.change_token().unwrap(), t);
+}
+
+#[test]
+fn change_token_sees_other_connection_writes() {
+    let (_dir, path) = temp_db();
+    let app = Db::open(&path).unwrap();
+    let cli = Db::open(&path).unwrap();
+    let p = add_project(&cli, "p");
+
+    let t0 = app.change_token().unwrap();
+    let v = cli
+        .insert_version(&new_version(p, "from cli", vec![]), &dummy_store())
+        .unwrap();
+    let t1 = app.change_token().unwrap();
+    assert_ne!(t0, t1, "insert from another connection");
+
+    // A label edit leaves MAX(versions.id) unchanged but must still change the token.
+    cli.set_version_label(v.id, "renamed").unwrap();
+    let t2 = app.change_token().unwrap();
+    assert_ne!(t1, t2, "label edit from another connection");
+    assert_eq!(app.change_token().unwrap(), t2);
+}
+
+#[test]
+fn change_token_sees_own_writes() {
+    let db = Db::open_in_memory().unwrap();
+    let t0 = db.change_token().unwrap();
+    let p = add_project(&db, "p");
+    let t1 = db.change_token().unwrap();
+    assert_ne!(t0, t1);
+    db.set_project_name(p, "q").unwrap();
+    assert_ne!(db.change_token().unwrap(), t1);
+}

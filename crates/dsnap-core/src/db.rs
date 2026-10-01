@@ -25,7 +25,7 @@
 //! files. Those rows are unreferenced, so step 2 catches any reuse and the next prune removes
 //! them (`Store::delete` of a missing file returns `Ok(0)`). Keep prune batches small (see
 //! `limit`) so the write lock is not held for longer than the busy timeout.
-#![allow(unused_variables)] // DSNA-82 / DSNA-32 stubs below; removed when implemented
+#![allow(unused_variables)] // DSNA-82 stubs below; removed when implemented
 
 mod codec;
 mod schema;
@@ -390,15 +390,23 @@ impl Db {
 
     /// Value that changes whenever any connection commits a write. Poll it to detect writes
     /// from another process (e.g. the CLI).
+    ///
+    /// Combines `PRAGMA data_version` (bumped by commits from other connections) with this
+    /// connection's total row-change count (bumped by its own writes). Both only grow, so any
+    /// commit changes the token. Costs one pragma read; fine to poll every 500 ms. Only
+    /// equality between two tokens from the same `Db` is meaningful.
     pub fn change_token(&self) -> Result<i64> {
-        todo!("DSNA-32")
+        let conn = self.conn();
+        let data_version: i64 = conn.query_row("PRAGMA data_version", [], |r| r.get(0))?;
+        let own = i64::try_from(conn.total_changes()).unwrap_or(i64::MAX);
+        Ok(data_version.wrapping_shl(32).wrapping_add(own))
     }
 }
 
 impl Dsnap {
     /// Token that changes when the database changes (from this or another process).
     pub fn db_change_token(&self) -> Result<i64> {
-        todo!("DSNA-32")
+        self.db.change_token()
     }
 }
 

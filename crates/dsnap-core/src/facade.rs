@@ -13,7 +13,6 @@ use crate::store::Store;
 /// module that owns each feature (`projects`, `snapshot`, `diff`, `restore`, ...).
 pub struct Dsnap {
     pub(crate) home: Home,
-    #[allow(dead_code)] // read once Chain D implements the db methods
     pub(crate) db: Db,
     pub(crate) store: Store,
 }
