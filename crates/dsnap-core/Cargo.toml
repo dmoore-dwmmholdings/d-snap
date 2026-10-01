@@ -23,10 +23,15 @@ time.workspace = true
 zstd.workspace = true
 
 [dev-dependencies]
+criterion.workspace = true
 # Use from integration tests in tests/ only (see the crate docs of dsnap-test-support).
 dsnap-test-support.workspace = true
 proptest.workspace = true
 tempfile.workspace = true
+
+[[bench]]
+name = "line_diff"
+harness = false
 
 [lints]
 workspace = true

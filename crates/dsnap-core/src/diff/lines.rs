@@ -219,13 +219,143 @@ impl<'a> Prepared<'a> {
 
     fn ops(&self) -> Vec<DiffOp> {
         let deadline = Instant::now().checked_add(DIFF_DEADLINE);
-        similar::capture_diff_slices_deadline(
-            Algorithm::Myers,
-            &self.old_keys,
-            &self.new_keys,
-            deadline,
-        )
+        diff_keys(&self.old_keys, &self.new_keys, deadline)
     }
+}
+
+/// Patience-anchored diff of two key sequences.
+///
+/// Lines that occur exactly once on each side are matched up by a longest increasing
+/// subsequence (O(n log n)); the gaps between those anchors are diffed with Myers. Plain
+/// Myers is O(N·D), which is too slow when many lines change across a large file (DSNA-40);
+/// `similar`'s own Patience runs Myers over all unique lines and degrades the same way.
+fn diff_keys(old: &[u32], new: &[u32], deadline: Option<Instant>) -> Vec<DiffOp> {
+    let mut ops = Vec::new();
+    let (mut o, mut n) = (0usize, 0usize);
+    for (ao, an) in unique_anchors(old, new) {
+        ops.extend(similar::capture_diff_deadline(
+            Algorithm::Myers,
+            old,
+            o..ao,
+            new,
+            n..an,
+            deadline,
+        ));
+        ops.push(DiffOp::Equal {
+            old_index: ao,
+            new_index: an,
+            len: 1,
+        });
+        (o, n) = (ao + 1, an + 1);
+    }
+    ops.extend(similar::capture_diff_deadline(
+        Algorithm::Myers,
+        old,
+        o..old.len(),
+        new,
+        n..new.len(),
+        deadline,
+    ));
+    normalize_ops(ops)
+}
+
+/// `(old_index, new_index)` pairs of lines unique on both sides, forming the longest chain
+/// increasing on both sides.
+fn unique_anchors(old: &[u32], new: &[u32]) -> Vec<(usize, usize)> {
+    const NONE: usize = usize::MAX;
+    let n_keys = old.iter().chain(new).max().map_or(0, |&m| m as usize + 1);
+    // Per key: count and position on each side (position valid when the count is 1).
+    let mut old_count = vec![0u8; n_keys];
+    let mut new_count = vec![0u8; n_keys];
+    let mut new_pos = vec![NONE; n_keys];
+    for &k in old {
+        let c = &mut old_count[k as usize];
+        *c = c.saturating_add(1);
+    }
+    for (i, &k) in new.iter().enumerate() {
+        let c = &mut new_count[k as usize];
+        *c = c.saturating_add(1);
+        new_pos[k as usize] = i;
+    }
+    let pairs: Vec<(usize, usize)> = old
+        .iter()
+        .enumerate()
+        .filter(|&(_, &k)| old_count[k as usize] == 1 && new_count[k as usize] == 1)
+        .map(|(i, &k)| (i, new_pos[k as usize]))
+        .collect();
+
+    // Patience sorting: tails[l] = index into `pairs` of the smallest new_index ending an
+    // increasing run of length l + 1; prev links rebuild the run.
+    let mut tails: Vec<usize> = Vec::new();
+    let mut prev = vec![NONE; pairs.len()];
+    for (i, &(_, ni)) in pairs.iter().enumerate() {
+        let l = tails.partition_point(|&t| pairs[t].1 < ni);
+        if l > 0 {
+            prev[i] = tails[l - 1];
+        }
+        if l == tails.len() {
+            tails.push(i);
+        } else {
+            tails[l] = i;
+        }
+    }
+    let mut chain = Vec::with_capacity(tails.len());
+    let mut cur = tails.last().copied().unwrap_or(NONE);
+    while cur != NONE {
+        chain.push(pairs[cur]);
+        cur = prev[cur];
+    }
+    chain.reverse();
+    chain
+}
+
+/// Rewrite the op indices from a running cursor, drop empty ops and join adjacent `Equal`
+/// ops so `group_diff_ops` sees each unchanged run as one op.
+///
+/// The cursor rewrite is needed because `similar` 2.7's Myers can report a `Delete`'s
+/// `new_index` one past the true position (the lengths and order are right), which would
+/// skew hunk ranges.
+fn normalize_ops(ops: Vec<DiffOp>) -> Vec<DiffOp> {
+    let mut out: Vec<DiffOp> = Vec::with_capacity(ops.len());
+    let (mut o, mut n) = (0usize, 0usize);
+    for op in ops {
+        let (old_len, new_len) = (op.old_range().len(), op.new_range().len());
+        let op = match op {
+            DiffOp::Equal { len, .. } => {
+                if let Some(DiffOp::Equal { len: prev, .. }) = out.last_mut() {
+                    *prev += len;
+                    (o, n) = (o + len, n + len);
+                    continue;
+                }
+                DiffOp::Equal {
+                    old_index: o,
+                    new_index: n,
+                    len,
+                }
+            }
+            DiffOp::Delete { .. } => DiffOp::Delete {
+                old_index: o,
+                old_len,
+                new_index: n,
+            },
+            DiffOp::Insert { .. } => DiffOp::Insert {
+                old_index: o,
+                new_index: n,
+                new_len,
+            },
+            DiffOp::Replace { .. } => DiffOp::Replace {
+                old_index: o,
+                old_len,
+                new_index: n,
+                new_len,
+            },
+        };
+        (o, n) = (o + old_len, n + new_len);
+        if old_len + new_len > 0 {
+            out.push(op);
+        }
+    }
+    out
 }
 
 fn strip_eol(line: &str) -> &str {
@@ -622,6 +752,71 @@ mod tests {
             serde_json::to_string(&row).unwrap(),
             r#"{"hunk":0,"old":null,"new":{"no":1,"text":"x","changed":true}}"#
         );
+    }
+
+    /// Apply ops to `old` and check they produce `new`, cover both sides exactly once, and
+    /// never leave two adjacent `Equal` ops.
+    fn check_ops(old: &[u32], new: &[u32]) {
+        let ops = diff_keys(old, new, None);
+        let mut rebuilt = Vec::new();
+        let (mut o, mut n) = (0, 0);
+        for (i, op) in ops.iter().enumerate() {
+            assert_eq!(
+                (op.old_range().start, op.new_range().start),
+                (o, n),
+                "{ops:?}"
+            );
+            if let DiffOp::Equal { .. } = op {
+                assert_eq!(&old[op.old_range()], &new[op.new_range()]);
+                if i > 0 {
+                    assert!(!matches!(ops[i - 1], DiffOp::Equal { .. }), "{ops:?}");
+                }
+            }
+            rebuilt.extend_from_slice(&new[op.new_range()]);
+            (o, n) = (op.old_range().end, op.new_range().end);
+        }
+        assert_eq!((o, n), (old.len(), new.len()));
+        assert_eq!(rebuilt, new);
+    }
+
+    #[test]
+    fn anchored_diff_is_a_valid_edit_script() {
+        let mut seed = 0x1234_5678_9ABC_DEF1u64;
+        let mut rnd = |m: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % m
+        };
+        for _ in 0..200 {
+            // Small alphabets give many duplicate lines; larger ones give many anchors.
+            let alphabet = 2 + rnd(40);
+            let old: Vec<u32> = (0..rnd(60)).map(|_| rnd(alphabet) as u32).collect();
+            let mut new = Vec::new();
+            for &k in &old {
+                match rnd(6) {
+                    0 => {}
+                    1 => new.push(rnd(alphabet) as u32),
+                    2 => new.extend([k, rnd(alphabet) as u32]),
+                    _ => new.push(k),
+                }
+            }
+            check_ops(&old, &new);
+            check_ops(&new, &old);
+        }
+        check_ops(&[], &[]);
+        check_ops(&[1, 2, 3], &[]);
+        check_ops(&[], &[1, 2, 3]);
+    }
+
+    #[test]
+    fn anchors_skip_lines_repeated_on_either_side() {
+        // 1 is unique on both sides; 2 repeats in old; 3 repeats in new; 4 moves.
+        // (0, 1) and (4, 0) cross, so only one of them can be kept.
+        let anchors = unique_anchors(&[1, 2, 2, 3, 4, 5], &[4, 1, 3, 3, 5]);
+        assert_eq!(anchors.len(), 2, "{anchors:?}");
+        assert_eq!(anchors.last(), Some(&(5, 4)));
+        assert!(anchors.iter().all(|&(o, _)| o == 0 || o == 4 || o == 5));
     }
 
     #[test]

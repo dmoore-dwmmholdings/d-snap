@@ -24,6 +24,8 @@ dsnap-test-support = { path = "crates/dsnap-test-support" }
 anyhow = "1.0.100"
 blake3 = "1.8.2"
 clap = { version = "4.5.50", features = ["derive"] }
+# 0.7: 0.8 needs Rust 1.86, above the workspace rust-version.
+criterion = { version = "0.7.0", default-features = false, features = ["cargo_bench_support"] }
 filetime = "0.2.26"
 ignore = "0.4.24"
 notify = "8.2.0"
