@@ -192,6 +192,19 @@ impl BlobFiles for FakeFiles {
     }
 }
 
+impl BlobSweep for FakeFiles {
+    fn sweep(&self, referenced: &HashSet<BlobHash>) -> crate::Result<Swept> {
+        let mut present = self.present.lock().unwrap();
+        let before = present.len();
+        present.retain(|h| referenced.contains(h));
+        let deleted = (before - present.len()) as u64;
+        Ok(Swept {
+            deleted,
+            bytes_freed: deleted * 100,
+        })
+    }
+}
+
 /// A store where every blob exists; for tests that do not exercise the blob check.
 fn dummy_store() -> FakeFiles {
     FakeFiles {
@@ -816,5 +829,69 @@ fn failed_store_delete_rolls_back_the_batch() {
         db.prune_unreferenced_with(&Failing, PRUNE_BATCH),
         Err(Error::Io { .. })
     ));
+    assert_eq!(count(&db, "blobs"), 1);
+}
+
+// ---- DSNA-88: sweep orphan blob files ----
+
+#[test]
+fn sweep_deletes_orphans_and_keeps_referenced() {
+    let db = Db::open_in_memory().unwrap();
+    let p = add_project(&db, "p");
+    let kept = BlobHash::of(b"kept");
+    let orphan = BlobHash::of(b"orphan"); // file only, no row
+    let unref_row = BlobHash::of(b"unref"); // file and row, no entry
+    let files = FakeFiles::with(&[kept, orphan, unref_row]);
+    let mut v = new_version(p, "v", vec![file_entry("k", b"kept")]);
+    v.new_blobs = vec![blob(b"kept")];
+    db.insert_version_with(&v, &files).unwrap();
+    db.insert_blob(&blob(b"unref")).unwrap();
+
+    let r = db.sweep_orphans_with(&files).unwrap();
+    assert_eq!(
+        (r.blobs_pruned, r.bytes_freed, r.versions_deleted),
+        (2, 200, 0)
+    );
+    assert!(files.has(&kept));
+    assert!(!files.has(&orphan) && !files.has(&unref_row));
+    assert_eq!(count(&db, "blobs"), 1);
+    assert!(db.unreferenced_blobs().unwrap().is_empty());
+}
+
+#[test]
+fn snapshot_committing_after_sweep_gets_blob_missing() {
+    let (_dir, path) = temp_db();
+    let snap_side = Db::open(&path).unwrap();
+    let sweep_side = Db::open(&path).unwrap();
+    let p = add_project(&snap_side, "p");
+    let files = FakeFiles::default();
+
+    // Snapshot side stores Y (new to the DB) but has not committed yet.
+    let y = BlobHash::of(b"y");
+    files.present.lock().unwrap().insert(y);
+    let mut nv = new_version(p, "v", vec![file_entry("y", b"y")]);
+    nv.new_blobs = vec![blob(b"y")];
+
+    // Sweep runs first and removes Y as an orphan.
+    let r = sweep_side.sweep_orphans_with(&files).unwrap();
+    assert_eq!(r.blobs_pruned, 1);
+
+    let err = snap_side.insert_version_with(&nv, &files).unwrap_err();
+    assert!(matches!(err, Error::BlobMissing(h) if h == y), "{err}");
+    assert_eq!(count(&snap_side, "versions"), 0);
+    assert_eq!(count(&snap_side, "entries"), 0);
+}
+
+#[test]
+fn failed_sweep_rolls_back_row_deletes() {
+    struct Failing;
+    impl BlobSweep for Failing {
+        fn sweep(&self, _: &HashSet<BlobHash>) -> crate::Result<Swept> {
+            Err(Error::io("objects", std::io::Error::other("denied")))
+        }
+    }
+    let db = Db::open_in_memory().unwrap();
+    db.insert_blob(&blob(b"a")).unwrap();
+    assert!(db.sweep_orphans_with(&Failing).is_err());
     assert_eq!(count(&db, "blobs"), 1);
 }

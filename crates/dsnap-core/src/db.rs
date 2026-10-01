@@ -409,6 +409,45 @@ impl Db {
         })
     }
 
+    /// Delete every blob file no entry references, including orphans with no `blobs` row
+    /// (written by a snapshot that never committed), plus stale temp files, and drop the
+    /// `blobs` rows of unreferenced blobs. One `BEGIN IMMEDIATE` transaction; the referenced
+    /// set is read inside it (DSNA-80 protocol, DSNA-88).
+    ///
+    /// Walks the whole store, so keep it off the hot path. A snapshot that stored a blob but
+    /// has not committed yet is safe: the blob is new to the database, so its
+    /// [`Db::insert_version`] re-checks it and returns [`Error::BlobMissing`].
+    ///
+    /// Not public yet: the real sweeper is `Store::sweep` (DSNA-29, Chain C), which is not on
+    /// `main`; `Db::sweep_orphans(&Store)` is a one-line wrapper once it lands.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn sweep_orphans_with(&self, files: &dyn BlobSweep) -> Result<RetentionReport> {
+        self.write(|tx| {
+            let referenced = {
+                let mut stmt = tx.prepare_cached(
+                    "SELECT DISTINCT blob_hash FROM entries WHERE blob_hash IS NOT NULL",
+                )?;
+                let rows = stmt
+                    .query_map([], |r| r.get::<_, Vec<u8>>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                rows.into_iter()
+                    .map(codec::hash_from_sql)
+                    .collect::<Result<HashSet<_>>>()?
+            };
+            let swept = files.sweep(&referenced)?;
+            tx.execute(
+                "DELETE FROM blobs
+                 WHERE NOT EXISTS (SELECT 1 FROM entries e WHERE e.blob_hash = blobs.hash)",
+                [],
+            )?;
+            Ok(RetentionReport {
+                versions_deleted: 0,
+                blobs_pruned: u32::try_from(swept.deleted).unwrap_or(u32::MAX),
+                bytes_freed: swept.bytes_freed,
+            })
+        })
+    }
+
     /// Whether any entry references `hash`.
     pub fn blob_referenced(&self, hash: &BlobHash) -> Result<bool> {
         let conn = self.conn();
@@ -479,6 +518,24 @@ impl BlobFiles for Store {
     fn delete(&self, hash: &BlobHash) -> Result<u64> {
         Store::delete(self, hash)
     }
+}
+
+/// What a store sweep removed.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct Swept {
+    /// Blob files deleted.
+    pub(crate) deleted: u64,
+    /// Bytes freed on disk (blobs and temp files).
+    pub(crate) bytes_freed: u64,
+}
+
+/// Whole-store sweep used by [`Db::sweep_orphans_with`]: delete every blob file whose hash
+/// is not in `referenced` (and stale temp files). `Store::sweep` (DSNA-29) implements it once
+/// Chain C is merged.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) trait BlobSweep {
+    /// Delete unreferenced blob files.
+    fn sweep(&self, referenced: &HashSet<BlobHash>) -> Result<Swept>;
 }
 
 /// Protocol step 2 (module docs): every blob the new entries use that no committed entry
