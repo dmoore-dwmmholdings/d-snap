@@ -1,0 +1,297 @@
+//! `Dsnap::snapshot` end to end (DSNA-49): capture, fast path, F7, counts, ignore rules,
+//! size cap, cancel.
+#![allow(clippy::unwrap_used)] // helpers outside #[test] fns are test code too
+
+#[path = "support/project.rs"]
+mod project;
+
+use std::collections::BTreeMap;
+use std::fs;
+use std::sync::{Arc, Mutex};
+
+use dsnap_core::db::Db;
+use dsnap_core::{
+    CancelToken, ChangeCounts, Dsnap, EntryKind, Error, GlobalSettings, Progress, ProjectSettings,
+    RelPath, SkipReason, SnapshotOptions, Stage, VersionKind,
+};
+use dsnap_test_support::{FixtureProject, TestHome, tree_bytes, tree_dirs};
+
+use project::{Env, rp, snap, versions};
+
+/// Every file of the latest version, read back from the store.
+fn stored_bytes(env: &Env) -> BTreeMap<RelPath, Vec<u8>> {
+    let latest = env.db.latest_version(env.project).unwrap().unwrap();
+    env.db
+        .entries(latest.id)
+        .unwrap()
+        .into_iter()
+        .filter_map(|e| match e.kind {
+            EntryKind::File => Some((e.path, env.dsnap.read_blob(&e.blob.unwrap()).unwrap())),
+            EntryKind::Symlink { target } => {
+                let mut v = b"symlink:".to_vec();
+                v.extend_from_slice(target.as_bytes());
+                Some((e.path, v))
+            }
+            EntryKind::Dir => None,
+        })
+        .collect()
+}
+
+#[test]
+fn first_snapshot_captures_every_file_byte_for_byte() {
+    let fx = FixtureProject::new()
+        .file("a.txt", "hello\n")
+        .file("src/main.rs", "fn main() {}\n")
+        .file("bin/data.bin", [0u8, 1, 2, 255, 0, 7])
+        .file("empty.txt", "")
+        .file("deep/er/still/x", "x")
+        .dir("empty_dir")
+        .readonly("a.txt")
+        .build();
+    let env = Env::new(fx.root());
+    let r = snap(&env, Some("first"));
+    let v = r.version.unwrap();
+    assert_eq!(v.label, "first");
+    assert_eq!(v.kind, VersionKind::Manual);
+    assert!(!v.unstable);
+    assert_eq!(
+        v.counts,
+        ChangeCounts {
+            added: 6,
+            modified: 0,
+            deleted: 0
+        }
+    );
+    assert!(r.skipped.is_empty());
+    assert_eq!(stored_bytes(&env), tree_bytes(fx.root()));
+
+    let entries = env.db.entries(v.id).unwrap();
+    let ro = entries.iter().find(|e| e.path == rp("a.txt")).unwrap();
+    assert!(ro.readonly);
+    let dir = entries.iter().find(|e| e.path == rp("empty_dir")).unwrap();
+    assert_eq!(dir.kind, EntryKind::Dir);
+    assert!(tree_dirs(fx.root()).contains(&rp("empty_dir")));
+}
+
+#[test]
+fn unchanged_second_snapshot_writes_nothing() {
+    let fx = FixtureProject::new().file("a.txt", "1").build();
+    let env = Env::new(fx.root());
+    snap(&env, None).version.unwrap();
+    let token = env.db.change_token().unwrap();
+    let blobs = project::store_files(&env);
+
+    let r = snap(&env, None);
+    assert!(r.version.is_none());
+    assert_eq!(versions(&env), 1);
+    assert_eq!(env.db.change_token().unwrap(), token);
+    assert_eq!(project::store_files(&env), blobs);
+}
+
+#[test]
+fn mtime_only_change_is_not_a_change() {
+    let fx = FixtureProject::new().file("a.txt", "same").build();
+    let env = Env::new(fx.root());
+    snap(&env, None).version.unwrap();
+    let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+    filetime::set_file_mtime(
+        fx.path("a.txt"),
+        filetime::FileTime::from_system_time(later),
+    )
+    .unwrap();
+    assert!(snap(&env, None).version.is_none());
+}
+
+#[test]
+fn counts_added_modified_deleted() {
+    let fx = FixtureProject::new()
+        .file("keep.txt", "k")
+        .file("edit.txt", "before")
+        .file("gone.txt", "bye")
+        .file("gone2.txt", "bye2")
+        .build();
+    let env = Env::new(fx.root());
+    snap(&env, None).version.unwrap();
+
+    project::rewrite(&fx.path("edit.txt"), b"after, longer");
+    fs::remove_file(fx.path("gone.txt")).unwrap();
+    fs::remove_file(fx.path("gone2.txt")).unwrap();
+    fs::write(fx.path("new.txt"), "fresh").unwrap();
+    fs::create_dir(fx.path("newdir")).unwrap();
+
+    let v = snap(&env, Some("second")).version.unwrap();
+    assert_eq!(
+        v.counts,
+        ChangeCounts {
+            added: 2,
+            modified: 1,
+            deleted: 2
+        }
+    );
+    assert_eq!(stored_bytes(&env), tree_bytes(fx.root()));
+    assert_eq!(versions(&env), 2);
+}
+
+#[test]
+fn ignored_and_oversize_files_are_excluded_and_oversize_reported() {
+    let fx = FixtureProject::new()
+        .file("a.txt", "a")
+        .file("debug.log", "ignored by .gitignore")
+        .file("node_modules/pkg/index.js", "built-in ignore")
+        .file("secret/key", "extra_ignore")
+        .file("big.bin", vec![7u8; 2048])
+        .gitignore(&["*.log"])
+        .build();
+    let env = Env::with_settings(
+        fx.root(),
+        ProjectSettings {
+            extra_ignore: vec!["secret/".into()],
+            ..ProjectSettings::default()
+        },
+    );
+    env.db
+        .set_global_settings(&GlobalSettings {
+            size_cap_bytes: 1024,
+            ..GlobalSettings::default()
+        })
+        .unwrap();
+
+    let r = snap(&env, None);
+    let v = r.version.unwrap();
+    let paths: Vec<String> = env
+        .db
+        .entries(v.id)
+        .unwrap()
+        .into_iter()
+        .map(|e| e.path.to_string())
+        .collect();
+    assert_eq!(paths, [".gitignore", "a.txt"]);
+    assert_eq!(r.skipped.len(), 1);
+    assert_eq!(r.skipped[0].path, "big.bin");
+    assert_eq!(r.skipped[0].reason, SkipReason::TooLarge { size: 2048 });
+}
+
+#[test]
+fn cancel_before_commit_leaves_no_version() {
+    let fx = FixtureProject::new()
+        .file("a.txt", "a")
+        .file("b.txt", "b")
+        .build();
+    let env = Env::new(fx.root());
+
+    // Already cancelled.
+    let cancel = CancelToken::new();
+    cancel.cancel();
+    let err = env
+        .dsnap
+        .snapshot(
+            env.project,
+            SnapshotOptions {
+                cancel: Some(cancel),
+                ..SnapshotOptions::default()
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(err, Error::Cancelled), "{err}");
+    assert_eq!(versions(&env), 0);
+
+    // Cancelled during the hash phase, after blobs were written.
+    let cancel = CancelToken::new();
+    let c = cancel.clone();
+    let progress = Progress::new(move |e| {
+        if e.stage == Stage::Hash {
+            c.cancel();
+        }
+    });
+    let err = env
+        .dsnap
+        .snapshot(
+            env.project,
+            SnapshotOptions {
+                cancel: Some(cancel),
+                progress: Some(progress),
+                ..SnapshotOptions::default()
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(err, Error::Cancelled), "{err}");
+    assert_eq!(versions(&env), 0);
+
+    // A later snapshot still works.
+    assert!(snap(&env, None).version.is_some());
+}
+
+#[test]
+fn progress_reports_walk_and_hash() {
+    let fx = FixtureProject::new().file("a.txt", "a").build();
+    let env = Env::new(fx.root());
+    let stages = Arc::new(Mutex::new(Vec::new()));
+    let s = stages.clone();
+    env.dsnap
+        .snapshot(
+            env.project,
+            SnapshotOptions {
+                progress: Some(Progress::new(move |e| s.lock().unwrap().push(e.stage))),
+                kind: VersionKind::Cli,
+                ..SnapshotOptions::default()
+            },
+        )
+        .unwrap();
+    let stages = stages.lock().unwrap();
+    assert!(stages.contains(&Stage::Walk) && stages.contains(&Stage::Hash));
+    let latest = env.db.latest_version(env.project).unwrap().unwrap();
+    assert_eq!(latest.kind, VersionKind::Cli);
+}
+
+#[test]
+fn default_label_is_a_timestamp() {
+    let fx = FixtureProject::new().file("a.txt", "a").build();
+    let env = Env::new(fx.root());
+    let v = snap(&env, Some("  ")).version.unwrap();
+    // YYYY-MM-DD HH:MM:SS
+    let b = v.label.as_bytes();
+    assert_eq!(b.len(), 19, "{}", v.label);
+    assert_eq!(
+        (b[4], b[7], b[10], b[13], b[16]),
+        (b'-', b'-', b' ', b':', b':')
+    );
+    assert!(v.created_at_ms > 0);
+}
+
+#[test]
+fn first_snapshot_of_an_empty_folder_is_a_baseline() {
+    let fx = FixtureProject::new().build();
+    let env = Env::new(fx.root());
+    let v = snap(&env, None).version.unwrap();
+    assert_eq!(v.counts, ChangeCounts::default());
+    assert!(snap(&env, None).version.is_none());
+}
+
+#[test]
+fn missing_root_is_project_missing() {
+    let home = TestHome::new();
+    let dsnap = home.open();
+    let db = Db::open(&home.path().join("dsnap.db")).unwrap();
+    let root = home.path().join("gone");
+    let p = db
+        .insert_project("gone", &root, &ProjectSettings::default())
+        .unwrap();
+    let err = dsnap.snapshot(p, SnapshotOptions::default()).unwrap_err();
+    assert!(matches!(err, Error::ProjectMissing { .. }), "{err}");
+    let _: &Dsnap = &dsnap;
+}
+
+#[test]
+fn symlinks_are_stored_as_links() {
+    if !dsnap_test_support::symlinks_supported() {
+        eprintln!("symlinks unsupported here; skipping");
+        return;
+    }
+    let fx = FixtureProject::new()
+        .file("target.txt", "t")
+        .symlink("link", "target.txt")
+        .build();
+    let env = Env::new(fx.root());
+    snap(&env, None).version.unwrap();
+    assert_eq!(stored_bytes(&env), tree_bytes(fx.root()));
+}
