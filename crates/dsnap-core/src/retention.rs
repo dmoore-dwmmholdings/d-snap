@@ -11,7 +11,8 @@ impl Dsnap {
         todo!("DSNA-15")
     }
 
-    /// Delete blobs no version references.
+    /// Delete blobs no version references, by calling `Db::prune_unreferenced` in batches.
+    /// Never delete store files directly (see the `db` module docs, DSNA-80).
     pub fn prune_blobs(&self) -> Result<RetentionReport> {
         todo!("DSNA-15")
     }

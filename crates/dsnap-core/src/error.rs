@@ -40,6 +40,11 @@ pub enum Error {
         #[source]
         source: Box<Error>,
     },
+    /// A new version would reference a blob missing from the store (pruned after the snapshot
+    /// deduplicated against it). Nothing was committed; store the blob again and retry.
+    /// See [`crate::db::Db::insert_version`].
+    #[error("blob {0} is missing from the store")]
+    BlobMissing(crate::types::BlobHash),
     /// Stored data is inconsistent (bad blob, hash mismatch, malformed row).
     #[error("corrupt data: {0}")]
     Corrupt(String),

@@ -21,6 +21,10 @@ impl Store {
     }
 
     /// Store `bytes` (no-op if the hash already exists) and return its record.
+    ///
+    /// Writes go to a temp file renamed into place, so a reader never sees a partial blob.
+    /// The no-op path is safe only because `Db::insert_version` re-checks blob presence under
+    /// the write lock (see the `db` module docs).
     pub fn put(&self, bytes: &[u8]) -> Result<BlobInfo> {
         todo!("DSNA-6")
     }
@@ -41,6 +45,9 @@ impl Store {
     }
 
     /// Delete a blob; returns the bytes freed on disk (0 if it did not exist).
+    ///
+    /// Only [`crate::db::Db::prune_unreferenced`] may call this, inside its write transaction.
+    /// Deleting a blob anywhere else can lose snapshot data (see the `db` module docs).
     pub fn delete(&self, hash: &BlobHash) -> Result<u64> {
         todo!("DSNA-6")
     }

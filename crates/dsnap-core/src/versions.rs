@@ -26,7 +26,7 @@ impl Dsnap {
         todo!("DSNA-15")
     }
 
-    /// Delete a version and prune blobs it alone used.
+    /// Delete a version, then prune unreferenced blobs via [`Dsnap::prune_blobs`].
     pub fn delete_version(&self, id: VersionId) -> Result<()> {
         todo!("DSNA-15")
     }

@@ -2,6 +2,29 @@
 //!
 //! Every write that creates a version runs in one transaction. Sets a busy timeout so the CLI
 //! and the app can share the file.
+//!
+//! # Blob lifetime protocol (DSNA-80, Rule 1)
+//!
+//! The CLI and the app are separate processes sharing one store. A snapshot may deduplicate
+//! against a blob (`Store::put` is a no-op when the file exists) that retention is about to
+//! prune. To make that safe, the SQLite write lock is the single lock for blob lifetime:
+//!
+//! 1. **Only [`Db::prune_unreferenced`] deletes blob files**, and it does so inside one
+//!    `BEGIN IMMEDIATE` transaction: select unreferenced blobs, delete each store file
+//!    ([`Store::delete`]), delete their rows, commit. No other code calls `Store::delete`.
+//! 2. **[`Db::insert_version`] verifies before committing.** Inside its own `BEGIN IMMEDIATE`
+//!    transaction, for every distinct blob in the new entries that no existing entry row
+//!    references, it checks [`Store::contains`]. If one is missing it rolls back and returns
+//!    [`crate::Error::BlobMissing`]. Blobs that an existing row references cannot be pruned
+//!    while the lock is held, so they need no check.
+//! 3. **The snapshot retries.** On `BlobMissing`, the caller (snapshot, DSNA-14) re-stores
+//!    the affected files with `Store::put_file` and calls `insert_version` once more. If the
+//!    file's hash changed in the meantime, it redoes the capture for that path.
+//!
+//! A prune that crashes after deleting files but before committing leaves rows for missing
+//! files. Those rows are unreferenced, so step 2 catches any reuse and the next prune removes
+//! them (`Store::delete` of a missing file returns `Ok(0)`). Keep prune batches small (see
+//! `limit`) so the write lock is not held for longer than the busy timeout.
 #![allow(unused_variables)] // stub signatures; remove when implemented
 
 use std::path::Path;
@@ -11,9 +34,10 @@ use rusqlite::Connection;
 
 use crate::error::Result;
 use crate::facade::Dsnap;
+use crate::store::Store;
 use crate::types::{
     BlobHash, BlobInfo, ChangeCounts, Entry, GlobalSettings, Project, ProjectId, ProjectSettings,
-    RelPath, Version, VersionId, VersionKind,
+    RelPath, RetentionReport, Version, VersionId, VersionKind,
 };
 
 /// Database handle. Thread-safe; serialises access to one connection.
@@ -95,8 +119,12 @@ impl Db {
         todo!("DSNA-7")
     }
 
-    /// Insert a version, its entries and new blob rows in one transaction.
-    pub fn insert_version(&self, v: &NewVersion) -> Result<Version> {
+    /// Insert a version, its entries and new blob rows in one `BEGIN IMMEDIATE` transaction.
+    ///
+    /// Before committing, checks that `store` holds every blob the new entries reference that
+    /// no existing entry references; otherwise rolls back with [`crate::Error::BlobMissing`]
+    /// (see the module docs).
+    pub fn insert_version(&self, v: &NewVersion, store: &Store) -> Result<Version> {
         todo!("DSNA-7")
     }
 
@@ -150,13 +178,21 @@ impl Db {
         todo!("DSNA-7")
     }
 
-    /// Blobs no entry references.
+    /// Blobs no entry references, for reporting only. Never delete based on this list; the
+    /// answer can change as soon as it returns. Use [`Db::prune_unreferenced`].
     pub fn unreferenced_blobs(&self) -> Result<Vec<BlobInfo>> {
         todo!("DSNA-7")
     }
 
-    /// Remove a blob row.
-    pub fn delete_blob(&self, hash: &BlobHash) -> Result<()> {
+    /// Delete up to `limit` unreferenced blobs (store file and row) in one `BEGIN IMMEDIATE`
+    /// transaction. This is the only code path that deletes blob files (see the module docs).
+    /// Returns `versions_deleted: 0` plus the blobs and bytes freed.
+    pub fn prune_unreferenced(&self, store: &Store, limit: usize) -> Result<RetentionReport> {
+        todo!("DSNA-7")
+    }
+
+    /// Whether any entry references `hash`.
+    pub fn blob_referenced(&self, hash: &BlobHash) -> Result<bool> {
         todo!("DSNA-7")
     }
 
