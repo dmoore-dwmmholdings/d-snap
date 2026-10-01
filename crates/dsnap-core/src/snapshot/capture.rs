@@ -317,6 +317,97 @@ impl Dsnap {
     }
 }
 
+impl Dsnap {
+    /// Store again every file of `cap` whose blob is missing from the store: `reported` (from
+    /// [`Error::BlobMissing`]) and any other blob of `cap.entries` that the store no longer
+    /// holds, so one prune batch cannot fail the retry too (DSNA-80 protocol step 3, DSNA-83).
+    ///
+    /// Each affected path is captured again with the snapshot rules ([`capture_file`] with
+    /// re-check and lock retry): unchanged content is simply stored again; changed content
+    /// replaces the entry (and is unstable if it keeps changing); a file that is gone is
+    /// dropped; a file that cannot be read is skipped and its previous entry carried forward.
+    /// Errors writing the store are returned.
+    pub(crate) fn restore_missing_blobs(
+        &self,
+        cap: &mut Capture,
+        reported: BlobHash,
+    ) -> Result<()> {
+        let mut missing: HashSet<BlobHash> = cap
+            .entries
+            .iter()
+            .filter_map(|e| e.blob)
+            .filter(|h| !self.store.contains(h))
+            .collect();
+        missing.insert(reported);
+        let read = |abs: &Path| {
+            self.store.put_file(abs).map(|info| Read {
+                hash: info.hash,
+                size: info.size,
+                stored: Some(info),
+            })
+        };
+        let rules = CaptureRules {
+            recheck: true,
+            lock_delays: &LOCK_RETRY_DELAYS,
+        };
+        let mut drop_idx = Vec::new();
+        let mut new_skips = Vec::new();
+        for (i, e) in cap.entries.iter_mut().enumerate() {
+            let affected =
+                e.kind == EntryKind::File && e.blob.is_some_and(|h| missing.contains(&h));
+            if !affected {
+                continue;
+            }
+            let abs = e.path.to_path(&cap.root);
+            // Compare against the file as it is now, not as the walk saw it.
+            let mut now = e.clone();
+            if let Some((size, mtime_ns)) = stat(&abs) {
+                now.size = size;
+                now.mtime_ns = mtime_ns;
+            }
+            match capture_file(&read, &abs, &now, rules)? {
+                Hashed::Captured {
+                    read,
+                    mtime_ns,
+                    unstable,
+                } => {
+                    e.blob = Some(read.hash);
+                    e.size = read.size;
+                    e.mtime_ns = mtime_ns;
+                    cap.new_blobs.extend(read.stored);
+                    if unstable {
+                        cap.unstable_paths.push(e.path.clone());
+                    }
+                }
+                Hashed::Gone => drop_idx.push(i),
+                Hashed::Skip(reason) => {
+                    new_skips.push(SkippedFile {
+                        path: e.path.to_string(),
+                        reason,
+                    });
+                    drop_idx.push(i);
+                }
+            }
+        }
+        remove_indexes(&mut cap.entries, &drop_idx);
+        if !new_skips.is_empty() {
+            cap.skipped.extend(new_skips);
+            cap.skipped.sort_by(|a, b| a.path.cmp(&b.path));
+            carry_forward(
+                &mut cap.entries,
+                &cap.skipped,
+                &cap.latest_entries,
+                EntryDiffOptions::default().case_insensitive,
+            );
+        }
+        cap.unstable_paths.sort();
+        cap.unstable_paths.dedup();
+        cap.new_blobs.sort_by_key(|b| b.hash);
+        cap.new_blobs.dedup_by_key(|b| b.hash);
+        Ok(())
+    }
+}
+
 /// Threads for storing files: at least [`MIN_STORE_THREADS`], or the CPU count if higher.
 pub(crate) const MIN_STORE_THREADS: usize = 16;
 

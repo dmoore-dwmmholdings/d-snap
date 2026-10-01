@@ -13,6 +13,10 @@
 //!
 //! Blobs are written before the transaction. A snapshot that fails or is cancelled before
 //! the commit leaves no version, only orphan blobs, which `Db::sweep_orphans` removes.
+//!
+//! If a concurrent prune deleted a blob this snapshot deduplicated against, the insert fails
+//! with [`Error::BlobMissing`]; the affected files are stored again (or recaptured if they
+//! changed meanwhile) and the insert is retried once (DSNA-80 protocol, DSNA-83).
 
 pub(crate) mod capture;
 
@@ -21,7 +25,7 @@ use time::macros::format_description;
 
 use crate::db::NewVersion;
 use crate::diff::entries::{EntryDiffOptions, count_changes, diff_entries};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::facade::Dsnap;
 use crate::types::{ProjectId, SnapshotOptions, SnapshotReport};
 
@@ -32,47 +36,63 @@ impl Dsnap {
     ///
     /// Errors: [`crate::Error::ProjectMissing`] if the folder is gone,
     /// [`crate::Error::Cancelled`] if `opts.cancel` fires before the commit (nothing is
-    /// committed then), and walk, store or database errors.
+    /// committed then), [`Error::BlobMissing`] if a blob is still missing after one retry,
+    /// and walk, store or database errors.
     pub fn snapshot(&self, project: ProjectId, opts: SnapshotOptions) -> Result<SnapshotReport> {
         let hooks = Hooks {
             progress: opts.progress.clone(),
             cancel: opts.cancel.clone(),
         };
         let proj = self.load_project(project)?;
-        let cap = self.capture(&proj, Mode::Store, &hooks)?;
-
-        let changes = diff_entries(
-            &cap.latest_entries,
-            &cap.entries,
-            EntryDiffOptions::default(),
-        );
-        let mut report = SnapshotReport {
-            version: None,
-            skipped: cap.skipped,
-            unstable_paths: cap.unstable_paths,
-        };
-        if cap.latest.is_some() && changes.is_empty() {
-            return Ok(report);
-        }
+        let mut cap = self.capture(&proj, Mode::Store, &hooks)?;
 
         let now = now_local();
         let label = match opts.label {
             Some(l) if !l.trim().is_empty() => l,
             _ => default_label(now),
         };
-        let nv = NewVersion {
-            project_id: project,
-            label,
-            created_at_ms: unix_ms(now),
-            kind: opts.kind,
-            unstable: !report.unstable_paths.is_empty(),
-            counts: count_changes(&changes),
-            entries: cap.entries,
-            new_blobs: cap.new_blobs,
-        };
-        hooks.check_cancel()?;
-        report.version = Some(self.db.insert_version(&nv, &self.store)?);
-        Ok(report)
+        let mut retried = false;
+        loop {
+            let changes = diff_entries(
+                &cap.latest_entries,
+                &cap.entries,
+                EntryDiffOptions::default(),
+            );
+            let mut report = SnapshotReport {
+                version: None,
+                skipped: cap.skipped.clone(),
+                unstable_paths: cap.unstable_paths.clone(),
+            };
+            if cap.latest.is_some() && changes.is_empty() {
+                return Ok(report);
+            }
+            let nv = NewVersion {
+                project_id: project,
+                label: label.clone(),
+                created_at_ms: unix_ms(now),
+                kind: opts.kind,
+                unstable: !report.unstable_paths.is_empty(),
+                counts: count_changes(&changes),
+                entries: std::mem::take(&mut cap.entries),
+                new_blobs: std::mem::take(&mut cap.new_blobs),
+            };
+            hooks.check_cancel()?;
+            match self.db.insert_version(&nv, &self.store) {
+                Ok(v) => {
+                    report.version = Some(v);
+                    return Ok(report);
+                }
+                // A prune removed a blob this snapshot deduplicated against (DSNA-80): store
+                // the affected files again and retry once. Nothing was committed.
+                Err(Error::BlobMissing(hash)) if !retried => {
+                    retried = true;
+                    cap.entries = nv.entries;
+                    cap.new_blobs = nv.new_blobs;
+                    self.restore_missing_blobs(&mut cap, hash)?;
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 }
 
