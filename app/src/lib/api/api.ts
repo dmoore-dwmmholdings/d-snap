@@ -92,14 +92,19 @@ export interface Api {
   // Snapshots (F4–F7)
   /** Captures the folder. Empty `label` means default (timestamp). `version: null` = nothing changed. */
   snapshot(projectId: ProjectId, label?: string): Promise<SnapshotReport>;
-  /** Changes in the folder since the latest version ("Unsaved changes", badge count). */
+  /**
+   * Changes in the folder since the latest version ("Unsaved changes", badge
+   * count). Paths outside any snapshot (ignored, over the size cap) are left out
+   * on both sides, so they never show as deleted. The same applies to every
+   * comparison against the working tree.
+   */
   status(projectId: ProjectId): Promise<FileChange[]>;
   /**
    * Cancels a queued or running snapshot or restore by `Progress.opId`. Rejects
    * `not_found` if it already finished.
    *
-   * Correlation rule: operations on one project run one at a time (later calls
-   * queue). Each call emits its first `Progress` event (phase `queued` or `walk`)
+   * Correlation rule: writes on one project (`snapshot`, `restoreProject`,
+   * `restoreFile`, `revertHunk`) run one at a time; later calls queue. Each call emits its first `Progress` event (phase `queued` or `walk`)
    * before the method returns its promise, so the latest `Progress` with this
    * `projectId` and `op` carries the call's `opId`.
    */
@@ -146,7 +151,9 @@ export interface Api {
   /**
    * Reverts hunk `hunkIndex` of `fileDiff(projectId, from, to, path, opts)` in the
    * folder; pass the same `opts` the diff view used. `to` must be the working
-   * tree, else `invalid_input`. Ignored or over-cap paths reject `not_found`.
+   * tree, else `invalid_input`. If the path is uncaptured (see
+   * `RestorePlan.uncaptured`), nothing is written and the report's `uncaptured`
+   * holds the path.
    */
   revertHunk(
     projectId: ProjectId,

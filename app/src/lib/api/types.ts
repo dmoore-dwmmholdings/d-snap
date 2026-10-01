@@ -195,9 +195,14 @@ export interface RestorePlan {
   delete: RelPath[];
   createDirs: RelPath[];
   /**
-   * Paths the restore would change but leaves alone, because their current
-   * content cannot be in the safety snapshot: ignored now, or over the size cap
-   * (Rule 1, F20). The confirm dialog must list them.
+   * Paths the restore would change but leaves alone, because doing so could
+   * replace or remove content the safety snapshot cannot hold (Rule 1, F20).
+   * A path is uncaptured when it is ignored now, or the folder holds it but it is
+   * not capturable (over the size cap, locked, unreadable), or a path like that
+   * is its ancestor, or (for a file to be written) its descendant. Example: the
+   * version has file `out` but the folder has `out/` with an ignored child, or the
+   * version has `pkg/a.txt` but the folder has a 60 MB file `pkg`. The confirm
+   * dialog must list them.
    */
   uncaptured: RelPath[];
 }

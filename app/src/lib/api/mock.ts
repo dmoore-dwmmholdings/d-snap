@@ -303,7 +303,8 @@ export class MockApi implements Api {
   changes(projectId: ProjectId, from: VersionId | null, to: VersionRef): Promise<FileChange[]> {
     return this.call(() => {
       const rec = this.rec(projectId);
-      return compareTrees(this.state, this.side(rec, from), this.target(rec, to), true);
+      const [older, newer] = this.sides(rec, from, to);
+      return compareTrees(this.state, older, newer, true);
     });
   }
 
@@ -357,8 +358,7 @@ export class MockApi implements Api {
   }
 
   restoreFile(projectId: ProjectId, versionId: VersionId, path: RelPath): Promise<RestoreReport> {
-    return this.call(() => {
-      const rec = this.rec(projectId);
+    return this.operation('restore', projectId, (rec) => {
       if (rec.project.missing) throw missing(rec);
       const target = this.versionIn(rec, versionId);
       const e = target.entries.get(path);
@@ -383,12 +383,19 @@ export class MockApi implements Api {
     hunkIndex: number,
     opts: DiffOptions,
   ): Promise<RestoreReport> {
-    return this.call(() => {
-      const rec = this.rec(projectId);
-      if (to.kind !== 'workingTree') {
-        throw new ApiError('invalid_input', 'Only changes in the folder can be reverted.');
-      }
+    if (to.kind !== 'workingTree') {
+      return Promise.reject(
+        new ApiError('invalid_input', 'Only changes in the folder can be reverted.'),
+      );
+    }
+    return this.operation('restore', projectId, (rec) => {
       if (rec.project.missing) throw missing(rec);
+      const label = from === null ? 'empty' : this.versionIn(rec, from).version.label;
+      if (this.guard(rec).check(path, true)) {
+        // Rule 1: the folder copy is not in any snapshot, so never write over it.
+        const safety = this.safetySnapshot(rec, label);
+        return { safetyVersion: safety, written: [], deleted: [], failed: [], uncaptured: [path] };
+      }
       const diff = this.diffOf(rec, from, to, path, opts);
       if (diff.body.kind !== 'text') {
         throw new ApiError('invalid_input', `${path} has no text hunks.`);
@@ -401,7 +408,6 @@ export class MockApi implements Api {
         this.state.entryText(newEntry),
         hunk,
       );
-      const label = from === null ? 'empty' : this.versionIn(rec, from).version.label;
       const safety = this.safetySnapshot(rec, label);
       const hash = this.state.putText(text);
       rec.tree.set(path, this.state.fileEntry(path, hash, this.now() * 1_000_000));
@@ -517,17 +523,36 @@ export class MockApi implements Api {
     return rec.versions[rec.versions.length - 1]?.entries ?? null;
   }
 
+  /**
+   * Both sides of a comparison. Against the working tree, paths the folder holds
+   * outside any snapshot (ignored, over the size cap, or under such a path) are
+   * dropped from the old side too, so they never show as "deleted" and cannot be
+   * restored or reverted over.
+   */
+  private sides(rec: ProjectRecord, from: VersionId | null, to: VersionRef): [Tree | null, Tree] {
+    const older = this.side(rec, from);
+    const newer = this.target(rec, to);
+    if (to.kind !== 'workingTree' || !older) return [older, newer];
+    const { check } = this.guard(rec);
+    return [new Map([...older].filter(([p]) => !check(p, false))), newer];
+  }
+
   private statusOf(rec: ProjectRecord, withLines: boolean): FileChange[] {
-    return compareTrees(this.state, this.latest(rec), this.state.capturable(rec).kept, withLines);
+    const latest = this.latest(rec);
+    const id = rec.versions[rec.versions.length - 1]?.version.id ?? null;
+    if (!latest || id === null) {
+      return compareTrees(this.state, null, this.state.capturable(rec).kept, withLines);
+    }
+    const [older, newer] = this.sides(rec, id, { kind: 'workingTree' });
+    return compareTrees(this.state, older, newer, withLines);
   }
 
   private pair(rec: ProjectRecord, from: VersionId | null, to: VersionRef, path: RelPath) {
-    const change = compareTrees(this.state, this.side(rec, from), this.target(rec, to), false).find(
-      (c) => c.path === path,
-    );
+    const [older, newer] = this.sides(rec, from, to);
+    const change = compareTrees(this.state, older, newer, false).find((c) => c.path === path);
     if (change) return { oldEntry: change.old, newEntry: change.new };
     // Unchanged file: same entry on both sides.
-    const e = this.target(rec, to).get(path);
+    const e = newer.get(path);
     if (!e) throw new ApiError('not_found', `${path} not found.`);
     return { oldEntry: e, newEntry: e };
   }
@@ -566,30 +591,49 @@ export class MockApi implements Api {
   }
 
   /**
-   * Restore plan. Paths whose current content no safety snapshot can hold
-   * (ignored now, or over the size cap) and that the restore would change go to
-   * `uncaptured` and are never written or deleted (Rule 1, DSNA-87).
+   * Rule 1 guard. `check(p, asFile)` is true when writing or deleting `p` could
+   * replace or remove content that no safety snapshot holds: `p` is ignored, or
+   * is in the folder but not capturable (over the size cap), or has such a path
+   * as an ancestor, or (when `p` would become a file) as a descendant.
+   */
+  private guard(rec: ProjectRecord): {
+    kept: Tree;
+    check: (p: RelPath, asFile: boolean) => boolean;
+  } {
+    const { kept } = this.state.capturable(rec);
+    const held = [...rec.tree.keys()].filter((p) => !kept.has(p));
+    const heldSet = new Set(held);
+    const check = (p: RelPath, asFile: boolean) =>
+      this.state.ignored(rec, p) ||
+      heldSet.has(p) ||
+      held.some((q) => p.startsWith(`${q}/`) || (asFile && q.startsWith(`${p}/`)));
+    return { kept, check };
+  }
+
+  /**
+   * Restore plan. Paths the restore would change but where that could replace
+   * or remove uncaptured content (see `guard`) go to `uncaptured` and are never
+   * written, created or deleted (Rule 1, DSNA-87).
    */
   private planOf(rec: ProjectRecord, target: Tree, versionId: VersionId): RestorePlan {
     const write: RelPath[] = [];
     const del: RelPath[] = [];
     const createDirs: RelPath[] = [];
     const uncaptured = new Set<RelPath>();
-    const { kept } = this.state.capturable(rec);
-    const protectedPath = (p: RelPath) =>
-      this.state.ignored(rec, p) || (rec.tree.has(p) && !kept.has(p));
+    const { check } = this.guard(rec);
     for (const [p, e] of target) {
       const cur = rec.tree.get(p);
       if (cur && sameContent(cur, e)) continue;
-      if (protectedPath(p)) {
-        if (e.kind.kind !== 'dir' || !cur) uncaptured.add(p);
-      } else if (e.kind.kind === 'dir') {
+      const isDir = e.kind.kind === 'dir';
+      if (check(p, !isDir)) {
+        if (!isDir || !cur) uncaptured.add(p);
+      } else if (isDir) {
         if (!cur) createDirs.push(p);
       } else write.push(p);
     }
     for (const [p, e] of rec.tree) {
       if (target.has(p) || e.kind.kind === 'dir') continue;
-      if (protectedPath(p)) uncaptured.add(p);
+      if (check(p, true)) uncaptured.add(p);
       else del.push(p);
     }
     return {

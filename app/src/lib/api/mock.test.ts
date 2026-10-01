@@ -437,6 +437,97 @@ describe('restore', () => {
     await rejectsWith(api.revertHunk(tool.id, latest, WT, 'src/lib.rs', 5, o), 'invalid_input');
   });
 
+  it('never reverts a hunk over a file that is now over the size cap (Rule 1)', async () => {
+    const { api, tool } = await setup();
+    api.mockWriteFile(tool.id, 'data.txt', 'small v1\n');
+    const v1 = (await api.snapshot(tool.id, 'v1')).version!;
+    api.mockWriteFile(tool.id, 'data.txt', 'huge user data\n', 60 * 1024 * 1024);
+    // The over-cap file is outside every snapshot, so it is not shown as deleted.
+    expect((await api.status(tool.id)).map((c) => c.path)).not.toContain('data.txt');
+    expect((await api.changes(tool.id, v1.id, WT)).map((c) => c.path)).not.toContain('data.txt');
+    const before = await api.listVersions(tool.id);
+
+    const report = await api.revertHunk(tool.id, v1.id, WT, 'data.txt', 0, DEFAULT_DIFF_OPTIONS);
+    expect(report).toMatchObject({ written: [], uncaptured: ['data.txt'] });
+    expect(api.mockReadFile(tool.id, 'data.txt')).toBe('huge user data\n');
+    await expectSafety(api, tool.id, before, report.safetyVersion, 'v1');
+  });
+
+  it('never reverts a hunk over a path that is ignored now (Rule 1)', async () => {
+    const { api, tool } = await setup();
+    api.mockWriteFile(tool.id, 'cfg.txt', 'committed\n');
+    const v1 = (await api.snapshot(tool.id, 'v1')).version!;
+    const settings = await api.getProjectSettings(tool.id);
+    await api.setProjectSettings(tool.id, { ...settings, extraIgnore: ['cfg.txt'] });
+    api.mockWriteFile(tool.id, 'cfg.txt', 'local edit\n');
+    expect((await api.status(tool.id)).map((c) => c.path)).not.toContain('cfg.txt');
+
+    const report = await api.revertHunk(tool.id, v1.id, WT, 'cfg.txt', 0, DEFAULT_DIFF_OPTIONS);
+    expect(report).toMatchObject({ written: [], uncaptured: ['cfg.txt'] });
+    expect(api.mockReadFile(tool.id, 'cfg.txt')).toBe('local edit\n');
+  });
+
+  it('does not plan a file write over a folder holding uncaptured content', async () => {
+    const { api, tool } = await setup();
+    api.mockWriteFile(tool.id, 'out', 'old output file\n');
+    const v1 = (await api.snapshot(tool.id, 'v1')).version!;
+    const settings = await api.getProjectSettings(tool.id);
+    await api.setProjectSettings(tool.id, { ...settings, extraIgnore: ['*.dat'] });
+    api.mockWriteFile(tool.id, 'out', null);
+    api.mockWriteFile(tool.id, 'out/precious.dat', 'ignored data\n');
+
+    const plan = await api.restorePlan(tool.id, v1.id);
+    expect(plan.write).not.toContain('out');
+    expect(plan.uncaptured).toEqual(['out', 'out/precious.dat']);
+    const report = await api.restoreProject(tool.id, v1.id);
+    expect(report.written).not.toContain('out');
+    expect(api.mockReadFile(tool.id, 'out')).toBeNull();
+    expect(api.mockReadFile(tool.id, 'out/precious.dat')).toBe('ignored data\n');
+    const file = await api.restoreFile(tool.id, v1.id, 'out');
+    expect(file).toMatchObject({ written: [], uncaptured: ['out'] });
+  });
+
+  it('does not plan a write under a path that is now an over-cap file', async () => {
+    const { api, tool } = await setup();
+    api.mockWriteFile(tool.id, 'pkg/a.txt', 'a\n');
+    const v1 = (await api.snapshot(tool.id, 'v1')).version!;
+    api.mockWriteFile(tool.id, 'pkg/a.txt', null);
+    api.mockWriteFile(tool.id, 'pkg', 'big file\n', 60 * 1024 * 1024);
+
+    const plan = await api.restorePlan(tool.id, v1.id);
+    expect(plan.write).not.toContain('pkg/a.txt');
+    expect(plan.uncaptured).toEqual(['pkg', 'pkg/a.txt']);
+    await api.restoreProject(tool.id, v1.id);
+    expect(api.mockReadFile(tool.id, 'pkg')).toBe('big file\n');
+    expect(api.mockReadFile(tool.id, 'pkg/a.txt')).toBeNull();
+    const file = await api.restoreFile(tool.id, v1.id, 'pkg/a.txt');
+    expect(file).toMatchObject({ written: [], uncaptured: ['pkg/a.txt'] });
+  });
+
+  it('queues file and hunk restores behind other writes, with progress', async () => {
+    const { api, tool } = await setup();
+    const latest = (await api.listVersions(tool.id))[0]!;
+    api.mockWriteFile(tool.id, 'src/main.rs', 'edited\n');
+    const events: string[] = [];
+    api.onProgress((p) => events.push(`${p.opId}:${p.op}:${p.phase}`));
+
+    const snap = api.snapshot(tool.id, 'first');
+    const file = api.restoreFile(tool.id, latest.id, 'src/main.rs');
+    const hunk = api.revertHunk(tool.id, latest.id, WT, 'src/lib.rs', 0, DEFAULT_DIFF_OPTIONS);
+    expect(events).toEqual(['op-1:snapshot:walk', 'op-2:restore:queued', 'op-3:restore:queued']);
+    const snapReport = await snap;
+    // The snapshot ran first: it captured the edit before the restore undid it.
+    expect(snapReport.version!.counts.modified).toBe(1);
+    expect((await file).written).toEqual(['src/main.rs']);
+    await rejectsWith(hunk, 'invalid_input'); // src/lib.rs is unchanged: no hunk 0
+    expect(events.filter((e) => e.startsWith('op-2'))).toEqual([
+      'op-2:restore:queued',
+      'op-2:restore:walk',
+      'op-2:restore:restore',
+      'op-2:restore:done',
+    ]);
+  });
+
   it('refuses every restore on a missing project, writing no safety version', async () => {
     const { api, notes } = await setup();
     const versions = await api.listVersions(notes.id);
