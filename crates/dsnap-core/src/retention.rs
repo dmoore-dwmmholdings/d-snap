@@ -5,11 +5,19 @@
 //! replaces the "only sweep objects older than 10 minutes" guard first planned in DSNA-55: a
 //! snapshot that deduplicated against a blob being pruned gets `Error::BlobMissing` from
 //! `Db::insert_version` and stores it again, so no age guard is needed.
+//!
+//! Also blob repair ([`Dsnap::repair_blobs`]), the other store maintenance step.
+
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+
+use serde::{Deserialize, Serialize};
 
 use crate::db::PRUNE_BATCH;
 use crate::error::{Error, Result};
 use crate::facade::Dsnap;
-use crate::types::{ProjectId, RetentionReport};
+use crate::store::RepairOutcome;
+use crate::types::{BlobHash, EntryKind, ProjectId, RetentionReport, VersionId};
 use crate::versions::version_counts;
 
 /// Versions deleted per write transaction during retention, so the write lock is released
@@ -96,5 +104,111 @@ impl Dsnap {
                 Err(e) => return Err(e),
             }
         }
+    }
+}
+
+/// What [`Dsnap::repair_blobs`] did for one damaged blob.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BlobRepair {
+    /// The damaged blob.
+    pub hash: BlobHash,
+    /// Outcome.
+    pub outcome: BlobRepairOutcome,
+}
+
+/// Outcome of repairing one blob.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum BlobRepairOutcome {
+    /// Rewritten from a working-tree file whose content still has this hash.
+    Repaired {
+        /// File the content came from.
+        source: PathBuf,
+    },
+    /// Intact by the time it was repaired (e.g. another process repaired it).
+    Healthy,
+    /// No working-tree file still holds this content; these versions cannot restore it.
+    NoIntactSource {
+        /// Versions with an entry using the blob, newest first.
+        versions: Vec<VersionId>,
+        /// The last I/O error met while trying sources or reading the object, if any.
+        error: Option<String>,
+    },
+    /// No entry references the blob, so it is left for pruning and not repaired.
+    Unreferenced,
+}
+
+impl Dsnap {
+    /// Find damaged blobs ([`crate::store::Store::verify_all`]) and rewrite each from a
+    /// working-tree file that still holds its content (DSNA-99).
+    ///
+    /// Objects `verify_all` could not read (`Error::Io`) are skipped: they may be fine. Only
+    /// blobs that an entry references are repaired; sources are tried newest version first,
+    /// each working file once, and are stored only if they hash to the blob (`repair_file`
+    /// checks). Repair renames over the object and never deletes, so it needs no DB lock.
+    /// Returns one record per damaged blob, sorted by hash.
+    pub fn repair_blobs(&self) -> Result<Vec<BlobRepair>> {
+        let mut out = Vec::new();
+        for (hash, err) in self.store.verify_all()? {
+            if matches!(err, Error::Io { .. }) {
+                continue;
+            }
+            let outcome = self.repair_one(&hash)?;
+            out.push(BlobRepair { hash, outcome });
+        }
+        Ok(out)
+    }
+
+    fn repair_one(&self, hash: &BlobHash) -> Result<BlobRepairOutcome> {
+        let uses = self.db.entries_using_blob(hash)?;
+        if uses.is_empty() {
+            return Ok(BlobRepairOutcome::Unreferenced);
+        }
+        let mut roots: HashMap<ProjectId, Option<PathBuf>> = HashMap::new();
+        let mut tried = HashSet::new();
+        let mut versions = Vec::new();
+        let mut error = None;
+        for (project, version, entry) in &uses {
+            if versions.last() != Some(version) {
+                versions.push(*version);
+            }
+            if entry.kind != EntryKind::File || !tried.insert((*project, entry.path.clone())) {
+                continue;
+            }
+            let root = match roots.get(project) {
+                Some(r) => r.clone(),
+                None => {
+                    let r = match self.db.get_project(*project) {
+                        Ok(p) => Some(p.root),
+                        Err(Error::NotFound(_)) => None,
+                        Err(e) => return Err(e),
+                    };
+                    roots.insert(*project, r.clone());
+                    r
+                }
+            };
+            let Some(root) = root else { continue };
+            let source = entry.path.to_path(&root);
+            // Only a regular file (not a link to one) is a source for a file entry.
+            match std::fs::symlink_metadata(&source) {
+                Ok(m) if m.is_file() => {}
+                _ => continue,
+            }
+            match self.store.repair_file(hash, &source) {
+                Ok(RepairOutcome::Repaired { .. }) => {
+                    return Ok(BlobRepairOutcome::Repaired { source });
+                }
+                Ok(RepairOutcome::Healthy) => return Ok(BlobRepairOutcome::Healthy),
+                Ok(RepairOutcome::SourceMismatch { .. }) => {}
+                Err(e @ Error::Io { .. }) => error = Some(e.to_string()),
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(BlobRepairOutcome::NoIntactSource { versions, error })
     }
 }

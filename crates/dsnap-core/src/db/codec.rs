@@ -139,14 +139,19 @@ pub(crate) struct EntryRow {
 
 impl EntryRow {
     pub(crate) fn read(r: &Row<'_>) -> rusqlite::Result<Self> {
+        Self::read_at(r, 0)
+    }
+
+    /// Read [`ENTRY_COLS`] starting at column `at`.
+    pub(crate) fn read_at(r: &Row<'_>, at: usize) -> rusqlite::Result<Self> {
         Ok(Self {
-            path: r.get(0)?,
-            kind: r.get(1)?,
-            blob: r.get(2)?,
-            size: r.get(3)?,
-            mtime_ns: r.get(4)?,
-            readonly: r.get(5)?,
-            link_target: r.get(6)?,
+            path: r.get(at)?,
+            kind: r.get(at + 1)?,
+            blob: r.get(at + 2)?,
+            size: r.get(at + 3)?,
+            mtime_ns: r.get(at + 4)?,
+            readonly: r.get(at + 5)?,
+            link_target: r.get(at + 6)?,
         })
     }
 

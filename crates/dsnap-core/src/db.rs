@@ -528,6 +528,37 @@ impl Db {
         is_referenced(&conn, hash)
     }
 
+    /// Every entry that references `hash`, with its project and version, newest version
+    /// first (blob repair, DSNA-99).
+    pub fn entries_using_blob(
+        &self,
+        hash: &BlobHash,
+    ) -> Result<Vec<(ProjectId, VersionId, Entry)>> {
+        let conn = self.conn();
+        let cols = ENTRY_COLS
+            .split(", ")
+            .map(|c| format!("e.{c}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut stmt = conn.prepare_cached(&format!(
+            "SELECT v.project_id, v.id, {cols} FROM entries e
+             JOIN versions v ON v.id = e.version_id
+             WHERE e.blob_hash = ?1 ORDER BY v.id DESC, e.path"
+        ))?;
+        let rows = stmt
+            .query_map([hash.0.as_slice()], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    EntryRow::read_at(r, 2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.into_iter()
+            .map(|(p, v, e)| Ok((ProjectId(p), VersionId(v), e.into_entry()?)))
+            .collect()
+    }
+
     /// Stored global settings (defaults if never set; missing fields take their defaults).
     pub fn global_settings(&self) -> Result<GlobalSettings> {
         let json: Option<String> = self
