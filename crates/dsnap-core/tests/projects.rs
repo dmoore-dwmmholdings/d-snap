@@ -4,12 +4,9 @@
 use std::fs;
 use std::path::Path;
 
-use dsnap_core::db::{Db, NewVersion};
-use dsnap_core::store::Store;
-use dsnap_core::{
-    AutoSnapshot, ChangeCounts, Dsnap, Entry, EntryKind, Error, GlobalSettings, ProjectId,
-    ProjectSettings, RelPath, VersionKind,
-};
+mod common;
+
+use dsnap_core::{AutoSnapshot, Dsnap, Error, GlobalSettings, ProjectId, ProjectSettings};
 use dsnap_test_support::TestHome;
 
 fn invalid<T: std::fmt::Debug>(r: dsnap_core::Result<T>) -> String {
@@ -21,36 +18,6 @@ fn invalid<T: std::fmt::Debug>(r: dsnap_core::Result<T>) -> String {
 
 fn tmp() -> tempfile::TempDir {
     tempfile::tempdir().unwrap()
-}
-
-/// Commit a version of `project` holding one file with `content` (through a second handle on
-/// the same home, as the CLI would).
-fn commit(home: &Path, project: ProjectId, content: &[u8]) -> dsnap_core::BlobHash {
-    let db = Db::open(&home.join("dsnap.db")).unwrap();
-    let store = Store::open(home.join("objects")).unwrap();
-    let info = store.put(content).unwrap();
-    db.insert_version(
-        &NewVersion {
-            project_id: project,
-            label: "v".into(),
-            created_at_ms: 0,
-            kind: VersionKind::Cli,
-            unstable: false,
-            counts: ChangeCounts::default(),
-            entries: vec![Entry {
-                path: RelPath::new("f").unwrap(),
-                kind: EntryKind::File,
-                blob: Some(info.hash),
-                size: info.size,
-                mtime_ns: 0,
-                readonly: false,
-            }],
-            new_blobs: vec![info],
-        },
-        &store,
-    )
-    .unwrap();
-    info.hash
 }
 
 fn blob_exists(ds: &Dsnap, hash: &dsnap_core::BlobHash) -> bool {
@@ -148,7 +115,7 @@ fn same_folder_with_other_spelling_is_a_duplicate_on_windows() {
     }
 
     // A row stored before normalization (different case) is still caught.
-    let db = Db::open(&home.path().join("dsnap.db")).unwrap();
+    let db = dsnap_core::db::Db::open(&home.path().join("dsnap.db")).unwrap();
     let dir2 = tmp();
     let legacy = dir2.path().join("Legacy");
     fs::create_dir(&legacy).unwrap();
@@ -241,10 +208,11 @@ fn remove_keeps_or_prunes_blobs() {
     let a = ds.add_project(&dir.path().join("a"), None).unwrap();
     let b = ds.add_project(&dir.path().join("b"), None).unwrap();
     let c = ds.add_project(&dir.path().join("c"), None).unwrap();
-    let only_a = commit(home.path(), a.id, b"only a");
-    let shared = commit(home.path(), a.id, b"shared");
-    commit(home.path(), c.id, b"shared");
-    let only_b = commit(home.path(), b.id, b"only b");
+    let cli = common::Cli::open(home.path());
+    let only_a = cli.commit_one(a.id, b"only a");
+    let shared = cli.commit_one(a.id, b"shared");
+    cli.commit_one(c.id, b"shared");
+    let only_b = cli.commit_one(b.id, b"only b");
 
     // Without deleting snapshots: rows go, blobs stay for the next prune.
     ds.remove_project(b.id, false).unwrap();
@@ -253,7 +221,7 @@ fn remove_keeps_or_prunes_blobs() {
 
     // With deleting snapshots: unreferenced blobs go (including b's leftover), shared stay.
     ds.remove_project(a.id, true).unwrap();
-    let db = Db::open(&home.path().join("dsnap.db")).unwrap();
+    let db = &cli.db;
     assert!(db.list_versions(a.id).unwrap().is_empty());
     assert!(!blob_exists(&ds, &only_a));
     assert!(!blob_exists(&ds, &only_b));

@@ -353,6 +353,62 @@ impl Db {
         })
     }
 
+    /// Delete several versions and recompute the stored counts of every surviving version
+    /// whose predecessor changed, in one `BEGIN IMMEDIATE` transaction.
+    ///
+    /// `recount(old, new)` gets the entries of the new predecessor (empty if none) and of
+    /// the survivor. Ids that do not exist are skipped. Returns the number of versions
+    /// deleted. Blobs are left for [`Db::prune_unreferenced`].
+    pub fn delete_versions(
+        &self,
+        ids: &[VersionId],
+        recount: &dyn Fn(&[Entry], &[Entry]) -> ChangeCounts,
+    ) -> Result<u32> {
+        self.write(|tx| {
+            let mut deleted: Vec<(ProjectId, VersionId)> = Vec::new();
+            for &id in ids {
+                if let Some(v) = version_by_id(tx, id)? {
+                    tx.execute("DELETE FROM versions WHERE id = ?1", [id.0])?;
+                    deleted.push((v.project_id, id));
+                }
+            }
+            let mut successors = HashSet::new();
+            for &(project, id) in &deleted {
+                let next: Option<i64> = tx
+                    .query_row(
+                        "SELECT id FROM versions WHERE project_id = ?1 AND id > ?2
+                         ORDER BY id LIMIT 1",
+                        params![project.0, id.0],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                if let Some(next) = next {
+                    successors.insert((project, VersionId(next)));
+                }
+            }
+            for (project, id) in successors {
+                let prev: Option<i64> = tx
+                    .query_row(
+                        "SELECT id FROM versions WHERE project_id = ?1 AND id < ?2
+                         ORDER BY id DESC LIMIT 1",
+                        params![project.0, id.0],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                let old = match prev {
+                    Some(p) => entries_of(tx, VersionId(p))?,
+                    None => Vec::new(),
+                };
+                let c = recount(&old, &entries_of(tx, id)?);
+                tx.execute(
+                    "UPDATE versions SET added = ?2, modified = ?3, deleted = ?4 WHERE id = ?1",
+                    params![id.0, c.added, c.modified, c.deleted],
+                )?;
+            }
+            Ok(u32::try_from(deleted.len()).unwrap_or(u32::MAX))
+        })
+    }
+
     /// Record a blob (no-op if present).
     pub fn insert_blob(&self, blob: &BlobInfo) -> Result<()> {
         self.write(|tx| insert_blob_tx(tx, blob))
