@@ -263,7 +263,17 @@ impl Store {
     ///
     /// If the object already exists (stored earlier or by a concurrent writer) the temp file
     /// is removed and the existing object's size returned.
-    fn persist(&self, mut temp: TempFile, hash: &BlobHash) -> Result<u64> {
+    fn persist(&self, temp: TempFile, hash: &BlobHash) -> Result<u64> {
+        self.persist_with(temp, hash, |from, to| fs::rename(from, to))
+    }
+
+    /// [`Store::persist`] with an injectable rename, so tests can reach the failure branches.
+    fn persist_with(
+        &self,
+        mut temp: TempFile,
+        hash: &BlobHash,
+        mut rename: impl FnMut(&Path, &Path) -> io::Result<()>,
+    ) -> Result<u64> {
         let temp_path = temp.path.clone();
         let file = temp.file()?;
         file.sync_all().at(&temp_path)?;
@@ -279,7 +289,7 @@ impl Store {
 
         let mut attempt = 0u64;
         loop {
-            match fs::rename(&temp_path, &dest) {
+            match rename(&temp_path, &dest) {
                 Ok(()) => {
                     temp.keep = true;
                     sync_dir(&shard);
@@ -441,5 +451,104 @@ impl Drop for TempFile {
         if !self.keep {
             let _ = fs::remove_file(&self.path);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+    use tempfile::TempDir;
+
+    fn store() -> (TempDir, Store) {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path().join("objects")).unwrap();
+        (tmp, store)
+    }
+
+    /// A temp file holding `bytes`, as `put` leaves it before `persist`.
+    fn temp_with(store: &Store, bytes: &[u8]) -> (TempFile, PathBuf) {
+        let mut temp = store.temp_file().unwrap();
+        temp.file().unwrap().write_all(bytes).unwrap();
+        let path = temp.path.clone();
+        (temp, path)
+    }
+
+    fn denied() -> io::Error {
+        io::Error::from(io::ErrorKind::PermissionDenied)
+    }
+
+    /// DSNA-92: a concurrent writer creates the object, then our rename fails (as on Windows
+    /// when that object is open). The existing object is a success.
+    #[test]
+    fn rename_failure_with_existing_object_is_success() {
+        let (_tmp, store) = store();
+        let bytes = b"race";
+        let hash = BlobHash::of(bytes);
+        let winner = zstd::bulk::compress(bytes, ZSTD_LEVEL).unwrap();
+        let (temp, temp_path) = temp_with(&store, b"ours, a different length");
+        let calls = Cell::new(0);
+
+        let size = store
+            .persist_with(temp, &hash, |_, to| {
+                calls.set(calls.get() + 1);
+                fs::write(to, &winner)?;
+                Err(denied())
+            })
+            .unwrap();
+
+        assert_eq!(calls.get(), 1, "no retry once the object exists");
+        assert_eq!(size, winner.len() as u64, "size of the existing object");
+        assert_eq!(store.get(&hash).unwrap(), bytes);
+        assert!(!temp_path.exists(), "temp file removed");
+    }
+
+    /// A transient sharing violation is retried.
+    #[test]
+    fn transient_rename_failure_is_retried() {
+        let (_tmp, store) = store();
+        let bytes = b"retry";
+        let hash = BlobHash::of(bytes);
+        let compressed = zstd::bulk::compress(bytes, ZSTD_LEVEL).unwrap();
+        let (temp, temp_path) = temp_with(&store, &compressed);
+        let calls = Cell::new(0);
+
+        let size = store
+            .persist_with(temp, &hash, |from, to| {
+                calls.set(calls.get() + 1);
+                if calls.get() < 3 {
+                    Err(denied())
+                } else {
+                    fs::rename(from, to)
+                }
+            })
+            .unwrap();
+
+        assert_eq!(calls.get(), 3);
+        assert_eq!(size, compressed.len() as u64);
+        assert_eq!(store.get(&hash).unwrap(), bytes);
+        assert!(!temp_path.exists());
+    }
+
+    /// A rename that keeps failing with no object in place is an error, and the temp file is
+    /// cleaned up.
+    #[test]
+    fn persistent_rename_failure_is_an_error() {
+        let (_tmp, store) = store();
+        let hash = BlobHash::of(b"never");
+        let (temp, temp_path) = temp_with(&store, b"x");
+        let calls = Cell::new(0);
+
+        let err = store
+            .persist_with(temp, &hash, |_, _| {
+                calls.set(calls.get() + 1);
+                Err(denied())
+            })
+            .unwrap_err();
+
+        assert!(matches!(err, Error::Io { .. }), "{err:?}");
+        assert_eq!(calls.get(), 6, "first try plus 5 retries");
+        assert!(!store.contains(&hash));
+        assert!(!temp_path.exists());
     }
 }
