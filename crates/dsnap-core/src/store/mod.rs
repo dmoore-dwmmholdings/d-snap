@@ -36,6 +36,10 @@ const BUF_SIZE: usize = 256 * 1024;
 /// File-name prefix of in-flight writes under `objects/`.
 pub(crate) const TEMP_PREFIX: &str = ".tmp-";
 
+mod gc;
+
+pub use gc::{SweepReport, TEMP_GRACE};
+
 /// Blob store rooted at the `objects` directory.
 #[derive(Debug)]
 pub struct Store {
