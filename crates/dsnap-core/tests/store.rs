@@ -338,3 +338,25 @@ fn put_after_delete_recreates_the_blob() {
     assert_eq!(store.get(&a.hash).unwrap(), bytes);
     assert_eq!(store.get(&b.hash).unwrap(), big);
 }
+
+#[test]
+fn contains_never_reports_a_partial_blob() {
+    let (tmp, store) = store();
+    let store = Arc::new(store);
+    let big = data(20 << 20, 11);
+    let hash = BlobHash::of(&big);
+    let p = write(tmp.path(), "big", &big);
+
+    let writer = {
+        let store = store.clone();
+        std::thread::spawn(move || store.put_file(&p).unwrap())
+    };
+    // Poll until the blob appears; the first time it does, it must be complete.
+    while !store.contains(&hash) {
+        assert!(!writer.is_finished() || store.contains(&hash));
+        std::thread::yield_now();
+    }
+    assert!(store.get(&hash).unwrap() == big);
+    let info = writer.join().unwrap();
+    assert_eq!(info.hash, hash);
+}
