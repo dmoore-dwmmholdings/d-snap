@@ -15,7 +15,6 @@ pub struct Dsnap {
     pub(crate) home: Home,
     #[allow(dead_code)] // read once Chain D implements the db methods
     pub(crate) db: Db,
-    #[allow(dead_code)] // read once Chain C implements the store methods
     pub(crate) store: Store,
 }
 
