@@ -11,6 +11,7 @@ use std::process::ExitCode;
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
+use dsnap_core::lock::ProjectLock;
 use dsnap_core::projects::normalize_root;
 use dsnap_core::{
     DiffOptions, Dsnap, Project, ProjectId, RelPath, SnapshotOptions, VersionId, VersionKind,
@@ -304,6 +305,7 @@ fn snap(dsnap: &Dsnap, out: &Out, path: &Path, label: Option<String>, quiet: boo
             .add_project(path, None)
             .with_context(|| format!("cannot track {}", path.display()))?,
     };
+    let _lock = lock_project(dsnap, p.id)?;
     let report = dsnap.snapshot(
         p.id,
         SnapshotOptions {
@@ -381,6 +383,7 @@ fn restore(dsnap: &Dsnap, out: &Out, path: &Path, args: &RestoreArgs) -> Result<
         return Err(anyhow!(Exit(EXIT_USAGE)));
     }
 
+    let _lock = lock_project(dsnap, p.id)?;
     let report = match &args.file {
         Some(f) => dsnap.restore_file(p.id, args.version, f)?,
         None => dsnap.restore_project(p.id, args.version)?,
@@ -391,6 +394,17 @@ fn restore(dsnap: &Dsnap, out: &Out, path: &Path, args: &RestoreArgs) -> Result<
     } else {
         Err(anyhow!(Exit(EXIT_PARTIAL)))
     }
+}
+
+/// Wait for any other D-Snap operation on the project (the app, a hook), saying so.
+fn lock_project(dsnap: &Dsnap, project: ProjectId) -> Result<ProjectLock> {
+    ProjectLock::acquire(
+        &dsnap.project_lock_path(project),
+        dsnap_core::lock::STALE_AFTER,
+        None,
+        || eprintln!("Waiting for another D-Snap operation on this project..."),
+    )?
+    .ok_or_else(|| anyhow!("another D-Snap operation on this project is still running"))
 }
 
 /// Ask on a terminal; anything else (a pipe, a hook) counts as "no".

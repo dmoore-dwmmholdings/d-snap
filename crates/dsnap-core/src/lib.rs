@@ -14,6 +14,7 @@ mod facade;
 pub mod db;
 pub mod diff;
 pub mod ignore_rules;
+pub mod lock;
 pub mod store;
 pub mod walk;
 

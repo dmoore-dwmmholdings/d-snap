@@ -2,7 +2,9 @@
 //! with a temporary home and capture events; `commands.rs` wraps each in a Tauri command.
 //!
 //! Writes on one project (snapshot, restore, hunk revert) run one at a time: later calls
-//! wait, reporting phase `queued`. Each write emits its first `dsnap://progress` event
+//! wait, reporting phase `queued`. They also take the shared [`ProjectLock`], so a CLI or
+//! hook operation on the same project never interleaves (DSNA-68); waiting for it is
+//! reported as `queued` too. Each write emits its first `dsnap://progress` event
 //! before its command returns its promise ([`Backend::begin`]), so the UI can tie the
 //! latest progress for a project to the call.
 
@@ -11,6 +13,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+use dsnap_core::lock::{ProjectLock, STALE_AFTER};
 use dsnap_core::{
     BlobHash, CancelToken, DiffOptions, Dsnap, FileChange, FileDiff, GlobalSettings, Progress,
     ProgressEvent, Project, ProjectId, ProjectSettings, RelPath, RestorePlan, RestoreReport,
@@ -222,6 +225,19 @@ impl Backend {
             let project_lock = self.project_lock(ctx.project);
             let _guard = lock(&project_lock);
             ctx.cancel.check()?;
+            // Also wait for other processes (the CLI, a hook) on this project.
+            let _shared = ProjectLock::acquire(
+                &dsnap.project_lock_path(ctx.project),
+                STALE_AFTER,
+                Some(&ctx.cancel),
+                || self.progress(ctx, Phase::Queued, 0, None, None),
+            )?
+            .ok_or_else(|| {
+                ApiError::new(
+                    "db",
+                    "another D-Snap operation on this project is still running",
+                )
+            })?;
             f(dsnap)
         })();
         self.progress(ctx, Phase::Done, 0, None, None);

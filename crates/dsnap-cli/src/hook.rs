@@ -2,14 +2,16 @@
 //!
 //! A hook runs on every prompt and every Stop, so it must never block or fail an agent turn:
 //! it ignores its stdin, never prompts, and always exits 0. Problems go to stderr and to
-//! `<home>/logs/hook.log` (rotated at 1 MB). Two hooks on the same project serialize on a
-//! lock file in the home directory, never in the project folder.
+//! `<home>/logs/hook.log` (rotated at 1 MB). Hooks serialize with every other D-Snap
+//! operation on the project through [`ProjectLock`] (a file in the home directory, never in
+//! the project folder).
 
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
+use dsnap_core::lock::ProjectLock;
 use dsnap_core::{Dsnap, Home, SnapshotOptions, VersionKind};
 use time::OffsetDateTime;
 use time::macros::format_description;
@@ -20,8 +22,6 @@ const LOG_MAX_BYTES: u64 = 1024 * 1024;
 const SLOW: Duration = Duration::from_secs(10);
 /// How long a hook waits for another hook on the same project.
 const LOCK_WAIT: Duration = Duration::from_secs(5);
-/// A lock file older than this is left over from a crashed hook and is taken over.
-const LOCK_STALE: Duration = Duration::from_secs(600);
 
 /// `dsnap snap --hook`: snapshot `path`, logging instead of failing.
 pub fn snap(home: Option<PathBuf>, path: &Path, label: Option<String>) {
@@ -47,12 +47,8 @@ fn snap_inner(
             Err(e) => crate::try_find_project(&dsnap, path)?.ok_or(e)?,
         },
     };
-    let lock_path = dsnap
-        .home()
-        .root()
-        .join("locks")
-        .join(format!("project-{}.lock", project.id));
-    let Some(_lock) = Lock::acquire(&lock_path)? else {
+    let lock_path = dsnap.project_lock_path(project.id);
+    let Some(_lock) = ProjectLock::acquire(&lock_path, LOCK_WAIT, None, || {})? else {
         log.write(&format!(
             "skipped snapshot of {}: another snapshot of it is still running",
             project.root.display()
@@ -130,58 +126,6 @@ fn now() -> String {
         "[year]-[month]-[day] [hour]:[minute]:[second]"
     ))
     .unwrap_or_default()
-}
-
-/// A lock file held for one snapshot; removed on drop.
-struct Lock {
-    path: PathBuf,
-}
-
-impl Lock {
-    /// Take the lock, waiting up to [`LOCK_WAIT`]. `None` if another hook still holds it.
-    fn acquire(path: &Path) -> io::Result<Option<Self>> {
-        if let Some(dir) = path.parent() {
-            fs::create_dir_all(dir)?;
-        }
-        let deadline = Instant::now() + LOCK_WAIT;
-        loop {
-            match File::options().write(true).create_new(true).open(path) {
-                Ok(mut f) => {
-                    let _ = writeln!(f, "{}", std::process::id());
-                    return Ok(Some(Self {
-                        path: path.to_path_buf(),
-                    }));
-                }
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                    if is_stale(path) {
-                        let _ = fs::remove_file(path);
-                        continue;
-                    }
-                }
-                // Windows reports a file being deleted as access denied; retry.
-                Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {}
-                Err(e) => return Err(e),
-            }
-            if Instant::now() >= deadline {
-                return Ok(None);
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-    }
-}
-
-impl Drop for Lock {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-    }
-}
-
-fn is_stale(path: &Path) -> bool {
-    fs::metadata(path)
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| SystemTime::now().duration_since(t).ok())
-        .is_some_and(|age| age > LOCK_STALE)
 }
 
 /// The hooks JSON for Claude Code settings, calling this executable.

@@ -176,3 +176,28 @@ fn base64_matches_the_standard_alphabet() {
     assert_eq!(base64(b"foo"), "Zm9v");
     assert_eq!(base64(&[0xFB, 0xFF]), "+/8=");
 }
+
+#[test]
+fn a_write_waits_for_another_process_and_says_so() {
+    let home = TestHome::new();
+    let (b, events) = backend(&home);
+    let fx = FixtureProject::new().file("a.txt", "a").build();
+    let p = b.add_project(fx.root().to_str().unwrap()).unwrap();
+    let path = b.dsnap().unwrap().project_lock_path(p.id);
+    let cli = ProjectLock::try_acquire(&path).unwrap().unwrap();
+
+    let b = Arc::new(b);
+    let ctx = b.begin(p.id, Op::Snapshot);
+    let worker = {
+        let b = Arc::clone(&b);
+        std::thread::spawn(move || b.snapshot(&ctx, None))
+    };
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let phases: Vec<String> = named(&events, EVENT_PROGRESS)
+        .iter()
+        .map(|e| e["phase"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(phases, ["walk", "queued"], "waiting is visible");
+    drop(cli);
+    assert!(worker.join().unwrap().unwrap().version.is_some());
+}
