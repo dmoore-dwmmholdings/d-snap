@@ -48,6 +48,8 @@ jobs:
         run: cargo test -p dsnap-core --release --locked --lib db::tests::perf_ -- --ignored --nocapture
       - name: Store write performance (release, DSNA-102)
         run: cargo test -p dsnap-core --release --locked --test store_perf -- --ignored --nocapture
+      - name: M1 acceptance (release, DSNA-65)
+        run: cargo test -p dsnap-cli --release --locked --test m1_acceptance -- --ignored --nocapture
       - name: Docs
         if: matrix.os == 'ubuntu-latest'
         run: cargo doc --workspace --no-deps --locked

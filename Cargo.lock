@@ -1039,6 +1039,7 @@ dependencies = [
  "clap",
  "dsnap-core",
  "dsnap-test-support",
+ "filetime",
  "serde",
  "serde_json",
  "tempfile",

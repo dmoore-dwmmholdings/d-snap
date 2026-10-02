@@ -22,6 +22,7 @@ time.workspace = true
 
 [dev-dependencies]
 dsnap-test-support.workspace = true
+filetime.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 
