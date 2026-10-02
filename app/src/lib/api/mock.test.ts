@@ -487,6 +487,22 @@ describe('restore', () => {
     expect(file).toMatchObject({ written: [], uncaptured: ['out'] });
   });
 
+  it('does not replace an uncaptured file with a version directory', async () => {
+    const { api, shop } = await setup();
+    // Version 10 has the empty dir logs/archive; the folder now holds an over-cap file there.
+    api.mockWriteFile(shop.id, 'logs/archive', 'big archive data', 60 * 1024 * 1024);
+
+    const plan = await api.restorePlan(shop.id, 10);
+    expect(plan.createDirs).not.toContain('logs/archive');
+    expect(plan.uncaptured).toContain('logs/archive');
+    const report = await api.restoreProject(shop.id, 10);
+    expect(report.uncaptured).toContain('logs/archive');
+    expect(api.mockReadFile(shop.id, 'logs/archive')).toBe('big archive data');
+    const file = await api.restoreFile(shop.id, 10, 'logs/archive');
+    expect(file).toMatchObject({ written: [], uncaptured: ['logs/archive'] });
+    expect(api.mockReadFile(shop.id, 'logs/archive')).toBe('big archive data');
+  });
+
   it('does not plan a write under a path that is now an over-cap file', async () => {
     const { api, tool } = await setup();
     api.mockWriteFile(tool.id, 'pkg/a.txt', 'a\n');

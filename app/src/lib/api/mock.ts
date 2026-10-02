@@ -626,7 +626,8 @@ export class MockApi implements Api {
       if (cur && sameContent(cur, e)) continue;
       const isDir = e.kind.kind === 'dir';
       if (check(p, !isDir)) {
-        if (!isDir || !cur) uncaptured.add(p);
+        // An existing dir at p needs nothing; anything else held there must stay.
+        if (!isDir || cur?.kind.kind !== 'dir') uncaptured.add(p);
       } else if (isDir) {
         if (!cur) createDirs.push(p);
       } else write.push(p);
