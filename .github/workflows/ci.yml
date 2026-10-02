@@ -38,7 +38,7 @@ jobs:
       - name: Diff performance (release, DSNA-40)
         run: cargo test -p dsnap-core --release --locked --test diff_perf -- --ignored --nocapture
       - name: Snapshot performance (release, DSNA-52)
-        run: cargo test -p dsnap-core --release --locked --test snapshot_perf -- --ignored --nocapture
+        run: cargo test -p dsnap-core --release --locked --test snapshot_perf -- --ignored --nocapture --test-threads=1
       - name: Index DB insert performance (release, DSNA-101)
         run: cargo test -p dsnap-core --release --locked --lib db::tests::perf_ -- --ignored --nocapture
       - name: Store write performance (release, DSNA-102)
