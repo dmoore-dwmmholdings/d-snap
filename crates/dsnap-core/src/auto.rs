@@ -134,6 +134,23 @@ impl AutoScheduler {
     /// Errors only if the project list cannot be read; a failing snapshot is reported in
     /// its [`AutoRun`] and retried at the next due time.
     pub fn tick(&self) -> Result<Vec<AutoRun>> {
+        self.tick_with(|project| {
+            self.dsnap.snapshot(
+                project,
+                SnapshotOptions {
+                    kind: VersionKind::Auto,
+                    ..SnapshotOptions::default()
+                },
+            )
+        })
+    }
+
+    /// [`AutoScheduler::tick`], taking each due snapshot with `run` (the app routes it
+    /// through its per-project queue and lock). `run` should use [`VersionKind::Auto`].
+    pub fn tick_with(
+        &self,
+        run: impl Fn(ProjectId) -> Result<SnapshotReport>,
+    ) -> Result<Vec<AutoRun>> {
         let now = self.clock.now();
         let projects = self.dsnap.list_projects()?;
         let mut due = Vec::new();
@@ -182,13 +199,7 @@ impl AutoScheduler {
             .into_iter()
             .map(|project| AutoRun {
                 project,
-                result: self.dsnap.snapshot(
-                    project,
-                    SnapshotOptions {
-                        kind: VersionKind::Auto,
-                        ..SnapshotOptions::default()
-                    },
-                ),
+                result: run(project),
             })
             .collect())
     }
@@ -204,12 +215,20 @@ pub struct AutoRunner {
 impl AutoRunner {
     /// Start ticking `scheduler`.
     pub fn new(scheduler: Arc<AutoScheduler>, on_run: Arc<dyn Fn(AutoRun) + Send + Sync>) -> Self {
+        Self::with_tick(move || scheduler.tick(), on_run)
+    }
+
+    /// Call `tick` every [`TICK_INTERVAL`] (e.g. [`AutoScheduler::tick_with`]).
+    pub fn with_tick(
+        tick: impl Fn() -> Result<Vec<AutoRun>> + Send + 'static,
+        on_run: Arc<dyn Fn(AutoRun) + Send + Sync>,
+    ) -> Self {
         let (stop, rx) = mpsc::channel::<()>();
         let worker = std::thread::Builder::new()
             .name("dsnap-auto".into())
             .spawn(move || {
                 while let Err(RecvTimeoutError::Timeout) = rx.recv_timeout(TICK_INTERVAL) {
-                    if let Ok(runs) = scheduler.tick() {
+                    if let Ok(runs) = tick() {
                         runs.into_iter().for_each(|r| on_run(r));
                     }
                 }

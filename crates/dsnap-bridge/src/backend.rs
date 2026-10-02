@@ -23,6 +23,7 @@ use dsnap_core::{
 use serde::Serialize;
 
 use crate::error::ApiError;
+use crate::live::Live;
 
 /// Result of a command.
 pub type ApiResult<T> = Result<T, ApiError>;
@@ -36,6 +37,8 @@ pub const EVENT_PROGRESS: &str = "dsnap://progress";
 pub const EVENT_VERSIONS_CHANGED: &str = "dsnap://versions-changed";
 /// Files in a project folder changed.
 pub const EVENT_PROJECT_CHANGED: &str = "dsnap://project-changed";
+/// The project list changed (a folder went missing, another process edited a project).
+pub const EVENT_PROJECTS_CHANGED: &str = "dsnap://projects-changed";
 
 /// Largest blob `read_blob_as_data_url` returns.
 pub const MAX_DATA_URL_BYTES: usize = 20 * 1024 * 1024;
@@ -124,6 +127,7 @@ pub struct Backend {
     ops: Mutex<HashMap<String, CancelToken>>,
     project_locks: Mutex<HashMap<ProjectId, Arc<Mutex<()>>>>,
     next_op: AtomicU64,
+    live: Mutex<Option<Live>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -142,7 +146,30 @@ impl Backend {
             ops: Mutex::default(),
             project_locks: Mutex::default(),
             next_op: AtomicU64::new(1),
+            live: Mutex::new(None),
         }
+    }
+
+    /// Start file watching, the database poll and auto-snapshots ([`Live`]).
+    pub fn start_live(self: &Arc<Self>) {
+        let live = Live::start(self);
+        *lock(&self.live) = live;
+    }
+
+    /// Stop the live services (also on drop).
+    pub fn stop_live(&self) {
+        lock(&self.live).take();
+    }
+
+    fn sync_live(&self) {
+        if let Some(l) = lock(&self.live).as_ref() {
+            l.sync(self);
+        }
+    }
+
+    /// Emit an event without payload.
+    pub fn emit_unit(&self, name: &str) {
+        (self.emit)(name, serde_json::Value::Object(serde_json::Map::new()));
     }
 
     /// The core handle.
@@ -158,7 +185,8 @@ impl Backend {
         }
     }
 
-    fn versions_changed(&self, project_id: ProjectId) {
+    /// Report that versions of a project changed (`dsnap://versions-changed`).
+    pub fn versions_changed(&self, project_id: ProjectId) {
         self.emit(EVENT_VERSIONS_CHANGED, &VersionsChanged { project_id });
     }
 
@@ -270,7 +298,9 @@ impl Backend {
 
     /// Track a folder.
     pub fn add_project(&self, path: &str) -> ApiResult<Project> {
-        Ok(self.dsnap()?.add_project(Path::new(path), None)?)
+        let p = self.dsnap()?.add_project(Path::new(path), None)?;
+        self.sync_live();
+        Ok(p)
     }
 
     /// Rename a project.
@@ -284,12 +314,17 @@ impl Backend {
     pub fn remove_project(&self, id: ProjectId, delete_snapshots: bool) -> ApiResult<()> {
         self.dsnap()?.remove_project(id, delete_snapshots)?;
         lock(&self.project_locks).remove(&id);
+        self.sync_live();
         Ok(())
     }
 
     /// Point a project at its moved folder.
     pub fn relocate_project(&self, id: ProjectId, path: &str) -> ApiResult<Project> {
-        Ok(self.dsnap()?.relocate_project(id, Path::new(path))?)
+        let p = self.dsnap()?.relocate_project(id, Path::new(path))?;
+        if let Some(l) = lock(&self.live).as_ref() {
+            l.rewatch(id);
+        }
+        Ok(p)
     }
 
     /// The data directory (database and snapshots).
@@ -306,7 +341,11 @@ impl Backend {
 
     /// Replace a project's settings.
     pub fn set_project_settings(&self, id: ProjectId, settings: &ProjectSettings) -> ApiResult<()> {
-        Ok(self.dsnap()?.set_project_settings(id, settings)?)
+        self.dsnap()?.set_project_settings(id, settings)?;
+        if let Some(l) = lock(&self.live).as_ref() {
+            l.rewatch(id);
+        }
+        Ok(())
     }
 
     /// App-wide settings.
@@ -323,6 +362,16 @@ impl Backend {
 
     /// Take a manual snapshot (announced with [`Backend::begin`]).
     pub fn snapshot(&self, ctx: &OpCtx, label: Option<String>) -> ApiResult<SnapshotReport> {
+        self.snapshot_as(ctx, label, VersionKind::Manual)
+    }
+
+    /// Take a snapshot of `kind` (announced with [`Backend::begin`]).
+    pub fn snapshot_as(
+        &self,
+        ctx: &OpCtx,
+        label: Option<String>,
+        kind: VersionKind,
+    ) -> ApiResult<SnapshotReport> {
         let report = self.run_write(ctx, |d| {
             let progress = {
                 let ctx = ctx.clone();
@@ -351,7 +400,7 @@ impl Backend {
                 ctx.project,
                 SnapshotOptions {
                     label,
-                    kind: VersionKind::Manual,
+                    kind,
                     progress: Some(progress),
                     cancel: Some(ctx.cancel.clone()),
                 },

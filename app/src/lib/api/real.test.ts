@@ -143,6 +143,8 @@ describe('TauriApi', () => {
     await Promise.resolve();
     expect(unlisten).toHaveBeenCalledTimes(1);
 
+    api.onProjectsChanged(() => {});
+    expect(listen).toHaveBeenCalledWith(EVENTS.onProjectsChanged, expect.any(Function));
     const stop2 = api.onVersionsChanged(() => {});
     await Promise.resolve();
     await Promise.resolve();

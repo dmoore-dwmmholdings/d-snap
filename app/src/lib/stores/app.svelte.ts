@@ -142,8 +142,21 @@ export class AppStore {
       this.api.onProgress((p) => {
         this.progress[p.projectId] = p;
       }),
+      this.api.onProjectsChanged(() => void this.loadProjects()),
     );
     await this.loadProjects();
+  }
+
+  /**
+   * Refresh what the watchers would have reported (on window focus, in case a watcher
+   * missed something or could not start).
+   */
+  async refreshAll(): Promise<void> {
+    await this.loadProjects();
+    if (this.projectId !== null && this.view === 'main') {
+      await this.loadVersions();
+      if (this.sides?.to.kind === 'workingTree') await this.loadChanges();
+    }
   }
 
   stop(): void {

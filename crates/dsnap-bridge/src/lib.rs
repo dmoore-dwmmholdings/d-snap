@@ -5,6 +5,7 @@
 
 pub mod backend;
 pub mod error;
+pub mod live;
 
 /// Every Tauri command name; must match `COMMANDS` in `app/src/lib/api/commands.ts`. The
 /// app checks at compile time that it registers exactly these.

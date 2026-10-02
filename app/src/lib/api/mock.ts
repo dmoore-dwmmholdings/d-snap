@@ -65,6 +65,7 @@ export class MockApi implements Api {
   private readonly projectOps = new Map<ProjectId, Promise<unknown>>();
   private readonly projectListeners = new Set<Listener<ProjectChangedEvent>>();
   private readonly versionListeners = new Set<Listener<VersionsChangedEvent>>();
+  private readonly projectsListeners = new Set<() => void>();
   private readonly progressListeners = new Set<Listener<Progress>>();
 
   constructor(opts: MockOptions = {}) {
@@ -423,6 +424,16 @@ export class MockApi implements Api {
   onProjectChanged(cb: (e: ProjectChangedEvent) => void): Unsubscribe {
     this.projectListeners.add(cb);
     return () => this.projectListeners.delete(cb);
+  }
+
+  onProjectsChanged(cb: () => void): Unsubscribe {
+    this.projectsListeners.add(cb);
+    return () => this.projectsListeners.delete(cb);
+  }
+
+  /** Simulates another process changing the project list (or a folder going missing). */
+  mockEmitProjectsChanged(): void {
+    for (const cb of this.projectsListeners) cb();
   }
 
   onVersionsChanged(cb: (e: VersionsChangedEvent) => void): Unsubscribe {

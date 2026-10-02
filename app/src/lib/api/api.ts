@@ -169,6 +169,8 @@ export interface Api {
   // Events
   /** The folder changed on disk. */
   onProjectChanged(cb: (e: ProjectChangedEvent) => void): Unsubscribe;
+  /** The project list changed (a folder went missing, the CLI edited a project). Re-fetch `listProjects`. */
+  onProjectsChanged(cb: () => void): Unsubscribe;
   /** Versions changed (GUI, CLI or retention). Re-fetch `listVersions`. */
   onVersionsChanged(cb: (e: VersionsChangedEvent) => void): Unsubscribe;
   /** Snapshot or restore progress. */

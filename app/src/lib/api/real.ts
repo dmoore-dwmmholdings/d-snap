@@ -175,6 +175,10 @@ export class TauriApi implements Api {
     return subscribe(EVENTS.onProjectChanged, cb);
   }
 
+  onProjectsChanged(cb: () => void): Unsubscribe {
+    return subscribe(EVENTS.onProjectsChanged, () => cb());
+  }
+
   onVersionsChanged(cb: (e: VersionsChangedEvent) => void): Unsubscribe {
     return subscribe(EVENTS.onVersionsChanged, cb);
   }

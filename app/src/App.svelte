@@ -23,7 +23,12 @@
 
   onMount(() => {
     void store.start();
-    return () => store.stop();
+    const onFocus = () => void store.refreshAll();
+    window.addEventListener('focus', onFocus);
+    return () => {
+      window.removeEventListener('focus', onFocus);
+      store.stop();
+    };
   });
 
   let versionsList: VersionsList | undefined = $state();

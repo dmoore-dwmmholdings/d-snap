@@ -70,7 +70,9 @@ pub fn run() {
             let emit: Emit = Arc::new(move |name, payload| {
                 let _ = handle.emit(name, payload);
             });
-            app.manage(AppState(Arc::new(Backend::open(None, emit))));
+            let backend = Arc::new(Backend::open(None, emit));
+            backend.start_live();
+            app.manage(AppState(backend));
             Ok(())
         })
         .invoke_handler(handler())

@@ -3,7 +3,7 @@ import type { Api } from './api';
 /** `Api` methods that are Tauri commands (everything except event subscriptions). */
 export type CommandMethod = Exclude<
   keyof Api,
-  'onProjectChanged' | 'onVersionsChanged' | 'onProgress'
+  'onProjectChanged' | 'onProjectsChanged' | 'onVersionsChanged' | 'onProgress'
 >;
 
 /**
@@ -44,6 +44,7 @@ export const COMMANDS = {
 /** Tauri event names for the `Api` subscriptions. */
 export const EVENTS = {
   onProjectChanged: 'dsnap://project-changed',
+  onProjectsChanged: 'dsnap://projects-changed',
   onVersionsChanged: 'dsnap://versions-changed',
   onProgress: 'dsnap://progress',
 } as const satisfies Record<Exclude<keyof Api, CommandMethod>, string>;
