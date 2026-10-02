@@ -607,9 +607,10 @@ fn insert_10k_entries_is_fast() {
     let v = db.insert_version_with(&nv, &dummy_store()).unwrap();
     let took = start.elapsed();
     assert_eq!(db.entries(v.id).unwrap().len(), 10_000);
-    // Target is < 150 ms; the bound is generous so slow CI machines do not flake.
+    // Target is < 150 ms in release (see the `perf_` tests, run with --release in CI). This
+    // debug-build bound only catches gross regressions; shared Windows runners take ~1.1 s.
     assert!(
-        took.as_millis() < 1000,
+        took.as_millis() < 3000,
         "inserting 10k entries took {took:?}"
     );
 }
