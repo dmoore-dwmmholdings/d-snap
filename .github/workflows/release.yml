@@ -38,6 +38,10 @@ jobs:
       - name: Collect artifacts
         shell: pwsh
         run: |
+          # build.rs writes an empty sidecar placeholder; make sure the real CLI was bundled.
+          Get-ChildItem app/src-tauri/binaries/dsnap-*.exe | ForEach-Object {
+            if ($_.Length -eq 0) { throw "empty sidecar: $($_.Name)" }
+          }
           New-Item -ItemType Directory -Force dist-release | Out-Null
           Copy-Item target/release/bundle/nsis/*.exe dist-release/
           Copy-Item target/release/bundle/msi/*.msi dist-release/
