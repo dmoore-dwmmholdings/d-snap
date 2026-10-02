@@ -1,6 +1,6 @@
 //! Live updates through the app backend (DSNA-73, DSNA-74): watcher, DB poll and
 //! auto-snapshot events.
-#![allow(clippy::unwrap_used)]
+#![allow(clippy::unwrap_used, clippy::panic)]
 
 use std::fs;
 use std::sync::{Arc, Mutex};
