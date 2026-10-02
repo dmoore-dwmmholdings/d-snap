@@ -143,11 +143,17 @@ impl Db {
     ///
     /// Every write takes the write lock up front: in WAL mode a read transaction that later
     /// tries to write fails with `SQLITE_BUSY` without waiting on the busy timeout.
+    ///
+    /// `COMMIT` itself can fail with `SQLITE_BUSY` in WAL mode (seen on Windows while another
+    /// connection checkpoints), and that path does not wait on the busy handler. The
+    /// transaction stays open after such a failure, so the commit is retried within the busy
+    /// timeout and rolled back only if it still fails (DSNA-112).
     fn write<T>(&self, f: impl FnOnce(&Transaction<'_>) -> Result<T>) -> Result<T> {
         let mut conn = self.conn();
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let out = f(&tx)?;
-        tx.commit()?;
+        let mut tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let out = f(&tx)?; // an error drops `tx`, which rolls back
+        tx.set_drop_behavior(rusqlite::DropBehavior::Ignore);
+        commit_with_retry(&tx)?;
         Ok(out)
     }
 
@@ -1005,6 +1011,33 @@ fn delete_version_row(tx: &Transaction<'_>, id: VersionId) -> Result<Option<Proj
     tx.execute("DELETE FROM versions WHERE id = ?1", [id.0])?;
     refs::apply(tx, &deltas)?;
     Ok(Some(v.project_id))
+}
+
+/// `COMMIT` an open transaction, retrying while SQLite reports the database busy or locked,
+/// up to the busy timeout. If it still fails, roll back and return the error.
+fn commit_with_retry(conn: &Connection) -> Result<()> {
+    let start = Instant::now();
+    let mut pause = Duration::from_millis(2);
+    loop {
+        match conn.execute_batch("COMMIT") {
+            Ok(()) => return Ok(()),
+            Err(e) if is_busy(&e) && start.elapsed() < schema::BUSY_TIMEOUT => {
+                std::thread::sleep(pause);
+                pause = (pause * 2).min(Duration::from_millis(50));
+            }
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                return Err(e.into());
+            }
+        }
+    }
+}
+
+fn is_busy(e: &rusqlite::Error) -> bool {
+    matches!(
+        e.sqlite_error_code(),
+        Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+    )
 }
 
 fn projects_of(conn: &Connection, include_removing: bool) -> Result<Vec<Project>> {

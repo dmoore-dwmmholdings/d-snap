@@ -138,15 +138,17 @@ fn two_connections_write_under_contention_without_busy_errors() {
             let path = path.clone();
             thread::spawn(move || -> crate::Result<()> {
                 let db = Db::open(&path)?;
+                // Through `Db::write`, like every product write: BEGIN IMMEDIATE waits on the
+                // busy handler and COMMIT is retried if it reports busy (DSNA-112).
                 for i in 0..PER_THREAD {
-                    let mut conn = db.conn();
-                    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-                    tx.execute(
-                        "INSERT INTO projects (name, root_path, settings_json, created_at_ms)
-                         VALUES (?1, ?2, '{}', 0)",
-                        (format!("p{t}-{i}"), format!("/r/{t}/{i}")),
-                    )?;
-                    tx.commit()?;
+                    db.write(|tx| {
+                        tx.execute(
+                            "INSERT INTO projects (name, root_path, settings_json, created_at_ms)
+                             VALUES (?1, ?2, '{}', 0)",
+                            (format!("p{t}-{i}"), format!("/r/{t}/{i}")),
+                        )?;
+                        Ok(())
+                    })?;
                 }
                 Ok(())
             })
