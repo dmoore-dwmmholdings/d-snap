@@ -12,7 +12,7 @@ pub(crate) const BUSY_TIMEOUT: Duration = Duration::from_millis(5000);
 
 /// Migrations in order; migration `i` moves the schema from version `i` to `i + 1`.
 /// Never edit a released migration; append a new one.
-const MIGRATIONS: &[&str] = &[
+pub(crate) const MIGRATIONS: &[&str] = &[
     // v1 (DSNA-30)
     "
     CREATE TABLE projects (
@@ -65,6 +65,42 @@ const MIGRATIONS: &[&str] = &[
     // so one undeletable file cannot block every later batch.
     "
     ALTER TABLE blobs ADD COLUMN prune_failures INTEGER NOT NULL DEFAULT 0;
+    ",
+    // v3 (DSNA-101): per-blob reference counts replace the `entries_blob` index. That index
+    // is keyed by a random hash, so each version's rows landed on nearly every index page and
+    // every commit rewrote an index that grows with history. `blobs.refs` counts the versions
+    // where a blob starts to be used (see `db::refs`); it is filled by `refs::rebuild` right
+    // after this script, in the same transaction.
+    "
+    ALTER TABLE blobs ADD COLUMN refs INTEGER NOT NULL DEFAULT 0 CHECK (refs >= 0);
+
+    -- Every referenced blob needs a row, or its count has nowhere to live. Older code never
+    -- left an entry without one, but a hand-edited or partly copied database might.
+    INSERT OR IGNORE INTO blobs (hash, size, stored_size)
+        SELECT blob_hash, MAX(size), 0 FROM entries
+        WHERE blob_hash IS NOT NULL GROUP BY blob_hash;
+
+    DROP INDEX entries_blob;
+    CREATE INDEX blobs_unreferenced ON blobs(prune_failures, hash) WHERE refs = 0;
+
+    -- Guards for the counts: an entry must name a recorded blob, entries never change once
+    -- written (a changed blob_hash would bypass the counts), and a blob row that is still
+    -- referenced cannot be deleted.
+    CREATE TRIGGER entries_blob_recorded BEFORE INSERT ON entries
+    WHEN NEW.blob_hash IS NOT NULL
+         AND NOT EXISTS (SELECT 1 FROM blobs WHERE hash = NEW.blob_hash)
+    BEGIN
+        SELECT RAISE(ABORT, 'entry references a blob with no blobs row');
+    END;
+    CREATE TRIGGER entries_immutable BEFORE UPDATE ON entries
+    BEGIN
+        SELECT RAISE(ABORT, 'entries are immutable');
+    END;
+    CREATE TRIGGER blobs_keep_referenced BEFORE DELETE ON blobs
+    WHEN OLD.refs > 0
+    BEGIN
+        SELECT RAISE(ABORT, 'blob is still referenced');
+    END;
     ",
 ];
 
@@ -137,6 +173,9 @@ fn migrate(conn: &mut Connection) -> Result<()> {
             return Ok(()); // up to date; dropping `tx` ends the empty transaction
         };
         tx.execute_batch(sql)?;
+        if current + 1 == 3 {
+            super::refs::rebuild(&tx)?;
+        }
         tx.pragma_update(None, "user_version", current + 1)?;
         tx.commit()?;
     }

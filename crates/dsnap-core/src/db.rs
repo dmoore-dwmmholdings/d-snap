@@ -11,15 +11,15 @@
 //!
 //! 1. **Only [`Db::prune_unreferenced`] and [`Db::sweep_orphans`] delete blob files**, each
 //!    inside one `BEGIN IMMEDIATE` transaction that also reads which blobs are referenced:
-//!    prune selects unreferenced blob rows, deletes each store file ([`Store::delete`]) and
-//!    its row; sweep reads every referenced hash and calls [`Store::sweep`] with that set.
-//!    No other code calls `Store::delete` or `Store::sweep`, and a referenced set read in an
-//!    earlier transaction must never be used to delete.
+//!    prune selects blob rows with `refs = 0`, deletes each store file ([`Store::delete`])
+//!    and its row; sweep reads every hash with `refs > 0` and calls [`Store::sweep`] with
+//!    that set. No other code calls `Store::delete` or `Store::sweep`, and a referenced set
+//!    read in an earlier transaction must never be used to delete.
 //! 2. **[`Db::insert_version`] verifies before committing.** Inside its own `BEGIN IMMEDIATE`
-//!    transaction, for every distinct blob in the new entries that no existing entry row
-//!    references, it checks [`Store::contains`]. If one is missing it rolls back and returns
-//!    [`crate::Error::BlobMissing`]. Blobs that an existing row references cannot be pruned
-//!    while the lock is held, so they need no check.
+//!    transaction, for every distinct blob in the new entries whose row is missing or has
+//!    `refs = 0`, it checks [`Store::contains`]. If one is missing it rolls back and returns
+//!    [`crate::Error::BlobMissing`]. Blobs with `refs > 0` cannot be pruned while the lock is
+//!    held, so they need no check.
 //! 3. **The snapshot retries.** On `BlobMissing`, the caller (snapshot, DSNA-14) re-stores
 //!    the affected files with `Store::put_file` and calls `insert_version` once more. If the
 //!    file's hash changed in the meantime, it redoes the capture for that path.
@@ -29,10 +29,20 @@
 //! them (`Store::delete` of a missing file returns `Ok(0)`). Keep prune batches small (see
 //! `limit`) so the write lock is not held for longer than the busy timeout.
 //!
+//! **Reference counts (schema v3, DSNA-101).** `blobs.refs` counts the versions in which a
+//! blob starts to be used (see the `refs` module); `refs > 0` holds exactly when a committed
+//! entry references the blob, which is what the old `EXISTS` over the `entries_blob` index
+//! answered. `insert_version`, `delete_version`, `delete_versions`, `delete_unpinned_beyond`
+//! and `delete_project` update the counts in the same transaction as the rows. Any new code
+//! that deletes versions must go through `delete_version_row` (or subtract
+//! `refs::run_starts` for a whole project). Triggers refuse an entry whose blob has no row,
+//! any change to an entry, and deleting a blob row with `refs > 0`.
+//!
 //! Every connection runs with `synchronous=FULL`, so a commit that removes references
 //! (`delete_version`, `delete_project`) is on disk before a later prune deletes the files;
 //! with `NORMAL` a power loss could bring the version back without its blobs.
 mod codec;
+mod refs;
 mod schema;
 #[cfg(test)]
 mod tests;
@@ -259,6 +269,9 @@ impl Db {
     /// Delete a project with all its versions and entries (blobs are left for pruning).
     pub fn delete_project(&self, id: ProjectId) -> Result<()> {
         self.write(|tx| {
+            let mut gone = refs::run_starts(tx, Some(id))?;
+            gone.values_mut().for_each(|n| *n = -*n);
+            refs::apply(tx, &gone)?;
             let n = tx.execute("DELETE FROM projects WHERE id = ?1", [id.0])?;
             found(n, || not_found_project(id))
         })
@@ -268,7 +281,8 @@ impl Db {
     ///
     /// Before committing, checks that `store` holds every blob the new entries reference that
     /// no existing entry references; otherwise rolls back with [`crate::Error::BlobMissing`]
-    /// (see the module docs).
+    /// (see the module docs). A blob that is in the store but has no row and is not in
+    /// `new_blobs` gets a row (size from the entry, stored size from the store).
     pub fn insert_version(&self, v: &NewVersion, store: &Store) -> Result<Version> {
         self.insert_version_with(v, store)
     }
@@ -279,10 +293,7 @@ impl Db {
         v: &NewVersion,
         files: &dyn BlobFiles,
     ) -> Result<Version> {
-        self.write(|tx| {
-            check_new_blobs_present(tx, v, files)?;
-            insert_version_tx(tx, v)
-        })
+        self.write(|tx| insert_version_tx(tx, v, files))
     }
 
     /// Load one version.
@@ -386,9 +397,9 @@ impl Db {
 
     /// Delete a version and its entries.
     pub fn delete_version(&self, id: VersionId) -> Result<()> {
-        self.write(|tx| {
-            let n = tx.execute("DELETE FROM versions WHERE id = ?1", [id.0])?;
-            found(n, || not_found_version(id))
+        self.write(|tx| match delete_version_row(tx, id)? {
+            Some(_) => Ok(()),
+            None => Err(not_found_version(id)),
         })
     }
 
@@ -450,8 +461,7 @@ impl Db {
         let conn = self.conn();
         let mut stmt = conn.prepare_cached(&format!(
             "SELECT {BLOB_COLS} FROM blobs b
-             WHERE NOT EXISTS (SELECT 1 FROM entries e WHERE e.blob_hash = b.hash)
-             ORDER BY hash"
+             WHERE refs = 0 ORDER BY hash"
         ))?;
         let rows = stmt
             .query_map([], blob_row)?
@@ -483,8 +493,7 @@ impl Db {
         let (report, first_err) = self.write(|tx| {
             let hashes = {
                 let mut stmt = tx.prepare_cached(
-                    "SELECT hash FROM blobs b
-                     WHERE NOT EXISTS (SELECT 1 FROM entries e WHERE e.blob_hash = b.hash)
+                    "SELECT hash FROM blobs WHERE refs = 0
                      ORDER BY prune_failures, hash LIMIT ?1",
                 )?;
                 let rows = stmt
@@ -541,9 +550,7 @@ impl Db {
     pub(crate) fn sweep_orphans_with(&self, files: &dyn BlobSweep) -> Result<RetentionReport> {
         self.write(|tx| {
             let referenced = {
-                let mut stmt = tx.prepare_cached(
-                    "SELECT DISTINCT blob_hash FROM entries WHERE blob_hash IS NOT NULL",
-                )?;
+                let mut stmt = tx.prepare_cached("SELECT hash FROM blobs WHERE refs > 0")?;
                 let rows = stmt
                     .query_map([], |r| r.get::<_, Vec<u8>>(0))?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -552,11 +559,7 @@ impl Db {
                     .collect::<Result<HashSet<_>>>()?
             };
             let swept = files.sweep(&referenced)?;
-            tx.execute(
-                "DELETE FROM blobs
-                 WHERE NOT EXISTS (SELECT 1 FROM entries e WHERE e.blob_hash = blobs.hash)",
-                [],
-            )?;
+            tx.execute("DELETE FROM blobs WHERE refs = 0", [])?;
             Ok(RetentionReport {
                 versions_deleted: 0,
                 blobs_pruned: u32::try_from(swept.deleted).unwrap_or(u32::MAX),
@@ -575,9 +578,8 @@ impl Db {
     /// Every blob hash that at least one entry references, sorted.
     pub fn referenced_hashes(&self) -> Result<Vec<BlobHash>> {
         let conn = self.conn();
-        let mut stmt = conn.prepare_cached(
-            "SELECT DISTINCT blob_hash FROM entries WHERE blob_hash IS NOT NULL ORDER BY 1",
-        )?;
+        let mut stmt =
+            conn.prepare_cached("SELECT hash FROM blobs WHERE refs > 0 ORDER BY hash")?;
         let rows = stmt
             .query_map([], |r| r.get::<_, Vec<u8>>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -586,11 +588,17 @@ impl Db {
 
     /// Every entry that references `hash`, with its project and version, newest version
     /// first (blob repair, DSNA-99).
+    ///
+    /// Scans the whole `entries` table when the blob is referenced (there is no index on
+    /// `blob_hash` since schema v3), so keep it off hot paths.
     pub fn entries_using_blob(
         &self,
         hash: &BlobHash,
     ) -> Result<Vec<(ProjectId, VersionId, Entry)>> {
         let conn = self.conn();
+        if !is_referenced(&conn, hash)? {
+            return Ok(Vec::new());
+        }
         let cols = ENTRY_COLS
             .split(", ")
             .map(|c| format!("e.{c}"))
@@ -665,15 +673,16 @@ impl Dsnap {
 
 /// Blob file access used by the lifetime protocol. [`Store`] is the real implementation.
 pub(crate) trait BlobFiles {
-    /// Whether the blob file exists.
-    fn contains(&self, hash: &BlobHash) -> bool;
+    /// Compressed size of the blob file, or `None` if it is not stored (same rule as
+    /// [`Store::contains`]: an unreadable or 0-length object counts as missing).
+    fn present_size(&self, hash: &BlobHash) -> Option<u64>;
     /// Delete the blob file; bytes freed (0 if absent).
     fn delete(&self, hash: &BlobHash) -> Result<u64>;
 }
 
 impl BlobFiles for Store {
-    fn contains(&self, hash: &BlobHash) -> bool {
-        Store::contains(self, hash)
+    fn present_size(&self, hash: &BlobHash) -> Option<u64> {
+        self.stored_size(hash).ok().flatten()
     }
 
     fn delete(&self, hash: &BlobHash) -> Result<u64> {
@@ -710,30 +719,61 @@ impl BlobSweep for Store {
 }
 
 /// Protocol step 2 (module docs): every blob the new entries use that no committed entry
-/// references must still exist in the store. Runs under the write lock, before the new
-/// entries are inserted, so a concurrent prune either finished (and the check sees the file
-/// gone) or cannot start until this transaction ends.
-fn check_new_blobs_present(
+/// references (row missing or `refs = 0`) must still exist in the store. Runs under the
+/// write lock, after `new_blobs` rows are recorded and before the entries are inserted, so a
+/// concurrent prune either finished (and the check sees the file gone) or cannot start until
+/// this transaction ends. A present blob without a row gets one, because the entry triggers
+/// refuse a reference to an unrecorded blob.
+///
+/// Blobs in `prev` (used by the project's newest committed version) are referenced, so they
+/// are skipped without a lookup. Returns the distinct blobs of the new entries.
+fn check_blobs_present(
     tx: &Transaction<'_>,
     v: &NewVersion,
+    prev: &HashSet<BlobHash>,
     files: &dyn BlobFiles,
-) -> Result<()> {
+) -> Result<HashSet<BlobHash>> {
     let mut seen = HashSet::new();
-    for hash in v.entries.iter().filter_map(|e| e.blob.as_ref()) {
-        if seen.insert(*hash) && !is_referenced(tx, hash)? && !files.contains(hash) {
-            return Err(Error::BlobMissing(*hash));
+    let mut refs_of = tx.prepare_cached("SELECT refs FROM blobs WHERE hash = ?1")?;
+    for e in &v.entries {
+        let Some(hash) = e.blob else { continue };
+        if !seen.insert(hash) || prev.contains(&hash) {
+            continue;
+        }
+        let refs: Option<i64> = refs_of
+            .query_row([hash.0.as_slice()], |r| r.get(0))
+            .optional()?;
+        if refs.is_some_and(|n| n > 0) {
+            continue;
+        }
+        let Some(stored_size) = files.present_size(&hash) else {
+            return Err(Error::BlobMissing(hash));
+        };
+        if refs.is_none() {
+            insert_blob_tx(
+                tx,
+                &BlobInfo {
+                    hash,
+                    size: e.size,
+                    stored_size,
+                },
+            )?;
         }
     }
-    Ok(())
+    Ok(seen)
 }
 
 fn is_referenced(conn: &Connection, hash: &BlobHash) -> Result<bool> {
     let mut stmt =
-        conn.prepare_cached("SELECT EXISTS (SELECT 1 FROM entries WHERE blob_hash = ?1)")?;
+        conn.prepare_cached("SELECT EXISTS (SELECT 1 FROM blobs WHERE hash = ?1 AND refs > 0)")?;
     Ok(stmt.query_row([hash.0.as_slice()], |r| r.get(0))?)
 }
 
-fn insert_version_tx(tx: &Transaction<'_>, v: &NewVersion) -> Result<Version> {
+fn insert_version_tx(
+    tx: &Transaction<'_>,
+    v: &NewVersion,
+    files: &dyn BlobFiles,
+) -> Result<Version> {
     let project_exists = tx
         .query_row(
             "SELECT 1 FROM projects WHERE id = ?1",
@@ -745,6 +785,11 @@ fn insert_version_tx(tx: &Transaction<'_>, v: &NewVersion) -> Result<Version> {
     if !project_exists {
         return Err(not_found_project(v.project_id));
     }
+    for b in &v.new_blobs {
+        insert_blob_tx(tx, b)?;
+    }
+    let prev = refs::blob_set(tx, refs::predecessor(tx, v.project_id, None)?)?;
+    let used = check_blobs_present(tx, v, &prev, files)?;
     tx.execute(
         "INSERT INTO versions
              (project_id, label, created_at_ms, kind, pinned, unstable, added, modified, deleted)
@@ -780,9 +825,7 @@ fn insert_version_tx(tx: &Transaction<'_>, v: &NewVersion) -> Result<Version> {
             .map_err(|err| duplicate_path(err, &e.path))?;
         }
     }
-    for b in &v.new_blobs {
-        insert_blob_tx(tx, b)?;
-    }
+    refs::apply(tx, &refs::on_insert(&prev, &used))?;
     Ok(Version {
         id,
         project_id: v.project_id,
@@ -818,9 +861,8 @@ fn delete_versions_tx(
 ) -> Result<u32> {
     let mut deleted: Vec<(ProjectId, VersionId)> = Vec::new();
     for &id in ids {
-        if let Some(v) = version_by_id(tx, id)? {
-            tx.execute("DELETE FROM versions WHERE id = ?1", [id.0])?;
-            deleted.push((v.project_id, id));
+        if let Some(project) = delete_version_row(tx, id)? {
+            deleted.push((project, id));
         }
     }
     let mut successors = HashSet::new();
@@ -856,6 +898,18 @@ fn delete_versions_tx(
         )?;
     }
     Ok(u32::try_from(deleted.len()).unwrap_or(u32::MAX))
+}
+
+/// Delete one version (its entries cascade) and update the blob reference counts. Returns
+/// its project, or `None` if it does not exist. The only code that deletes a version row.
+fn delete_version_row(tx: &Transaction<'_>, id: VersionId) -> Result<Option<ProjectId>> {
+    let Some(v) = version_by_id(tx, id)? else {
+        return Ok(None);
+    };
+    let deltas = refs::on_delete(tx, v.project_id, id)?;
+    tx.execute("DELETE FROM versions WHERE id = ?1", [id.0])?;
+    refs::apply(tx, &deltas)?;
+    Ok(Some(v.project_id))
 }
 
 fn projects_of(conn: &Connection) -> Result<Vec<Project>> {
@@ -936,7 +990,12 @@ fn unique_root(e: rusqlite::Error, root: &Path) -> Error {
 
 /// Map an `entries` primary-key violation to [`Error::InvalidInput`].
 fn duplicate_path(e: rusqlite::Error, path: &RelPath) -> Error {
-    if is_constraint(&e) {
+    let primary_key = matches!(
+        &e,
+        rusqlite::Error::SqliteFailure(f, _)
+            if f.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY
+    );
+    if primary_key {
         Error::InvalidInput(format!("duplicate entry path {path}"))
     } else {
         e.into()

@@ -214,7 +214,7 @@ impl Store {
     ///
     /// A 0-length object counts as not stored: no zstd frame is empty, so it is damage (e.g. a
     /// partial copy of the data dir), and the next `put` of the same content replaces it.
-    fn stored_size(&self, hash: &BlobHash) -> Result<Option<u64>> {
+    pub(crate) fn stored_size(&self, hash: &BlobHash) -> Result<Option<u64>> {
         let path = self.path_of(hash);
         match fs::symlink_metadata(&path) {
             Ok(m) if m.is_file() && m.len() == 0 => Ok(None),
