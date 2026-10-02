@@ -445,3 +445,27 @@ fn sweep_timing_100k_objects() {
     eprintln!("prune_blobs on a clean store: {:?} ({r:?})", t.elapsed());
     assert_eq!(r.blobs_pruned, 0);
 }
+
+/// DSNA-108: one undeletable orphan does not stop the sweep; the rest are removed and the
+/// report counts the failure and keeps the bytes freed.
+#[test]
+fn stuck_orphan_does_not_block_the_sweep() {
+    let (_h, _d, ds, cli, _p) = setup();
+    // The stuck orphan's shard sorts before the free orphan's, so it is met first.
+    let mut contents: Vec<String> = (0..64).map(|i| format!("orphan {i}")).collect();
+    contents.sort_by_key(|c| hash_bytes(c.as_bytes()).0[0]);
+    let (stuck, free) = (&contents[0], contents.last().unwrap());
+    assert!(hash_bytes(stuck.as_bytes()).0[0] < hash_bytes(free.as_bytes()).0[0]);
+    let stuck = cli.store.put(stuck.as_bytes()).unwrap();
+    let free = cli.store.put(free.as_bytes()).unwrap();
+
+    let guard = hold_undeletable(&cli.store.path_of(&stuck.hash));
+    let r = ds.prune_blobs().unwrap();
+    assert_eq!(r.blobs_pruned, 1);
+    assert_eq!(r.bytes_freed, free.stored_size);
+    assert_eq!(r.blobs_failed, 1);
+    assert!(!cli.store.contains(&free.hash));
+    drop(guard);
+    assert_eq!(ds.prune_blobs().unwrap().blobs_pruned, 1);
+    assert!(!cli.store.contains(&stuck.hash));
+}

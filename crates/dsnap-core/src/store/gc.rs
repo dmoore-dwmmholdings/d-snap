@@ -27,6 +27,9 @@ pub struct SweepReport {
     pub temp_removed: u64,
     /// Bytes freed on disk (objects and temp files).
     pub bytes_freed: u64,
+    /// Unreferenced objects that could not be deleted (e.g. locked); [`Store::sweep`] skips
+    /// them and goes on.
+    pub failed: u64,
 }
 
 /// One file found under `objects/`.
@@ -57,20 +60,24 @@ impl Store {
     /// layer while it holds the write lock (`BEGIN IMMEDIATE`), with `referenced` read inside
     /// that same transaction. A `referenced` set read earlier can miss a version committed in
     /// the meantime and lose its data (see the [`crate::db`] module docs).
+    ///
+    /// An object that cannot be deleted is counted in [`SweepReport::failed`] and skipped,
+    /// so one stuck file does not stop the sweep (DSNA-108).
     pub fn sweep(&self, referenced: &HashSet<BlobHash>) -> Result<SweepReport> {
         let now = SystemTime::now();
         let mut report = SweepReport::default();
         for item in self.scan()? {
             match item {
                 Item::Object(hash, _) if referenced.contains(&hash) => {}
-                Item::Object(_, path) => {
-                    let freed = remove_file_len(&path)?;
+                Item::Object(_, path) => match remove_file_len(&path) {
                     // 0 means it vanished meanwhile (no zstd frame is empty).
-                    if freed > 0 {
+                    Ok(0) => {}
+                    Ok(freed) => {
                         report.deleted += 1;
                         report.bytes_freed += freed;
                     }
-                }
+                    Err(_) => report.failed += 1,
+                },
                 Item::Temp(path) => remove_stale_temp(&path, now, &mut report),
             }
         }

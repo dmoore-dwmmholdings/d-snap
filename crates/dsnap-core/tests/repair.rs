@@ -112,3 +112,25 @@ fn unreferenced_damaged_blob_is_not_repaired() {
     assert_eq!(report[0].outcome, BlobRepairOutcome::Unreferenced);
     assert!(ds.read_blob(&hash_bytes(content)).is_err());
 }
+
+/// DSNA-108: referenced blobs whose object is missing (or empty) are found and repaired too.
+#[test]
+fn missing_and_empty_objects_are_repaired() {
+    let (_h, dir, ds, cli, p) = setup();
+    fs::write(dir.path().join("f"), b"f bytes").unwrap();
+    fs::write(dir.path().join("g"), b"g bytes").unwrap();
+    cli.commit(p, &[("f", b"f bytes"), ("g", b"g bytes")]);
+    fs::write(cli.store.path_of(&hash_bytes(b"f bytes")), b"").unwrap();
+    fs::remove_file(cli.store.path_of(&hash_bytes(b"g bytes"))).unwrap();
+
+    let report = ds.repair_blobs().unwrap();
+    assert_eq!(report.len(), 2, "{report:?}");
+    assert!(
+        report
+            .iter()
+            .all(|r| matches!(r.outcome, BlobRepairOutcome::Repaired { .. })),
+        "{report:?}"
+    );
+    assert_eq!(ds.read_blob(&hash_bytes(b"f bytes")).unwrap(), b"f bytes");
+    assert_eq!(ds.read_blob(&hash_bytes(b"g bytes")).unwrap(), b"g bytes");
+}

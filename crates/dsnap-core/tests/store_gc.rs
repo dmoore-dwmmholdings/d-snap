@@ -73,6 +73,7 @@ fn sweep_keeps_referenced_and_young_temp_files_and_deletes_the_rest() {
             deleted: 5,
             temp_removed: 1,
             bytes_freed: dropped + old_len,
+            failed: 0,
         }
     );
     for b in &infos {

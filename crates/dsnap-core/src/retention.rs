@@ -65,7 +65,7 @@ impl Dsnap {
             }
             versions_deleted = versions_deleted.saturating_add(n);
         }
-        let mut report = self.prune_unreferenced_all()?;
+        let mut report = self.prune_after_commit();
         report.versions_deleted = versions_deleted;
         Ok(report)
     }
@@ -96,17 +96,20 @@ impl Dsnap {
     /// delete store files directly (see the `db` module docs, DSNA-80).
     pub fn prune_blobs(&self) -> Result<RetentionReport> {
         let mut total = self.prune_unreferenced_all()?;
-        match self.db.sweep_orphans(&self.store) {
-            Ok(r) => {
-                total.blobs_pruned = total.blobs_pruned.saturating_add(r.blobs_pruned);
-                total.bytes_freed = total.bytes_freed.saturating_add(r.bytes_freed);
-            }
-            // The sweep stops at the first file it cannot delete and rolls back; what it
-            // deleted is gone either way and the next sweep retries the rest.
-            Err(Error::Io { .. }) => total.blobs_failed = total.blobs_failed.max(1),
-            Err(e) => return Err(e),
-        }
+        let swept = self.db.sweep_orphans(&self.store)?;
+        total.blobs_pruned = total.blobs_pruned.saturating_add(swept.blobs_pruned);
+        total.bytes_freed = total.bytes_freed.saturating_add(swept.bytes_freed);
+        // The sweep visits every unreferenced object on disk, including the ones the prune
+        // loop could not delete, so its count replaces the loop's.
+        total.blobs_failed = swept.blobs_failed;
         Ok(total)
+    }
+
+    /// [`Dsnap::prune_unreferenced_all`] after a delete has already committed: any error is
+    /// a warning, because the caller's change is done and the next prune retries the blobs
+    /// (DSNA-108). Returns what was pruned before the error.
+    pub(crate) fn prune_after_commit(&self) -> RetentionReport {
+        self.prune_loop().0
     }
 
     /// Call [`crate::db::Db::prune_unreferenced`] with [`PRUNE_BATCH`] until it frees
@@ -116,23 +119,37 @@ impl Dsnap {
     /// error. That ends the loop as a warning: the bytes already freed are kept and
     /// `blobs_failed` counts the unreferenced blobs left behind. Database errors propagate.
     pub(crate) fn prune_unreferenced_all(&self) -> Result<RetentionReport> {
+        match self.prune_loop() {
+            (_, Some(e)) => Err(e),
+            (total, None) => Ok(total),
+        }
+    }
+
+    /// The loop behind [`Dsnap::prune_unreferenced_all`]: the totals so far, plus the
+    /// error that stopped it, if any.
+    fn prune_loop(&self) -> (RetentionReport, Option<Error>) {
         let mut total = RetentionReport::default();
         loop {
             #[cfg(test)]
             tests::run_before_batch_hook();
             match self.db.prune_unreferenced(&self.store, PRUNE_BATCH) {
-                Ok(r) if r.blobs_pruned == 0 => return Ok(total),
+                Ok(r) if r.blobs_pruned == 0 => return (total, None),
                 Ok(r) => {
                     total.blobs_pruned = total.blobs_pruned.saturating_add(r.blobs_pruned);
                     total.bytes_freed = total.bytes_freed.saturating_add(r.bytes_freed);
                 }
                 Err(Error::Io { .. }) => {
                     // Reporting only: the count is not used to delete anything.
-                    let left = self.db.unreferenced_blobs()?.len();
-                    total.blobs_failed = u32::try_from(left).unwrap_or(u32::MAX).max(1);
-                    return Ok(total);
+                    return match self.db.unreferenced_blobs() {
+                        Ok(left) => {
+                            total.blobs_failed =
+                                u32::try_from(left.len()).unwrap_or(u32::MAX).max(1);
+                            (total, None)
+                        }
+                        Err(e) => (total, Some(e)),
+                    };
                 }
-                Err(e) => return Err(e),
+                Err(e) => return (total, Some(e)),
             }
         }
     }
@@ -178,17 +195,28 @@ impl Dsnap {
     /// Find damaged blobs ([`crate::store::Store::verify_all`]) and rewrite each from a
     /// working-tree file that still holds its content (DSNA-99).
     ///
+    /// Blobs that an entry references but whose object is missing from the store (e.g. after
+    /// a crash) are repaired the same way (DSNA-108).
+    ///
     /// Objects `verify_all` could not read (`Error::Io`) are skipped: they may be fine. Only
     /// blobs that an entry references are repaired; sources are tried newest version first,
     /// each working file once, and are stored only if they hash to the blob (`repair_file`
     /// checks). Repair renames over the object and never deletes, so it needs no DB lock.
     /// Returns one record per damaged blob, sorted by hash.
     pub fn repair_blobs(&self) -> Result<Vec<BlobRepair>> {
-        let mut out = Vec::new();
+        let mut damaged = std::collections::BTreeSet::new();
         for (hash, err) in self.store.verify_all()? {
-            if matches!(err, Error::Io { .. }) {
-                continue;
+            if !matches!(err, Error::Io { .. }) {
+                damaged.insert(hash);
             }
+        }
+        for hash in self.db.referenced_hashes()? {
+            if !self.store.contains(&hash) {
+                damaged.insert(hash);
+            }
+        }
+        let mut out = Vec::new();
+        for hash in damaged {
             let outcome = self.repair_one(&hash)?;
             out.push(BlobRepair { hash, outcome });
         }
@@ -321,5 +349,38 @@ mod tests {
 
         assert_eq!(r.blobs_pruned, 0);
         assert_eq!(ds.read_blob(&x.hash).unwrap(), b"reused");
+    }
+
+    /// DSNA-108: a prune that fails after `delete_version` committed (here: another
+    /// connection holds the write lock past the busy timeout) is a warning, not an error.
+    #[test]
+    fn delete_version_succeeds_when_the_prune_after_it_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ds = Dsnap::open(Some(tmp.path().join("home"))).unwrap();
+        let root = tmp.path().join("proj");
+        std::fs::create_dir(&root).unwrap();
+        let p = ds.add_project(&root, None).unwrap().id;
+        let x = ds.store.put(b"only in v").unwrap();
+        let v = ds.db.insert_version(&version(p, x), &ds.store).unwrap();
+
+        let db_path = ds.home().db_path();
+        let mut holder: Option<rusqlite::Connection> = None;
+        BEFORE_BATCH.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                if holder.is_none() {
+                    let c = rusqlite::Connection::open(&db_path).unwrap();
+                    c.execute_batch("BEGIN IMMEDIATE").unwrap();
+                    holder = Some(c);
+                }
+            }));
+        });
+        let r = ds.delete_version(v.id);
+        BEFORE_BATCH.with(|h| *h.borrow_mut() = None);
+        r.unwrap();
+
+        assert!(matches!(ds.version(v.id), Err(Error::NotFound(_))));
+        // The blob was left for the next prune, which now succeeds.
+        assert_eq!(ds.read_blob(&x.hash).unwrap(), b"only in v");
+        assert_eq!(ds.prune_blobs().unwrap().blobs_pruned, 1);
     }
 }

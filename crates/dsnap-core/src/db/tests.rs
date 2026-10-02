@@ -201,6 +201,7 @@ impl BlobSweep for FakeFiles {
         Ok(Swept {
             deleted,
             bytes_freed: deleted * 100,
+            failed: 0,
         })
     }
 }

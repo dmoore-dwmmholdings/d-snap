@@ -43,13 +43,14 @@ impl Dsnap {
     /// through `Db::prune_unreferenced`.
     ///
     /// The next version's stored counts are recomputed against its new predecessor in the
-    /// same transaction. Blob files that cannot be deleted are left for the next prune and
-    /// are not an error here.
+    /// same transaction. Once the delete has committed, nothing fails the call: blobs that
+    /// cannot be pruned now (undeletable files, a busy database) are left for the next
+    /// prune.
     pub fn delete_version(&self, id: VersionId) -> Result<()> {
         if self.db.delete_versions(&[id], &version_counts)? == 0 {
             return Err(Error::NotFound(format!("version {id}")));
         }
-        self.prune_unreferenced_all()?;
+        self.prune_after_commit();
         Ok(())
     }
 }

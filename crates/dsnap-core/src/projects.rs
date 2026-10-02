@@ -63,12 +63,13 @@ impl Dsnap {
     /// Always deletes the project and all its versions from the index: versions without a
     /// project cannot be reached. `delete_snapshots` controls the blob cleanup: `true` prunes
     /// the blobs no other version uses now; `false` leaves them for the next retention run or
-    /// [`Dsnap::prune_blobs`]. Blob files that cannot be deleted are left for the next prune
-    /// and are not an error here.
+    /// [`Dsnap::prune_blobs`]. Once the project row is deleted, nothing fails the call: blobs
+    /// that cannot be pruned now (undeletable files, a busy database) are left for the next
+    /// prune.
     pub fn remove_project(&self, id: ProjectId, delete_snapshots: bool) -> Result<()> {
         self.db.delete_project(id)?;
         if delete_snapshots {
-            self.prune_unreferenced_all()?;
+            self.prune_after_commit();
         }
         Ok(())
     }

@@ -531,7 +531,8 @@ impl Db {
     /// [`Db::insert_version`] re-checks it and returns [`Error::BlobMissing`].
     ///
     /// Reports blob files deleted and bytes freed (blobs and temp files); `versions_deleted`
-    /// is 0.
+    /// is 0. Files that could not be deleted are skipped and counted in `blobs_failed`; a
+    /// later sweep retries them.
     pub fn sweep_orphans(&self, store: &Store) -> Result<RetentionReport> {
         self.sweep_orphans_with(store)
     }
@@ -560,7 +561,7 @@ impl Db {
                 versions_deleted: 0,
                 blobs_pruned: u32::try_from(swept.deleted).unwrap_or(u32::MAX),
                 bytes_freed: swept.bytes_freed,
-                blobs_failed: 0,
+                blobs_failed: u32::try_from(swept.failed).unwrap_or(u32::MAX),
             })
         })
     }
@@ -569,6 +570,18 @@ impl Db {
     pub fn blob_referenced(&self, hash: &BlobHash) -> Result<bool> {
         let conn = self.conn();
         is_referenced(&conn, hash)
+    }
+
+    /// Every blob hash that at least one entry references, sorted.
+    pub fn referenced_hashes(&self) -> Result<Vec<BlobHash>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare_cached(
+            "SELECT DISTINCT blob_hash FROM entries WHERE blob_hash IS NOT NULL ORDER BY 1",
+        )?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, Vec<u8>>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.into_iter().map(codec::hash_from_sql).collect()
     }
 
     /// Every entry that references `hash`, with its project and version, newest version
@@ -674,6 +687,8 @@ pub(crate) struct Swept {
     pub(crate) deleted: u64,
     /// Bytes freed on disk (blobs and temp files).
     pub(crate) bytes_freed: u64,
+    /// Unreferenced blob files that could not be deleted.
+    pub(crate) failed: u64,
 }
 
 /// Whole-store sweep used by [`Db::sweep_orphans_with`]: delete every blob file whose hash
@@ -689,6 +704,7 @@ impl BlobSweep for Store {
         Ok(Swept {
             deleted: r.deleted,
             bytes_freed: r.bytes_freed,
+            failed: r.failed,
         })
     }
 }
