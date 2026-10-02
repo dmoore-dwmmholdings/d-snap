@@ -148,7 +148,9 @@ impl Guard<'_> {
                     }
                 }
                 // Missing: nothing above it is in the way either.
-                Err(_) => break,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+                // Cannot tell what is there: leave it alone.
+                Err(_) => return Ok(true),
             }
         }
         if as_file {
