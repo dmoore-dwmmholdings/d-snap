@@ -235,3 +235,26 @@ fn failure_inside_the_transaction_leaves_no_partial_version() {
 fn store(env: &Env) -> dsnap_core::store::Store {
     dsnap_core::store::Store::open(env.home.path().join("objects")).unwrap()
 }
+
+/// DSNA-100: another process holding the write lock past the busy timeout gives the
+/// retryable `Error::Busy`, not a raw database error, and nothing is committed.
+#[test]
+fn write_lock_held_past_busy_timeout_is_busy() {
+    let fx = FixtureProject::new().file("a.txt", "a").build();
+    let env = Env::new(fx.root());
+    let conn = rusqlite::Connection::open(env.home.path().join("dsnap.db")).unwrap();
+    conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+    let t = std::time::Instant::now();
+    let err = env
+        .dsnap
+        .snapshot(env.project, SnapshotOptions::default())
+        .unwrap_err();
+    assert!(matches!(err, Error::Busy), "{err}");
+    assert!(err.to_string().contains("try again"), "{err}");
+    assert!(t.elapsed().as_secs_f64() >= 4.5, "waited {:?}", t.elapsed());
+
+    conn.execute_batch("ROLLBACK").unwrap();
+    assert_eq!(versions(&env), 0);
+    assert!(snap(&env, None).version.is_some());
+}

@@ -45,6 +45,10 @@ pub enum Error {
     /// See [`crate::db::Db::insert_version`].
     #[error("blob {0} is missing from the store")]
     BlobMissing(crate::types::BlobHash),
+    /// Another D-Snap operation (another process, e.g. a manual prune) held the database
+    /// write lock for longer than the busy timeout. Nothing was committed; retry later.
+    #[error("another D-Snap operation holds the database; try again")]
+    Busy,
     /// Stored data is inconsistent (bad blob, hash mismatch, malformed row).
     #[error("corrupt data: {0}")]
     Corrupt(String),

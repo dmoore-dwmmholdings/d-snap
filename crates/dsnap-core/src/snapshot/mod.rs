@@ -37,6 +37,7 @@ impl Dsnap {
     /// Errors: [`crate::Error::ProjectMissing`] if the folder is gone,
     /// [`crate::Error::Cancelled`] if `opts.cancel` fires before the commit (nothing is
     /// committed then), [`Error::BlobMissing`] if a blob is still missing after one retry,
+    /// [`Error::Busy`] if another D-Snap operation held the database past the busy timeout,
     /// and walk, store or database errors.
     pub fn snapshot(&self, project: ProjectId, opts: SnapshotOptions) -> Result<SnapshotReport> {
         let hooks = Hooks {
@@ -90,9 +91,25 @@ impl Dsnap {
                     cap.new_blobs = nv.new_blobs;
                     self.restore_missing_blobs(&mut cap, hash)?;
                 }
-                Err(e) => return Err(e),
+                Err(e) => return Err(busy_to_retryable(e)),
             }
         }
+    }
+}
+
+/// Map SQLite's busy/locked errors to [`Error::Busy`] (DSNA-100): another D-Snap operation
+/// held the write lock past the busy timeout, so the caller may simply retry.
+fn busy_to_retryable(e: Error) -> Error {
+    match &e {
+        Error::Db(db)
+            if matches!(
+                db.sqlite_error_code(),
+                Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+            ) =>
+        {
+            Error::Busy
+        }
+        _ => e,
     }
 }
 
