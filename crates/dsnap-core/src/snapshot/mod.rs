@@ -34,6 +34,9 @@ use capture::{Hooks, Mode};
 impl Dsnap {
     /// Capture the project folder. Returns `version: None` when nothing changed (F7).
     ///
+    /// The label is trimmed and cut to [`MAX_LABEL_CHARS`] characters; an empty label uses
+    /// the local time (`YYYY-MM-DD HH:MM:SS`).
+    ///
     /// Errors: [`crate::Error::ProjectMissing`] if the folder is gone,
     /// [`crate::Error::Cancelled`] if `opts.cancel` fires before the commit (nothing is
     /// committed then), [`Error::BlobMissing`] if a blob is still missing after one retry,
@@ -50,10 +53,12 @@ impl Dsnap {
         let now = now_local();
         let mut cap = self.capture(&proj, Mode::Store, &hooks)?;
 
-        let label = match opts.label {
-            Some(l) if !l.trim().is_empty() => l,
-            _ => default_label(now),
-        };
+        let label = opts
+            .label
+            .as_deref()
+            .map(clean_label)
+            .filter(|l| !l.is_empty())
+            .unwrap_or_else(|| default_label(now));
         let mut retried = false;
         loop {
             let changes = diff_entries(
@@ -115,6 +120,21 @@ fn busy_to_retryable(e: Error) -> Error {
     }
 }
 
+/// Longest version label in characters; longer labels are cut (same limit as
+/// `projects::MAX_NAME_CHARS` in Chain L).
+pub const MAX_LABEL_CHARS: usize = 200;
+
+/// Trim a label and cut it to [`MAX_LABEL_CHARS`] characters. A snapshot never fails over its
+/// label (a hook's `-m` text may be anything), so an over-long label is truncated, not
+/// rejected.
+fn clean_label(label: &str) -> String {
+    let trimmed = label.trim();
+    match trimmed.char_indices().nth(MAX_LABEL_CHARS) {
+        Some((cut, _)) => trimmed[..cut].trim_end().to_owned(),
+        None => trimmed.to_owned(),
+    }
+}
+
 /// Local time, or UTC when the local offset cannot be determined.
 fn now_local() -> OffsetDateTime {
     OffsetDateTime::now_local().unwrap_or_else(|_| OffsetDateTime::now_utc())
@@ -135,6 +155,22 @@ fn unix_ms(t: OffsetDateTime) -> i64 {
 mod tests {
     use super::*;
     use time::macros::datetime;
+
+    #[test]
+    fn labels_are_trimmed_and_capped() {
+        assert_eq!(
+            clean_label(
+                "  before agent turn 
+"
+            ),
+            "before agent turn"
+        );
+        assert_eq!(clean_label("   "), "");
+        let long = "é".repeat(MAX_LABEL_CHARS + 50);
+        assert_eq!(clean_label(&long).chars().count(), MAX_LABEL_CHARS);
+        let exact = "x".repeat(MAX_LABEL_CHARS);
+        assert_eq!(clean_label(&exact), exact);
+    }
 
     #[test]
     fn default_label_is_a_local_timestamp() {

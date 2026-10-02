@@ -350,3 +350,21 @@ fn racily_clean_same_size_edit_with_same_mtime_is_captured() {
     let e = env.db.entry(v2.id, &rp("a.txt")).unwrap().unwrap();
     assert_eq!(env.dsnap.read_blob(&e.blob.unwrap()).unwrap(), b"xyz");
 }
+
+/// DSNA-105: labels are trimmed and cut to `MAX_LABEL_CHARS`.
+#[test]
+fn labels_are_trimmed_and_capped() {
+    let fx = FixtureProject::new().file("a.txt", "a").build();
+    let env = Env::new(fx.root());
+    assert_eq!(
+        snap(&env, Some("  after agent turn \n"))
+            .version
+            .unwrap()
+            .label,
+        "after agent turn"
+    );
+    fs::write(fx.path("b.txt"), "b").unwrap();
+    let long = "x".repeat(dsnap_core::snapshot::MAX_LABEL_CHARS + 10);
+    let v = snap(&env, Some(&long)).version.unwrap();
+    assert_eq!(v.label.len(), dsnap_core::snapshot::MAX_LABEL_CHARS);
+}

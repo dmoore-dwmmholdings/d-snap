@@ -8,9 +8,10 @@
 //! Working-tree comparisons leave out paths that are now ignored on both sides (DSNA-27): a
 //! file captured earlier and ignored since does not show as deleted. Skipped paths (over the
 //! size cap, locked, unreadable) keep their previous entry, so they do not show as deleted
-//! either.
+//! either; [`Dsnap::status_report`] lists them, and [`Dsnap::file_diff`] reads their stored
+//! content rather than the file on disk.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -25,7 +26,7 @@ use crate::ignore_rules::IgnoreRules;
 use crate::snapshot::capture::{Hooks, Mode};
 use crate::types::{
     ChangeStatus, DiffOptions, Entry, EntryKind, FileChange, FileDiff, ProjectId, RelPath,
-    VersionId, VersionRef,
+    SkippedFile, StatusReport, VersionId, VersionRef,
 };
 
 /// [`Dsnap::changes`] computes line counts only for text files up to this size (both sides).
@@ -37,6 +38,23 @@ struct Sides {
     new: Vec<Entry>,
     /// Project root when the new side is the working tree (its bytes are read from disk).
     working_root: Option<PathBuf>,
+    /// Working-tree entries carried forward from the latest version (skipped paths): their
+    /// content is the stored blob, not the file on disk (DSNA-105).
+    carried: HashSet<RelPath>,
+    /// Paths the working-tree capture left out (empty for a stored version).
+    skipped: Vec<SkippedFile>,
+}
+
+impl Sides {
+    /// Where to read the new side's entry from: the disk for a captured working-tree file,
+    /// the store otherwise.
+    fn new_root(&self, e: &Entry) -> Option<&Path> {
+        if self.carried.contains(&e.path) {
+            None
+        } else {
+            self.working_root.as_deref()
+        }
+    }
 }
 
 impl Dsnap {
@@ -45,12 +63,18 @@ impl Dsnap {
     /// Without a version, every path in the folder is added. Line counts are not filled; use
     /// [`Dsnap::changes`] with [`VersionRef::WorkingTree`] for those. Writes nothing.
     pub fn status(&self, project: ProjectId) -> Result<Vec<FileChange>> {
+        Ok(self.status_report(project)?.changes)
+    }
+
+    /// [`Dsnap::status`] plus the paths the capture left out (over the size cap, locked,
+    /// unreadable), so the UI can warn about a tracked file that grew past the cap: such a
+    /// file keeps its previous entry and does not show as a change. Writes nothing.
+    pub fn status_report(&self, project: ProjectId) -> Result<StatusReport> {
         let sides = self.sides(project, None, VersionRef::WorkingTree)?;
-        Ok(diff_entries(
-            &sides.old,
-            &sides.new,
-            EntryDiffOptions::default(),
-        ))
+        Ok(StatusReport {
+            changes: diff_entries(&sides.old, &sides.new, EntryDiffOptions::default()),
+            skipped: sides.skipped,
+        })
     }
 
     /// Current folder entries with hashes (reusing stored hashes when size and mtime match).
@@ -74,10 +98,9 @@ impl Dsnap {
     ) -> Result<Vec<FileChange>> {
         let sides = self.sides(project, from, to)?;
         let mut changes = diff_entries(&sides.old, &sides.new, EntryDiffOptions::default());
-        let root = sides.working_root.as_deref();
         changes
             .par_iter_mut()
-            .for_each(|c| self.fill_line_counts(c, root));
+            .for_each(|c| self.fill_line_counts(c, &sides));
         Ok(changes)
     }
 
@@ -111,9 +134,10 @@ impl Dsnap {
         if old.is_none() && new.is_none() {
             return Err(Error::NotFound(format!("{path} on either side")));
         }
-        let root = sides.working_root.as_deref();
         let old_bytes = old.map(|e| self.side_bytes(e, None)).transpose()?;
-        let new_bytes = new.map(|e| self.side_bytes(e, root)).transpose()?;
+        let new_bytes = new
+            .map(|e| self.side_bytes(e, sides.new_root(e)))
+            .transpose()?;
         let o: Option<DiffSide<'_>> = old.zip(old_bytes.as_deref());
         let n: Option<DiffSide<'_>> = new.zip(new_bytes.as_deref());
         Ok(build_file_diff(path, o, n, opts))
@@ -139,6 +163,8 @@ impl Dsnap {
                     old,
                     new,
                     working_root: None,
+                    carried: HashSet::new(),
+                    skipped: Vec::new(),
                 })
             }
             VersionRef::WorkingTree => {
@@ -152,6 +178,8 @@ impl Dsnap {
                     old: in_scope(old, &cap.rules)?,
                     new: cap.entries,
                     working_root: Some(cap.root),
+                    carried: cap.carried,
+                    skipped: cap.skipped,
                 })
             }
         }
@@ -189,7 +217,7 @@ impl Dsnap {
 
     /// Fill a change's line counts when every present side is a small text file. Problems
     /// reading either side leave the counts `None`.
-    fn fill_line_counts(&self, c: &mut FileChange, working_root: Option<&Path>) {
+    fn fill_line_counts(&self, c: &mut FileChange, sides: &Sides) {
         let small_file = |e: &Option<Entry>| match e {
             None => true,
             Some(e) => e.kind == EntryKind::File && e.size <= MAX_LINE_COUNT_BYTES,
@@ -215,7 +243,8 @@ impl Dsnap {
                 }
             }
         };
-        let (Some(old), Some(new)) = (load(&c.old, None), load(&c.new, working_root)) else {
+        let new_root = c.new.as_ref().and_then(|e| sides.new_root(e));
+        let (Some(old), Some(new)) = (load(&c.old, None), load(&c.new, new_root)) else {
             return;
         };
         let (added, removed) = line_counts_bytes(&old, &new, &DiffOptions::default());

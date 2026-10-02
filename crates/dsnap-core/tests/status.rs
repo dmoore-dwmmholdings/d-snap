@@ -427,3 +427,92 @@ fn status_of_a_missing_folder_is_project_missing() {
         1
     );
 }
+
+/// DSNA-105: a tracked file that grew past the size cap keeps its previous entry. Status lists
+/// it as skipped (not as a change), and `file_diff` shows the stored content on both sides
+/// instead of reading the over-cap file from disk.
+#[test]
+fn file_over_the_cap_is_reported_skipped_and_diffed_from_the_store() {
+    let fx = FixtureProject::new()
+        .file("grows.txt", "small\n")
+        .file("a.txt", "a\n")
+        .build();
+    let env = Env::new(fx.root());
+    snap(&env, None).version.unwrap();
+    env.db
+        .set_global_settings(&dsnap_core::GlobalSettings {
+            size_cap_bytes: 64,
+            ..Default::default()
+        })
+        .unwrap();
+    project::rewrite(&fx.path("grows.txt"), "big line\n".repeat(20).as_bytes());
+
+    let report = env.dsnap.status_report(env.project).unwrap();
+    assert!(report.changes.is_empty(), "{:?}", report.changes);
+    assert_eq!(report.skipped.len(), 1);
+    assert_eq!(report.skipped[0].path, "grows.txt");
+    assert!(matches!(
+        report.skipped[0].reason,
+        dsnap_core::SkipReason::TooLarge { size: 180 }
+    ));
+    assert!(
+        env.dsnap
+            .changes(env.project, None, VersionRef::WorkingTree)
+            .unwrap()
+            .is_empty()
+    );
+    let d = env
+        .dsnap
+        .file_diff(
+            env.project,
+            None,
+            VersionRef::WorkingTree,
+            &rp("grows.txt"),
+            &DiffOptions::default(),
+        )
+        .unwrap();
+    assert!(text_hunks(&d.body).is_empty(), "{d:?}");
+}
+
+/// DSNA-105: in a working-tree comparison a locked file is not carried forward (status reads
+/// once, without the snapshot's lock retry): it shows as modified by its stat, and
+/// `file_diff` reports the read failure as `Error::Io` instead of a stale diff.
+#[cfg(windows)]
+#[test]
+fn locked_working_file_is_modified_and_its_diff_is_an_io_error() {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let fx = FixtureProject::new()
+        .file(
+            "locked.txt",
+            "one
+",
+        )
+        .build();
+    let env = Env::new(fx.root());
+    snap(&env, None).version.unwrap();
+    project::rewrite(
+        &fx.path("locked.txt"),
+        b"two
+",
+    );
+    let guard = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(fx.path("locked.txt"))
+        .unwrap();
+    let st = env.dsnap.status(env.project).unwrap();
+    assert_eq!(summary(&st), [s("locked.txt", "M")]);
+    let err = env
+        .dsnap
+        .file_diff(
+            env.project,
+            None,
+            VersionRef::WorkingTree,
+            &rp("locked.txt"),
+            &DiffOptions::default(),
+        )
+        .unwrap_err();
+    assert!(matches!(err, Error::Io { .. }), "{err}");
+    drop(guard);
+}

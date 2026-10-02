@@ -674,6 +674,18 @@ pub struct SnapshotReport {
     pub unstable_paths: Vec<RelPath>,
 }
 
+/// Working-tree status with the paths the capture left out
+/// ([`crate::Dsnap::status_report`]).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StatusReport {
+    /// Changes since the latest version.
+    pub changes: Vec<FileChange>,
+    /// Paths left out (over the size cap, locked, unreadable). A tracked one keeps its
+    /// previous entry, so it is not in `changes`.
+    pub skipped: Vec<SkippedFile>,
+}
+
 /// What a whole-project restore will do.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

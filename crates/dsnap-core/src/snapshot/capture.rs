@@ -88,6 +88,9 @@ pub(crate) struct Capture {
     pub(crate) unstable_paths: Vec<RelPath>,
     /// Blobs written to the store ([`Mode::Store`] only), one per hash.
     pub(crate) new_blobs: Vec<BlobInfo>,
+    /// Entries of `entries` carried forward from the latest version (see [`carry_forward`]):
+    /// their content is the stored blob, not the file on disk.
+    pub(crate) carried: HashSet<RelPath>,
 }
 
 /// What one read of a file produced.
@@ -299,7 +302,7 @@ impl Dsnap {
         remove_indexes(&mut entries, &drop_idx);
         skipped.sort_by(|a, b| a.path.cmp(&b.path));
         unstable_paths.sort();
-        carry_forward(
+        let carried = carry_forward(
             &mut entries,
             &skipped,
             &latest_entries,
@@ -317,6 +320,7 @@ impl Dsnap {
             skipped,
             unstable_paths,
             new_blobs,
+            carried,
         })
     }
 }
@@ -397,12 +401,13 @@ impl Dsnap {
         if !new_skips.is_empty() {
             cap.skipped.extend(new_skips);
             cap.skipped.sort_by(|a, b| a.path.cmp(&b.path));
-            carry_forward(
+            let carried = carry_forward(
                 &mut cap.entries,
                 &cap.skipped,
                 &cap.latest_entries,
                 EntryDiffOptions::default().case_insensitive,
             );
+            cap.carried.extend(carried);
         }
         cap.unstable_paths.sort();
         cap.unstable_paths.dedup();
@@ -581,14 +586,16 @@ fn stat(abs: &Path) -> Option<(u64, i64)> {
 /// A carried entry is not added when an ancestor of it is now a file or symlink, or (for a
 /// directory entry) when other entries now lie beneath it. A recorded empty directory that is
 /// an ancestor of a carried entry is dropped, because it is no longer empty.
+///
+/// Returns the paths carried forward.
 pub(crate) fn carry_forward(
     entries: &mut Vec<Entry>,
     skipped: &[SkippedFile],
     latest: &[Entry],
     case_insensitive: bool,
-) {
+) -> HashSet<RelPath> {
     if skipped.is_empty() || latest.is_empty() {
-        return;
+        return HashSet::new();
     }
     let key = |s: &str| {
         if case_insensitive {
@@ -638,11 +645,13 @@ pub(crate) fn carry_forward(
         carried.push(old.clone());
     }
     if carried.is_empty() {
-        return;
+        return HashSet::new();
     }
     entries.retain(|e| !(e.kind == EntryKind::Dir && drop_dirs.contains(&key(e.path.as_str()))));
+    let paths = carried.iter().map(|e| e.path.clone()).collect();
     entries.extend(carried);
     entries.sort_by(|a, b| a.path.cmp(&b.path));
+    paths
 }
 
 /// Proper ancestors of a `/`-separated path, nearest first.
