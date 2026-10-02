@@ -3,7 +3,8 @@
 //!
 //! 1. Walk the project with one [`IgnoreRules`] and the global size cap.
 //! 2. Fast path: a file whose kind, size and mtime match its entry in the latest version
-//!    reuses that entry's hash without being opened.
+//!    reuses that entry's hash without being opened, unless that entry is racily clean
+//!    (its mtime is not clearly older than the start of the capture that recorded it).
 //! 3. Every other file is hashed in parallel on the global rayon pool (CPU count). Storing
 //!    ([`Mode::Store`]) mostly waits on fsync and renames, so it uses a wider pool of at
 //!    least [`MIN_STORE_THREADS`] threads.
@@ -189,13 +190,16 @@ impl Dsnap {
             latest_entries.iter().map(|e| (&e.path, e)).collect();
         let mut entries = walked.entries;
         let mut skipped = walked.skipped;
+        let racy_from = latest
+            .as_ref()
+            .map_or(i64::MIN, |v| v.created_at_ms.saturating_mul(1_000_000));
         let mut to_hash = Vec::new();
         for (i, e) in entries.iter_mut().enumerate() {
             if e.kind != EntryKind::File {
                 continue;
             }
             match index.get(&e.path) {
-                Some(old) if unchanged_stat(old, e) => e.blob = old.blob,
+                Some(old) if unchanged_stat(old, e, racy_from) => e.blob = old.blob,
                 _ => to_hash.push(i),
             }
         }
@@ -429,13 +433,30 @@ fn store_pool() -> Option<&'static rayon::ThreadPool> {
 /// Reads one file: stores it ([`Mode::Store`]) or only hashes it.
 pub(crate) type ReadFn<'a> = dyn Fn(&Path) -> Result<Read> + Sync + 'a;
 
+/// Margin for timestamps with a sub-second part (NTFS 100 ns, ext4 and APFS ns, but the
+/// kernel's coarse clock can lag real time by a scheduler tick).
+pub(crate) const RACY_MARGIN_FINE_NS: i64 = 100_000_000;
+/// Margin for whole-second timestamps (FAT/exFAT store 2 s, some network shares 1 s).
+pub(crate) const RACY_MARGIN_COARSE_NS: i64 = 2_000_000_000;
+
 /// Same kind, size and mtime as the stored entry, which has a hash: the content is assumed
 /// unchanged and the file is not read.
-fn unchanged_stat(old: &Entry, now: &Entry) -> bool {
+///
+/// Racily clean entries are never trusted (DSNA-103, as in git): if the recorded mtime is
+/// not clearly older than `racy_from_ns` (the start of the capture that recorded it), a later
+/// same-size edit in the same timestamp tick would keep the same size and mtime, so the file
+/// is read again.
+fn unchanged_stat(old: &Entry, now: &Entry, racy_from_ns: i64) -> bool {
+    let margin = if old.mtime_ns.rem_euclid(1_000_000_000) == 0 {
+        RACY_MARGIN_COARSE_NS
+    } else {
+        RACY_MARGIN_FINE_NS
+    };
     old.kind == EntryKind::File
         && old.blob.is_some()
         && old.size == now.size
         && old.mtime_ns == now.mtime_ns
+        && old.mtime_ns < racy_from_ns.saturating_sub(margin)
 }
 
 /// Capture one file whose walk entry is `walked`.
@@ -892,6 +913,28 @@ mod tests {
         let (r, _, unstable) = captured(capture_file(&locked_twice, &abs, &e, rules).unwrap());
         assert_eq!(r.hash, BlobHash::of(b"x"));
         assert!(!unstable);
+    }
+
+    #[test]
+    fn racily_clean_entries_are_not_trusted() {
+        let sec = 1_000_000_000i64;
+        let start = 1_700_000_000 * sec; // capture start of the recorded version
+        let entry = |mtime_ns: i64| Entry {
+            mtime_ns,
+            ..file("a", "x")
+        };
+        let same = |mtime_ns| unchanged_stat(&entry(mtime_ns), &entry(mtime_ns), start);
+        // Fine timestamps: trusted when older than start - 100 ms.
+        assert!(same(start - 200_000_000 + 1));
+        assert!(!same(start - 50_000_001));
+        assert!(!same(start + 5 * sec), "mtime in the future");
+        // Whole-second timestamps (FAT): 2 s margin.
+        assert!(same(start - 3 * sec));
+        assert!(!same(start - sec));
+        assert!(!same(start - 2 * sec));
+        // Without a version time nothing is racy; different stat is never trusted.
+        assert!(unchanged_stat(&entry(start), &entry(start), i64::MAX));
+        assert!(!unchanged_stat(&entry(1), &entry(2), i64::MAX));
     }
 
     #[test]

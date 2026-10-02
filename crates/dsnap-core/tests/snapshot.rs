@@ -322,3 +322,31 @@ fn same_size_edit_with_later_mtime_is_captured() {
     let e = env.db.entry(v.id, &rp("a.txt")).unwrap().unwrap();
     assert_eq!(env.dsnap.read_blob(&e.blob.unwrap()).unwrap(), b"xyz");
 }
+
+/// DSNA-103: a same-size edit that keeps the recorded mtime (same timestamp tick as the
+/// capture) is still seen, because an entry whose mtime is not older than the capture start
+/// is racily clean and re-read.
+#[test]
+fn racily_clean_same_size_edit_with_same_mtime_is_captured() {
+    let fx = FixtureProject::new().file("a.txt", "abc").build();
+    let env = Env::new(fx.root());
+    // An mtime at (or after) the capture start, as when a file is written in the same tick.
+    let tick = filetime::FileTime::from_system_time(
+        std::time::SystemTime::now() + std::time::Duration::from_millis(500),
+    );
+    filetime::set_file_mtime(fx.path("a.txt"), tick).unwrap();
+    let v1 = snap(&env, None).version.unwrap();
+    let recorded = env.db.entry(v1.id, &rp("a.txt")).unwrap().unwrap();
+
+    fs::write(fx.path("a.txt"), "xyz").unwrap();
+    filetime::set_file_mtime(fx.path("a.txt"), tick).unwrap();
+    let now = env.dsnap.working_entries(env.project).unwrap();
+    assert_eq!(now[0].mtime_ns, recorded.mtime_ns, "same size and mtime");
+    assert_eq!(now[0].size, recorded.size);
+
+    assert_eq!(env.dsnap.status(env.project).unwrap().len(), 1);
+    let v2 = snap(&env, None).version.unwrap();
+    assert_eq!(v2.counts.modified, 1);
+    let e = env.db.entry(v2.id, &rp("a.txt")).unwrap().unwrap();
+    assert_eq!(env.dsnap.read_blob(&e.blob.unwrap()).unwrap(), b"xyz");
+}

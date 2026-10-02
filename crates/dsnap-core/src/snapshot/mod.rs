@@ -45,9 +45,11 @@ impl Dsnap {
             cancel: opts.cancel.clone(),
         };
         let proj = self.load_project(project)?;
+        // Taken before the walk: `created_at_ms` is the capture start, which the next
+        // capture's racy-clean check relies on (DSNA-103).
+        let now = now_local();
         let mut cap = self.capture(&proj, Mode::Store, &hooks)?;
 
-        let now = now_local();
         let label = match opts.label {
             Some(l) if !l.trim().is_empty() => l,
             _ => default_label(now),
