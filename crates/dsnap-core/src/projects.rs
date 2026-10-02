@@ -26,10 +26,13 @@ impl Dsnap {
             Some(n) => valid_name(n, "project name")?,
             None => default_name(&root),
         };
-        self.check_root_free(&root, None)?;
-        let id = self
-            .db
-            .insert_project(&name, &root, &ProjectSettings::default())?;
+        self.check_not_home(&root)?;
+        let id = self.db.insert_project_checked(
+            &name,
+            &root,
+            &ProjectSettings::default(),
+            &|projects| check_no_overlap(&root, projects, None),
+        )?;
         self.project(id)
     }
 
@@ -75,14 +78,15 @@ impl Dsnap {
         // NotFound for an unknown id comes before any path error.
         self.db.get_project(id)?;
         let root = normalize_root(new_root)?;
-        self.check_root_free(&root, Some(id))?;
-        self.db.set_project_root(id, &root)?;
+        self.check_not_home(&root)?;
+        self.db.set_project_root_checked(id, &root, &|projects| {
+            check_no_overlap(&root, projects, Some(id))
+        })?;
         self.project(id)
     }
 
-    /// Fail unless `root` (normalized) is disjoint from the D-Snap home and from every
-    /// tracked root other than `except`'s.
-    fn check_root_free(&self, root: &Path, except: Option<ProjectId>) -> Result<()> {
+    /// Fail unless `root` (normalized) is disjoint from the D-Snap home.
+    fn check_not_home(&self, root: &Path) -> Result<()> {
         let key = root_key(root);
         let home = self.home.root();
         let home_key = root_key(&std::fs::canonicalize(home).unwrap_or_else(|_| home.into()));
@@ -93,29 +97,36 @@ impl Dsnap {
                 home.display()
             )));
         }
-        for p in self.db.list_projects()? {
-            if Some(p.id) == except {
-                continue;
-            }
-            let other = root_key(&p.root);
-            let why = if key == other {
-                "is already tracked by"
-            } else if key.starts_with(&other) {
-                "is inside the folder of"
-            } else if other.starts_with(&key) {
-                "contains the folder of"
-            } else {
-                continue;
-            };
-            return Err(Error::InvalidInput(format!(
-                "{} {why} project {:?} ({})",
-                root.display(),
-                p.name,
-                p.root.display()
-            )));
-        }
         Ok(())
     }
+}
+
+/// Fail unless `root` (normalized) is disjoint from every root in `projects` other than
+/// `except`'s. Runs inside the insert/update transaction (DSNA-107).
+fn check_no_overlap(root: &Path, projects: &[Project], except: Option<ProjectId>) -> Result<()> {
+    let key = root_key(root);
+    for p in projects {
+        if Some(p.id) == except {
+            continue;
+        }
+        let other = root_key(&p.root);
+        let why = if key == other {
+            "is already tracked by"
+        } else if key.starts_with(&other) {
+            "is inside the folder of"
+        } else if other.starts_with(&key) {
+            "contains the folder of"
+        } else {
+            continue;
+        };
+        return Err(Error::InvalidInput(format!(
+            "{} {why} project {:?} ({})",
+            root.display(),
+            p.name,
+            p.root.display()
+        )));
+    }
+    Ok(())
 }
 
 /// Trim `name` and check it is non-empty and at most [`MAX_NAME_CHARS`] characters.

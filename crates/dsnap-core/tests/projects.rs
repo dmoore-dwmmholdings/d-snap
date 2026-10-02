@@ -308,3 +308,34 @@ fn global_settings_round_trip_and_validation() {
     }));
     assert_eq!(ds.global_settings().unwrap(), g);
 }
+
+/// DSNA-107: two processes adding nested folders at once; the overlap check runs inside the
+/// insert transaction, so exactly one of them wins every time.
+#[test]
+fn concurrent_nested_adds_never_both_succeed() {
+    let home = TestHome::new();
+    let a = home.open();
+    let b = home.open();
+    let dir = tmp();
+    for round in 0..20 {
+        let outer = dir.path().join(format!("r{round}"));
+        let inner = outer.join("inner");
+        fs::create_dir_all(&inner).unwrap();
+        let barrier = std::sync::Barrier::new(2);
+        let (ra, rb) = std::thread::scope(|s| {
+            let ta = s.spawn(|| {
+                barrier.wait();
+                a.add_project(&outer, None)
+            });
+            let tb = s.spawn(|| {
+                barrier.wait();
+                b.add_project(&inner, None)
+            });
+            (ta.join().unwrap(), tb.join().unwrap())
+        });
+        assert!(ra.is_ok() != rb.is_ok(), "round {round}: {ra:?} / {rb:?}");
+        let loser = if ra.is_ok() { rb } else { ra };
+        invalid(loser);
+    }
+    assert_eq!(a.list_projects().unwrap().len(), 20);
+}

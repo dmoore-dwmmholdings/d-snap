@@ -171,13 +171,52 @@ impl Db {
     /// All projects ordered by name (case-insensitive, then exact, then id).
     pub fn list_projects(&self) -> Result<Vec<Project>> {
         let conn = self.conn();
-        let mut stmt = conn.prepare_cached(&format!(
-            "SELECT {PROJECT_COLS} FROM projects ORDER BY name COLLATE NOCASE, name, id"
-        ))?;
-        let rows = stmt
-            .query_map([], ProjectRow::read)?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        rows.into_iter().map(ProjectRow::into_project).collect()
+        projects_of(&conn)
+    }
+
+    /// [`Db::insert_project`], first running `check` on all existing projects inside the
+    /// same `BEGIN IMMEDIATE` transaction, so no other process can add a conflicting project
+    /// between the check and the insert. `check`'s error aborts the insert.
+    pub fn insert_project_checked(
+        &self,
+        name: &str,
+        root: &Path,
+        settings: &ProjectSettings,
+        check: &dyn Fn(&[Project]) -> Result<()>,
+    ) -> Result<ProjectId> {
+        let root_s = root_to_sql(root)?;
+        let json = settings_to_sql(settings)?;
+        self.write(|tx| {
+            check(&projects_of(tx)?)?;
+            tx.execute(
+                "INSERT INTO projects (name, root_path, settings_json, created_at_ms)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![name, root_s, json, now_ms()],
+            )
+            .map_err(|e| unique_root(e, root))?;
+            Ok(ProjectId(tx.last_insert_rowid()))
+        })
+    }
+
+    /// [`Db::set_project_root`], first running `check` on all projects inside the same
+    /// `BEGIN IMMEDIATE` transaction (see [`Db::insert_project_checked`]).
+    pub fn set_project_root_checked(
+        &self,
+        id: ProjectId,
+        root: &Path,
+        check: &dyn Fn(&[Project]) -> Result<()>,
+    ) -> Result<()> {
+        let root_s = root_to_sql(root)?;
+        self.write(|tx| {
+            check(&projects_of(tx)?)?;
+            let n = tx
+                .execute(
+                    "UPDATE projects SET root_path = ?2 WHERE id = ?1",
+                    params![id.0, root_s],
+                )
+                .map_err(|e| unique_root(e, root))?;
+            found(n, || not_found_project(id))
+        })
     }
 
     /// Change a project's display name.
@@ -801,6 +840,16 @@ fn delete_versions_tx(
         )?;
     }
     Ok(u32::try_from(deleted.len()).unwrap_or(u32::MAX))
+}
+
+fn projects_of(conn: &Connection) -> Result<Vec<Project>> {
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT {PROJECT_COLS} FROM projects ORDER BY name COLLATE NOCASE, name, id"
+    ))?;
+    let rows = stmt
+        .query_map([], ProjectRow::read)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    rows.into_iter().map(ProjectRow::into_project).collect()
 }
 
 fn version_by_id(conn: &Connection, id: VersionId) -> Result<Option<Version>> {
