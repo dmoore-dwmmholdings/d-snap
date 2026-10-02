@@ -95,6 +95,11 @@ pub async fn pick_folder(app: AppHandle) -> ApiResult<Option<String>> {
 }
 
 #[tauri::command]
+pub async fn get_data_dir(state: State<'_, AppState>) -> ApiResult<String> {
+    blocking(&state, Backend::get_data_dir).await
+}
+
+#[tauri::command]
 pub async fn get_project_settings(
     state: State<'_, AppState>,
     id: ProjectId,

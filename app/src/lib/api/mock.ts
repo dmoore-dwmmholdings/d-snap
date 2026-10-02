@@ -196,6 +196,10 @@ export class MockApi implements Api {
     });
   }
 
+  getDataDir(): Promise<string> {
+    return this.call(() => 'C:\\Users\\demo\\AppData\\Local\\D-Snap', 0);
+  }
+
   pickFolder(): Promise<string | null> {
     return this.call(() => {
       if (this.pickResult !== undefined) return this.pickResult;

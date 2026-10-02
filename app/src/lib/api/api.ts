@@ -80,6 +80,8 @@ export interface Api {
   relocateProject(id: ProjectId, path: string): Promise<Project>;
   /** Opens the system file manager with the folder selected. */
   revealInExplorer(path: string): Promise<void>;
+  /** Where D-Snap keeps its database and snapshots (read-only display in Settings). */
+  getDataDir(): Promise<string>;
   /** Native folder picker. `null` when the user cancels. */
   pickFolder(): Promise<string | null>;
 

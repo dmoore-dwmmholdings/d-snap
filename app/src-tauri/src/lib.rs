@@ -35,6 +35,7 @@ commands!(
     relocate_project,
     reveal_in_explorer,
     pick_folder,
+    get_data_dir,
     get_project_settings,
     set_project_settings,
     get_global_settings,

@@ -20,6 +20,7 @@ export const COMMANDS = {
   relocateProject: 'relocate_project',
   revealInExplorer: 'reveal_in_explorer',
   pickFolder: 'pick_folder',
+  getDataDir: 'get_data_dir',
   getProjectSettings: 'get_project_settings',
   setProjectSettings: 'set_project_settings',
   getGlobalSettings: 'get_global_settings',

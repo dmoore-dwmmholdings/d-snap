@@ -78,6 +78,10 @@ export class TauriApi implements Api {
     return call(COMMANDS.revealInExplorer, { path });
   }
 
+  getDataDir(): Promise<string> {
+    return call(COMMANDS.getDataDir);
+  }
+
   pickFolder(): Promise<string | null> {
     return call(COMMANDS.pickFolder);
   }

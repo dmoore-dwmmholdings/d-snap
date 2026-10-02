@@ -292,6 +292,11 @@ impl Backend {
         Ok(self.dsnap()?.relocate_project(id, Path::new(path))?)
     }
 
+    /// The data directory (database and snapshots).
+    pub fn get_data_dir(&self) -> ApiResult<String> {
+        Ok(self.dsnap()?.home().root().to_string_lossy().into_owned())
+    }
+
     // ---- settings ----
 
     /// A project's settings.

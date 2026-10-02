@@ -52,6 +52,7 @@ describe('TauriApi', () => {
       { path: 'C:/p' },
     ],
     ['pickFolder', () => api.pickFolder(), COMMANDS.pickFolder, undefined],
+    ['getDataDir', () => api.getDataDir(), COMMANDS.getDataDir, undefined],
     ['getProjectSettings', () => api.getProjectSettings(2), COMMANDS.getProjectSettings, { id: 2 }],
     ['getGlobalSettings', () => api.getGlobalSettings(), COMMANDS.getGlobalSettings, undefined],
     ['snapshot', () => api.snapshot(3), COMMANDS.snapshot, { projectId: 3, label: null }],
