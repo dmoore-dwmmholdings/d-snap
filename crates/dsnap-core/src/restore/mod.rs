@@ -462,6 +462,10 @@ fn apply(
             r.failed.push((d.clone(), stop_msg(at)));
             continue;
         }
+        if !inside(root, d) {
+            r.uncaptured.push(d.clone());
+            continue;
+        }
         stopped = outcome(&mut r, d, create_dir(&d.to_path(root)), false);
     }
 
@@ -471,6 +475,10 @@ fn apply(
             continue;
         }
         let abs = e.path.to_path(root);
+        if !inside(root, &e.path) {
+            r.uncaptured.push(e.path.clone());
+            continue;
+        }
         // Replace only what the safety snapshot holds.
         match unchanged(&abs, current.get(&e.path)) {
             Ok(true) => {}
@@ -503,6 +511,22 @@ fn apply(
     r.uncaptured.sort();
     r.uncaptured.dedup();
     r
+}
+
+/// Whether every existing ancestor of `path` is a real directory, so writing `path` stays
+/// inside the project. A link left in place (its delete failed) would send the write to
+/// wherever it points.
+fn inside(root: &Path, path: &RelPath) -> bool {
+    let mut p = path.parent();
+    while let Some(a) = p {
+        match fs::symlink_metadata(a.to_path(root)) {
+            Ok(m) if m.is_dir() => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            _ => return false,
+        }
+        p = a.parent();
+    }
+    true
 }
 
 /// Whether the path at `abs` is still what the safety capture recorded (`expected`), or
