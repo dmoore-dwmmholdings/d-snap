@@ -102,6 +102,11 @@ pub(crate) const MIGRATIONS: &[&str] = &[
         SELECT RAISE(ABORT, 'blob is still referenced');
     END;
     ",
+    // v4 (DSNA-111): a project being removed is flagged first, then its versions are
+    // deleted in short transactions. Flagged projects are hidden and take no new versions.
+    "
+    ALTER TABLE projects ADD COLUMN removing INTEGER NOT NULL DEFAULT 0;
+    ",
 ];
 
 /// Newest schema version this build knows.

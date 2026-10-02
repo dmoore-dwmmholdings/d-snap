@@ -50,7 +50,7 @@ mod tests;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
@@ -67,6 +67,10 @@ use codec::{
     blob_from_row, blob_row, entry_kind_to_sql, root_to_sql, settings_from_sql, settings_to_sql,
     u64_to_sql, version_kind_to_sql,
 };
+
+/// Longest one write transaction of a project removal should take (DSNA-111); it stays
+/// well under the 5 s busy timeout other processes wait for.
+pub const REMOVE_BATCH_BUDGET: Duration = Duration::from_millis(250);
 
 /// Blobs deleted per [`Db::prune_unreferenced`] call when pruning everything in batches.
 ///
@@ -169,7 +173,7 @@ impl Db {
     pub fn get_project(&self, id: ProjectId) -> Result<Project> {
         self.conn()
             .query_row(
-                &format!("SELECT {PROJECT_COLS} FROM projects WHERE id = ?1"),
+                &format!("SELECT {PROJECT_COLS} FROM projects WHERE id = ?1 AND removing = 0"),
                 [id.0],
                 ProjectRow::read,
             )
@@ -181,7 +185,7 @@ impl Db {
     /// All projects ordered by name (case-insensitive, then exact, then id).
     pub fn list_projects(&self) -> Result<Vec<Project>> {
         let conn = self.conn();
-        projects_of(&conn)
+        projects_of(&conn, false)
     }
 
     /// [`Db::insert_project`], first running `check` on all existing projects inside the
@@ -197,7 +201,8 @@ impl Db {
         let root_s = root_to_sql(root)?;
         let json = settings_to_sql(settings)?;
         self.write(|tx| {
-            check(&projects_of(tx)?)?;
+            // Projects being removed still own their root folder.
+            check(&projects_of(tx, true)?)?;
             tx.execute(
                 "INSERT INTO projects (name, root_path, settings_json, created_at_ms)
                  VALUES (?1, ?2, ?3, ?4)",
@@ -218,10 +223,11 @@ impl Db {
     ) -> Result<()> {
         let root_s = root_to_sql(root)?;
         self.write(|tx| {
-            check(&projects_of(tx)?)?;
+            // Projects being removed still own their root folder.
+            check(&projects_of(tx, true)?)?;
             let n = tx
                 .execute(
-                    "UPDATE projects SET root_path = ?2 WHERE id = ?1",
+                    "UPDATE projects SET root_path = ?2 WHERE id = ?1 AND removing = 0",
                     params![id.0, root_s],
                 )
                 .map_err(|e| unique_root(e, root))?;
@@ -233,7 +239,7 @@ impl Db {
     pub fn set_project_name(&self, id: ProjectId, name: &str) -> Result<()> {
         self.write(|tx| {
             let n = tx.execute(
-                "UPDATE projects SET name = ?2 WHERE id = ?1",
+                "UPDATE projects SET name = ?2 WHERE id = ?1 AND removing = 0",
                 params![id.0, name],
             )?;
             found(n, || not_found_project(id))
@@ -246,7 +252,7 @@ impl Db {
         self.write(|tx| {
             let n = tx
                 .execute(
-                    "UPDATE projects SET root_path = ?2 WHERE id = ?1",
+                    "UPDATE projects SET root_path = ?2 WHERE id = ?1 AND removing = 0",
                     params![id.0, root_s],
                 )
                 .map_err(|e| unique_root(e, root))?;
@@ -259,7 +265,7 @@ impl Db {
         let json = settings_to_sql(settings)?;
         self.write(|tx| {
             let n = tx.execute(
-                "UPDATE projects SET settings_json = ?2 WHERE id = ?1",
+                "UPDATE projects SET settings_json = ?2 WHERE id = ?1 AND removing = 0",
                 params![id.0, json],
             )?;
             found(n, || not_found_project(id))
@@ -267,14 +273,98 @@ impl Db {
     }
 
     /// Delete a project with all its versions and entries (blobs are left for pruning).
+    ///
+    /// Runs in short transactions so other processes are not locked out for long
+    /// (DSNA-111): the first flags the project `removing`, which hides it from
+    /// [`Db::get_project`] and [`Db::list_projects`] and refuses new versions; then its
+    /// versions are deleted newest first, each batch holding the write lock for about
+    /// [`REMOVE_BATCH_BUDGET`]; the last drops the project row. If the process dies part way,
+    /// [`Db::resume_removals`] finishes the job.
     pub fn delete_project(&self, id: ProjectId) -> Result<()> {
+        self.delete_project_timed(id, REMOVE_BATCH_BUDGET)
+            .map(|_| ())
+    }
+
+    /// [`Db::delete_project`] with an explicit batch budget; returns how long each write
+    /// transaction took (tests and timing).
+    pub(crate) fn delete_project_timed(
+        &self,
+        id: ProjectId,
+        budget: Duration,
+    ) -> Result<Vec<Duration>> {
+        let mut times = Vec::new();
+        let t = Instant::now();
         self.write(|tx| {
+            let n = tx.execute("UPDATE projects SET removing = 1 WHERE id = ?1", [id.0])?;
+            found(n, || not_found_project(id))
+        })?;
+        times.push(t.elapsed());
+        self.finish_removal(id, budget, &mut times)?;
+        Ok(times)
+    }
+
+    /// Finish removing projects that a crash left flagged `removing` (see
+    /// [`Db::delete_project`]).
+    pub fn resume_removals(&self) -> Result<()> {
+        let ids = {
+            let conn = self.conn();
+            let mut stmt = conn.prepare_cached("SELECT id FROM projects WHERE removing = 1")?;
+            stmt.query_map([], |r| r.get::<_, i64>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for id in ids {
+            self.finish_removal(ProjectId(id), REMOVE_BATCH_BUDGET, &mut Vec::new())?;
+        }
+        Ok(())
+    }
+
+    /// Delete a flagged project's versions in batches, then its row.
+    fn finish_removal(
+        &self,
+        id: ProjectId,
+        budget: Duration,
+        times: &mut Vec<Duration>,
+    ) -> Result<()> {
+        loop {
+            let t = Instant::now();
+            let more = self.write(|tx| {
+                loop {
+                    let newest: Option<i64> = tx
+                        .query_row(
+                            "SELECT id FROM versions WHERE project_id = ?1
+                             ORDER BY id DESC LIMIT 1",
+                            [id.0],
+                            |r| r.get(0),
+                        )
+                        .optional()?;
+                    let Some(newest) = newest else {
+                        return Ok(false);
+                    };
+                    // Newest first: the deleted version has no successor, so only its own
+                    // reference counts change.
+                    delete_version_row(tx, VersionId(newest))?;
+                    if t.elapsed() >= budget {
+                        return Ok(true);
+                    }
+                }
+            })?;
+            times.push(t.elapsed());
+            if !more {
+                break;
+            }
+        }
+        let t = Instant::now();
+        self.write(|tx| {
+            // No versions are left; subtracting their run starts keeps this exact even if
+            // one slipped in before the flag was set.
             let mut gone = refs::run_starts(tx, Some(id))?;
             gone.values_mut().for_each(|n| *n = -*n);
             refs::apply(tx, &gone)?;
-            let n = tx.execute("DELETE FROM projects WHERE id = ?1", [id.0])?;
-            found(n, || not_found_project(id))
-        })
+            tx.execute("DELETE FROM projects WHERE id = ?1", [id.0])?;
+            Ok(())
+        })?;
+        times.push(t.elapsed());
+        Ok(())
     }
 
     /// Insert a version, its entries and new blob rows in one `BEGIN IMMEDIATE` transaction.
@@ -776,7 +866,7 @@ fn insert_version_tx(
 ) -> Result<Version> {
     let project_exists = tx
         .query_row(
-            "SELECT 1 FROM projects WHERE id = ?1",
+            "SELECT 1 FROM projects WHERE id = ?1 AND removing = 0",
             [v.project_id.0],
             |_| Ok(()),
         )
@@ -912,12 +1002,13 @@ fn delete_version_row(tx: &Transaction<'_>, id: VersionId) -> Result<Option<Proj
     Ok(Some(v.project_id))
 }
 
-fn projects_of(conn: &Connection) -> Result<Vec<Project>> {
+fn projects_of(conn: &Connection, include_removing: bool) -> Result<Vec<Project>> {
     let mut stmt = conn.prepare_cached(&format!(
-        "SELECT {PROJECT_COLS} FROM projects ORDER BY name COLLATE NOCASE, name, id"
+        "SELECT {PROJECT_COLS} FROM projects WHERE removing = 0 OR ?1
+         ORDER BY name COLLATE NOCASE, name, id"
     ))?;
     let rows = stmt
-        .query_map([], ProjectRow::read)?
+        .query_map([include_removing], ProjectRow::read)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     rows.into_iter().map(ProjectRow::into_project).collect()
 }

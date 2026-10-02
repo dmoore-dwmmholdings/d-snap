@@ -34,7 +34,7 @@ fn fresh_db_gets_current_schema() {
         schema::user_version(&db.conn()).unwrap(),
         schema::SCHEMA_VERSION
     );
-    assert_eq!(schema::SCHEMA_VERSION, 3);
+    assert_eq!(schema::SCHEMA_VERSION, 4);
     assert_eq!(
         table_names(&db),
         ["blobs", "entries", "projects", "settings", "versions"]
@@ -1062,14 +1062,22 @@ fn perf_insert_version_stays_flat_over_200_versions() {
     );
     assert_refs_exact(&db);
 
+    // DSNA-111: removing the project runs in short transactions.
     let t = Instant::now();
-    db.delete_project(p).unwrap();
+    let txs = db.delete_project_timed(p, REMOVE_BATCH_BUDGET).unwrap();
+    let longest = txs.iter().max().copied().unwrap_or_default();
     eprintln!(
-        "delete_project with {} versions: {:?}",
+        "delete_project with {} versions: {:?} in {} transactions, longest {longest:?}",
         VERSIONS - 1,
-        t.elapsed()
+        t.elapsed(),
+        txs.len()
+    );
+    assert!(
+        longest <= std::time::Duration::from_secs(1),
+        "a project-removal transaction took {longest:?}"
     );
     assert!(db.referenced_hashes().unwrap().is_empty());
+    assert_refs_exact(&db);
 }
 
 /// Check the schema v3 invariants: every entry blob has a row; `refs > 0` exactly when an
@@ -1587,7 +1595,10 @@ fn migration_from_v2_builds_refs_and_drops_the_entries_blob_index() {
     }
 
     let db = Db::open(&path).unwrap();
-    assert_eq!(schema::user_version(&db.conn()).unwrap(), 3);
+    assert_eq!(
+        schema::user_version(&db.conn()).unwrap(),
+        schema::SCHEMA_VERSION
+    );
     // shared starts runs in v1 (project p) and w (project q); v2 continues p's run.
     assert_eq!(
         (
@@ -1649,5 +1660,100 @@ fn migration_from_v2_builds_refs_and_drops_the_entries_blob_index() {
     let r = db.sweep_orphans_with(&files).unwrap();
     assert_eq!(r.blobs_pruned, 0);
     assert!(files.has(&BlobHash::of(b"shared")) && files.has(&BlobHash::of(b"rowless")));
+    assert_refs_exact(&db);
+}
+
+// ---- DSNA-111: project removal in short transactions ----
+
+/// Two projects sharing one blob, five versions each.
+fn two_projects(db: &Db) -> (ProjectId, ProjectId) {
+    let files = dummy_store();
+    let a = add_project(db, "removal-a");
+    let b = add_project(db, "removal-b");
+    for p in [a, b] {
+        for i in 0..5 {
+            let own = format!("{}-{i}", p.0);
+            let mut nv = new_version(
+                p,
+                "v",
+                vec![
+                    file_entry("own.txt", own.as_bytes()),
+                    file_entry("shared.txt", b"shared"),
+                ],
+            );
+            nv.new_blobs = vec![blob(own.as_bytes()), blob(b"shared")];
+            db.insert_version_with(&nv, &files).unwrap();
+        }
+    }
+    (a, b)
+}
+
+#[test]
+fn delete_project_runs_in_short_transactions() {
+    let (_dir, path) = temp_db();
+    let db = Db::open(&path).unwrap();
+    let (a, b) = two_projects(&db);
+
+    // A zero budget deletes one version per transaction.
+    let txs = db.delete_project_timed(a, Duration::ZERO).unwrap();
+    // flag, one batch per version, a last batch that finds none, the row
+    assert_eq!(txs.len(), 1 + 5 + 1 + 1);
+
+    assert!(matches!(db.get_project(a), Err(Error::NotFound(_))));
+    assert!(matches!(db.delete_project(a), Err(Error::NotFound(_))));
+    assert_eq!(db.list_versions(b).unwrap().len(), 5);
+    assert!(db.blob_referenced(&BlobHash::of(b"shared")).unwrap());
+    assert!(
+        !db.blob_referenced(&BlobHash::of(format!("{}-0", a.0).as_bytes()))
+            .unwrap()
+    );
+    assert_refs_exact(&db);
+}
+
+#[test]
+fn interrupted_removal_is_hidden_and_resumed() {
+    let (_dir, path) = temp_db();
+    let db = Db::open(&path).unwrap();
+    let (a, b) = two_projects(&db);
+    // As if the process died right after the first transaction of delete_project.
+    db.conn()
+        .execute("UPDATE projects SET removing = 1 WHERE id = ?1", [a.0])
+        .unwrap();
+
+    assert!(matches!(db.get_project(a), Err(Error::NotFound(_))));
+    let ids: Vec<ProjectId> = db.list_projects().unwrap().iter().map(|p| p.id).collect();
+    assert_eq!(ids, vec![b]);
+    let nv = new_version(a, "late", vec![file_entry("x.txt", b"x")]);
+    assert!(matches!(
+        db.insert_version_with(&nv, &dummy_store()),
+        Err(Error::NotFound(_))
+    ));
+    assert!(matches!(
+        db.set_project_name(a, "x"),
+        Err(Error::NotFound(_))
+    ));
+    // Its root stays taken until the removal finishes.
+    let root = std::env::temp_dir()
+        .join("dsnap-db-tests")
+        .join("removal-a");
+    let clash = db.insert_project_checked("again", &root, &ProjectSettings::default(), &|ps| {
+        if ps.iter().any(|p| p.id == a) {
+            Err(Error::InvalidInput("taken".into()))
+        } else {
+            Ok(())
+        }
+    });
+    assert!(matches!(clash, Err(Error::InvalidInput(_))));
+
+    db.resume_removals().unwrap();
+    assert_eq!(
+        db.conn()
+            .query_row("SELECT COUNT(*) FROM projects WHERE id = ?1", [a.0], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap(),
+        0
+    );
+    assert_eq!(db.list_versions(b).unwrap().len(), 5);
     assert_refs_exact(&db);
 }

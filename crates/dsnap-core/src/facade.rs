@@ -26,6 +26,9 @@ impl Dsnap {
         home.ensure()?;
         let store = Store::open(home.objects_dir())?;
         let db = Db::open(&home.db_path())?;
+        // A project removal a crash interrupted is finished here (DSNA-111). Best effort:
+        // a busy database just leaves it for the next open.
+        let _ = db.resume_removals();
         Ok(Self { home, db, store })
     }
 
