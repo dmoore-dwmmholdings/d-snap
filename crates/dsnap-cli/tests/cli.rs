@@ -219,3 +219,112 @@ fn partial_restore_exits_3() {
     assert_eq!(r.code, 3, "{}\n{}", r.out, r.err);
     assert!(r.out.contains("Not restored: b.txt"), "{}", r.out);
 }
+
+// ---- hook mode (DSNA-64) ----
+
+fn hook(home: &TestHome, root: &Path, stdin: &str) -> std::process::Child {
+    use std::io::Write as _;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_dsnap"))
+        .arg("--home")
+        .arg(home.path())
+        .args(["snap", "--hook", s(root), "-m", "before agent turn"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(stdin.as_bytes())
+        .unwrap();
+    child
+}
+
+fn hook_log(home: &TestHome) -> String {
+    fs::read_to_string(home.path().join("logs").join("hook.log")).unwrap_or_default()
+}
+
+fn version_count(home: &TestHome, root: &Path) -> usize {
+    let out = ok(home, &["--json", "list", s(root)]);
+    serde_json::from_str::<Vec<serde_json::Value>>(&out)
+        .unwrap()
+        .len()
+}
+
+#[test]
+fn hook_ignores_stdin_and_snapshots() {
+    let home = TestHome::new();
+    let fx = FixtureProject::new().file("a.txt", "a").build();
+    let json = r#"{"session_id":"x","hook_event_name":"UserPromptSubmit","prompt":"hi"}"#;
+    let out = hook(&home, fx.root(), json).wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    assert!(out.stdout.is_empty(), "hooks print nothing on stdout");
+    assert_eq!(version_count(&home, fx.root()), 1);
+}
+
+#[test]
+fn hook_exits_0_on_a_missing_folder_and_logs_it() {
+    let home = TestHome::new();
+    let gone = home.path().join("no-such-project");
+    let out = hook(&home, &gone, "{}").wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    assert!(hook_log(&home).contains("failed"), "{}", hook_log(&home));
+}
+
+#[test]
+fn hook_waits_for_a_held_lock_then_gives_up_quietly() {
+    let home = TestHome::new();
+    let fx = FixtureProject::new().file("a.txt", "a").build();
+    let _ = snapped(&home, fx.root()); // project id 1
+    fs::write(fx.path("a.txt"), "changed").unwrap();
+    let locks = home.path().join("locks");
+    fs::create_dir_all(&locks).unwrap();
+    fs::write(locks.join("project-1.lock"), "other").unwrap();
+
+    let start = std::time::Instant::now();
+    let out = hook(&home, fx.root(), "{}").wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    assert!(start.elapsed() >= std::time::Duration::from_secs(4));
+    assert!(
+        hook_log(&home).contains("still running"),
+        "{}",
+        hook_log(&home)
+    );
+    assert_eq!(
+        version_count(&home, fx.root()),
+        1,
+        "no snapshot without the lock"
+    );
+}
+
+#[test]
+fn concurrent_hooks_serialize() {
+    let home = TestHome::new();
+    let fx = FixtureProject::new().file("a.txt", "a").build();
+    let _ = snapped(&home, fx.root());
+    for i in 0..20 {
+        fs::write(fx.path(&format!("f{i}.txt")), "x".repeat(i * 1000)).unwrap();
+    }
+    let a = hook(&home, fx.root(), "{}");
+    let b = hook(&home, fx.root(), "{}");
+    for c in [a, b] {
+        assert_eq!(c.wait_with_output().unwrap().status.code(), Some(0));
+    }
+    // One of them saw the changes; the other found nothing new (or took the same state).
+    assert_eq!(version_count(&home, fx.root()), 2, "{}", hook_log(&home));
+    assert!(!home.path().join("locks").join("project-1.lock").exists());
+}
+
+#[test]
+fn hooks_print_is_claude_code_settings_json() {
+    let home = TestHome::new();
+    let out = ok(&home, &["hooks", "print"]);
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let cmd = v["hooks"]["Stop"][0]["hooks"][0]["command"]
+        .as_str()
+        .unwrap();
+    assert!(cmd.contains("snap --hook \"$CLAUDE_PROJECT_DIR\""), "{cmd}");
+    assert!(v["hooks"]["UserPromptSubmit"].is_array());
+}
