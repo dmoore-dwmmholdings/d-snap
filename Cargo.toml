@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/dsnap-core",
     "crates/dsnap-cli",
+    "crates/dsnap-bridge",
     "crates/dsnap-test-support",
     "app/src-tauri",
 ]
@@ -18,6 +19,7 @@ publish = false
 [workspace.dependencies]
 # Internal crates
 dsnap-core = { path = "crates/dsnap-core" }
+dsnap-bridge = { path = "crates/dsnap-bridge" }
 dsnap-test-support = { path = "crates/dsnap-test-support" }
 
 # Third-party
