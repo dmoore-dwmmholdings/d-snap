@@ -55,3 +55,21 @@ jobs:
         run: cargo doc --workspace --no-deps --locked
         env:
           RUSTDOCFLAGS: -D warnings
+
+  audit:
+    name: dependency audit (DSNA-77)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Licenses, advisories, sources (cargo-deny)
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories licenses sources
+      - name: No network crates in core, CLI or bridge
+        run: |
+          for c in dsnap-core dsnap-cli dsnap-bridge; do
+            if cargo tree -p "$c" -e normal,build --locked --target all \
+              | grep -E ' (reqwest|hyper|ureq|isahc|surf|curl|attohttpc|tokio-tungstenite|tungstenite) v'; then
+              echo "::error::$c depends on a network crate"; exit 1
+            fi
+          done

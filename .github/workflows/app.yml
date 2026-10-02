@@ -24,6 +24,14 @@ jobs:
           cache: npm
           cache-dependency-path: app/package-lock.json
       - run: npm ci
+      - name: npm audit (runtime dependencies, fail on high)
+        run: npm audit --omit=dev --audit-level=high
+      - name: No remote URLs in the built bundle (doc links in error strings are allowed)
+        run: |
+          npm run build
+          if grep -RhoE "https?://[^\"' )]+" dist | grep -vE "^https?://(localhost|127\.0\.0\.1|ipc\.localhost|www\.w3\.org|svelte\.dev/e/|github\.com/highlightjs/)"; then
+            echo "::error::remote URL in the frontend bundle"; exit 1
+          fi
       - run: npm run check
       - run: npm run lint
       - run: npm test

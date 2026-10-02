@@ -25,7 +25,8 @@ impl Home {
     }
 
     /// Resolve the home: `explicit` if given, else `DSNAP_HOME`, else the platform default
-    /// (`%LOCALAPPDATA%\D-Snap` on Windows).
+    /// (`%LOCALAPPDATA%\D-Snap\data` on Windows: the per-user installer puts the program in
+    /// `%LOCALAPPDATA%\D-Snap`, and data must not share a folder with program files).
     pub fn resolve(explicit: Option<PathBuf>) -> Result<Self> {
         Self::resolve_with(explicit, |k| std::env::var_os(k))
     }
@@ -71,7 +72,7 @@ impl Home {
 
 #[cfg(windows)]
 fn platform_default(var: &dyn Fn(&str) -> Option<PathBuf>) -> Option<PathBuf> {
-    var("LOCALAPPDATA").map(|p| p.join("D-Snap"))
+    var("LOCALAPPDATA").map(|p| p.join("D-Snap").join("data"))
 }
 
 #[cfg(target_os = "macos")]
@@ -135,7 +136,7 @@ mod tests {
             env_of(&[("LOCALAPPDATA", r"C:\Users\u\AppData\Local")]),
         )
         .unwrap();
-        assert_eq!(h.root(), Path::new(r"C:\Users\u\AppData\Local\D-Snap"));
+        assert_eq!(h.root(), Path::new(r"C:\Users\u\AppData\Local\D-Snap\data"));
     }
 
     #[cfg(all(unix, not(target_os = "macos")))]

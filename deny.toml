@@ -1,0 +1,55 @@
+# cargo-deny (DSNA-77): licenses, advisories and sources. Network crates are banned from
+# the core, CLI and bridge by a `cargo tree` check in ci.yml (the app's Tauri stack may
+# pull HTTP crates on other platforms; D-Snap itself makes no network calls).
+
+[graph]
+all-features = false
+
+[advisories]
+version = 2
+yanked = "deny"
+# Reviewed 2026-10-02 (DSNA-77). Revisit when Tauri or the MSRV moves.
+ignore = [
+    # proc-macro-error unmaintained: build-time proc macro under the Linux GTK stack only.
+    { id = "RUSTSEC-2024-0370", reason = "build-time only (gtk proc macros); no runtime code" },
+    # quick-xml DoS: only through Tauri's `plist`, which reads the app's own bundled plists.
+    { id = "RUSTSEC-2026-0194", reason = "quick-xml via tauri/plist; trusted, app-owned XML only" },
+    { id = "RUSTSEC-2026-0195", reason = "quick-xml via tauri/plist; trusted, app-owned XML only" },
+    # time stack exhaustion when parsing untrusted input: D-Snap only formats timestamps with
+    # compile-time format descriptions; the fix (0.3.47) needs a newer Rust than the MSRV.
+    { id = "RUSTSEC-2026-0009", reason = "time: formatting only, no parsing of untrusted input" },
+]
+
+[licenses]
+version = 2
+confidence-threshold = 0.9
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "MPL-2.0",
+    "CC0-1.0",
+    "BSL-1.0",
+    "0BSD",
+    "CDLA-Permissive-2.0",
+]
+
+[bans]
+multiple-versions = "allow"
+wildcards = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+
+[licenses.private]
+# Workspace crates are not published.
+ignore = true
