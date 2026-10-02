@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use notify::{RecommendedWatcher, RecursiveMode, Watcher as _};
+use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher as _};
 
 use crate::error::{Error, Result};
 use crate::facade::Dsnap;
@@ -133,7 +133,10 @@ impl Watcher {
             let relevant = match &res {
                 // Lost events or an error: recompute to be safe.
                 Err(_) => true,
-                Ok(ev) if ev.need_rescan() || ev.paths.is_empty() => true,
+                Ok(ev) if ev.need_rescan() => true,
+                // Reads (inotify reports them; status itself reads files) change nothing.
+                Ok(ev) if matches!(ev.kind, EventKind::Access(_)) => false,
+                Ok(ev) if ev.paths.is_empty() => true,
                 Ok(ev) => {
                     if ev
                         .paths
