@@ -46,6 +46,26 @@ impl Dsnap {
     /// [`Error::Busy`] if another D-Snap operation held the database past the busy timeout,
     /// and walk, store or database errors.
     pub fn snapshot(&self, project: ProjectId, opts: SnapshotOptions) -> Result<SnapshotReport> {
+        self.snapshot_impl(project, opts, false)
+    }
+
+    /// [`Dsnap::snapshot`] that writes a version even when nothing changed, so `version` is
+    /// always `Some`. Restore uses it for the safety version: the undo point is then a
+    /// version of its own, the newest one, which retention keeps (DSNA-85).
+    pub(crate) fn snapshot_forced(
+        &self,
+        project: ProjectId,
+        opts: SnapshotOptions,
+    ) -> Result<SnapshotReport> {
+        self.snapshot_impl(project, opts, true)
+    }
+
+    fn snapshot_impl(
+        &self,
+        project: ProjectId,
+        opts: SnapshotOptions,
+        force: bool,
+    ) -> Result<SnapshotReport> {
         let hooks = Hooks {
             progress: opts.progress.clone(),
             cancel: opts.cancel.clone(),
@@ -74,7 +94,7 @@ impl Dsnap {
                 skipped: cap.skipped.clone(),
                 unstable_paths: cap.unstable_paths.clone(),
             };
-            if cap.latest.is_some() && changes.is_empty() {
+            if !force && cap.latest.is_some() && changes.is_empty() {
                 return Ok(report);
             }
             let nv = NewVersion {
