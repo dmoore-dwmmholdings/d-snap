@@ -121,6 +121,22 @@ pub(crate) fn stage(dir: &Path, entry: &Entry, store: &Store) -> Result<Staged> 
     Ok(staged)
 }
 
+/// Write `bytes` to a new temp file in `dir` (which must exist) and fsync it. The mtime is
+/// the time of writing.
+pub(crate) fn stage_bytes(dir: &Path, bytes: &[u8]) -> Result<Staged> {
+    use std::io::Write as _;
+    let temp = temp_path(dir);
+    let mut file = File::options()
+        .write(true)
+        .create_new(true)
+        .open(&temp)
+        .at(&temp)?;
+    let staged = Staged { temp };
+    file.write_all(bytes).at(&staged.temp)?;
+    file.sync_all().at(&staged.temp)?;
+    Ok(staged)
+}
+
 impl Staged {
     /// Move the staged content over `target` (whose directory must exist) and apply
     /// `entry.readonly`. Refuses to replace a directory.

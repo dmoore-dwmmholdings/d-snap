@@ -25,6 +25,7 @@
 //! Directories are never removed recursively: [`EntryKind::Dir`] entries may still hold
 //! ignored or skipped paths.
 
+mod hunk;
 mod plan;
 mod write;
 
@@ -39,14 +40,15 @@ use crate::error::{Error, IoResultExt, Result};
 use crate::facade::Dsnap;
 use crate::ignore_rules::IgnoreRules;
 use crate::snapshot::capture::{Hooks, Mode};
+use crate::store::hash_bytes;
 use crate::types::{
-    Entry, EntryKind, Hunk, Project, ProjectId, RelPath, RestorePlan, RestoreReport,
-    SnapshotOptions, SnapshotReport, Version, VersionId, VersionKind,
+    BlobHash, DiffBody, Entry, EntryKind, Project, ProjectId, RelPath, RestorePlan, RestoreReport,
+    RevertHunk, SnapshotOptions, SnapshotReport, Version, VersionId, VersionKind, VersionRef,
 };
 use crate::walk::mtime_ns;
 
 use plan::{Current, Plan, plan};
-use write::{Staged, create_dir, locked_or_io, stage, write_symlink};
+use write::{Staged, create_dir, locked_or_io, stage, stage_bytes, write_symlink};
 
 impl Dsnap {
     /// What restoring the whole project to `target` would write, delete and create, and
@@ -105,16 +107,156 @@ impl Dsnap {
         self.restore(project, version, Some(path))
     }
 
-    /// Undo one hunk of the diff from `base` to the working file at `path`.
-    pub fn revert_hunk(
+    /// Undo one hunk of the diff between a version and the working file (F22).
+    ///
+    /// The diff is computed again with `req.opts`; the hunk's changed lines are replaced by
+    /// the old side's lines on the file's original bytes, so line endings and encoding are
+    /// kept (UTF-16 files are edited in their own byte order). A safety snapshot is taken
+    /// first (Rule 1) and the new content replaces the file atomically. If the file is
+    /// uncaptured (ignored, over the size cap, locked...), nothing is written and the path
+    /// is returned in `uncaptured`.
+    ///
+    /// Errors (nothing written): [`Error::InvalidInput`] if `req.to` is not the working
+    /// tree, the diff is not text, the hunk does not exist, or the file changed since the
+    /// diff (`req.working_hash`, or a change between the diff and the safety snapshot);
+    /// [`Error::NotFound`]; [`Error::SafetySnapshotFailed`].
+    pub fn revert_hunk(&self, project: ProjectId, req: &RevertHunk) -> Result<RestoreReport> {
+        if req.to != VersionRef::WorkingTree {
+            return Err(Error::InvalidInput(
+                "only changes in the folder can be reverted".into(),
+            ));
+        }
+        let proj = self.load_project(project)?;
+        let path = &req.path;
+        let pair = self.file_pair(project, req.from, req.to, path)?;
+        let diff = self.file_diff_impl(project, req.from, req.to, path, &req.opts)?;
+        let DiffBody::Text { hunks } = diff.body else {
+            return Err(Error::InvalidInput(format!("{path} has no text hunks")));
+        };
+        let hunk = usize::try_from(req.hunk_index)
+            .ok()
+            .and_then(|i| hunks.get(i))
+            .ok_or_else(|| {
+                Error::InvalidInput(format!("hunk {} does not exist", req.hunk_index))
+            })?;
+        let is_file = |s: &Option<(Entry, Vec<u8>)>| {
+            s.as_ref().is_none_or(|(e, _)| e.kind == EntryKind::File)
+        };
+        if !is_file(&pair.old) || !is_file(&pair.new) {
+            return Err(Error::InvalidInput(format!("{path} is not a regular file")));
+        }
+        let empty: &[u8] = &[];
+        let old = pair.old.as_ref().map_or(empty, |(_, b)| b.as_slice());
+        let new = pair.new.as_ref().map_or(empty, |(_, b)| b.as_slice());
+        let diffed = pair.new.as_ref().map(|_| hash_bytes(new));
+        if req.working_hash.is_some() && req.working_hash != diffed {
+            return Err(stale(path));
+        }
+        let reverted = hunk::revert(old, new, hunk)?;
+
+        // Safety snapshot, labelled after the version the hunk comes from.
+        let label = match req.from {
+            Some(id) => self.version_of(project, id)?.label,
+            None => self
+                .db
+                .latest_version(project)?
+                .map_or_else(|| "empty".to_owned(), |v| v.label),
+        };
+        let (safety_version, safety) = self.safety_snapshot(project, &label)?;
+        let report =
+            self.revert_after_safety(&proj, path, diffed, &reverted, safety_version, &safety);
+        let protect: Vec<VersionId> = req.from.into_iter().chain([safety_version]).collect();
+        let _ = self.apply_retention_protecting(project, &protect);
+        report
+    }
+
+    /// Write the reverted bytes unless the file is uncaptured or changed since the diff.
+    fn revert_after_safety(
+        &self,
+        proj: &Project,
+        path: &RelPath,
+        diffed: Option<BlobHash>,
+        reverted: &[u8],
+        safety_version: VersionId,
+        safety: &SnapshotReport,
+    ) -> Result<RestoreReport> {
+        let root = &proj.root;
+        let rules = IgnoreRules::new(root, &proj.settings)?;
+        let current = Current::new(
+            self.db.entries(safety_version)?,
+            &safety.skipped,
+            &safety.unstable_paths,
+            case_insensitive(),
+        );
+        let mut report = RestoreReport {
+            safety_version,
+            written: Vec::new(),
+            deleted: Vec::new(),
+            failed: Vec::new(),
+            uncaptured: Vec::new(),
+        };
+        if plan::uncaptured_file(root, &current, &rules, path)? {
+            report.uncaptured.push(path.clone());
+            return Ok(report);
+        }
+        // The safety capture must hold exactly the bytes the hunk was computed from.
+        let cur = current.get(path);
+        if cur.and_then(|e| e.blob) != diffed {
+            return Err(stale(path));
+        }
+        let abs = path.to_path(root);
+        let dir = abs
+            .parent()
+            .ok_or_else(|| Error::InvalidInput(format!("{path} has no parent")))?;
+        fs::create_dir_all(dir).at(dir)?;
+        let staged = stage_bytes(dir, reverted)?;
+        if !unchanged(&abs, cur)? {
+            return Err(stale(path));
+        }
+        let entry = Entry {
+            path: path.clone(),
+            kind: EntryKind::File,
+            blob: None,
+            size: reverted.len() as u64,
+            mtime_ns: 0,
+            readonly: cur.is_some_and(|e| e.readonly),
+        };
+        match staged.place(&abs, &entry) {
+            Ok(()) => report.written.push(path.clone()),
+            Err(e @ Error::Locked { .. }) => report.failed.push((path.clone(), e.to_string())),
+            Err(e) => return Err(e),
+        }
+        Ok(report)
+    }
+
+    /// Take the forced safety snapshot before a restore or revert (Rule 1).
+    fn safety_snapshot(
         &self,
         project: ProjectId,
-        base: VersionId,
-        path: &RelPath,
-        hunk: &Hunk,
-    ) -> Result<RestoreReport> {
-        let _ = (project, base, path, hunk);
-        todo!("DSNA-59")
+        target_label: &str,
+    ) -> Result<(VersionId, SnapshotReport)> {
+        let safety = self
+            .snapshot_forced(
+                project,
+                SnapshotOptions {
+                    label: Some(format!("Before restore to {target_label}")),
+                    kind: VersionKind::Safety,
+                    progress: None,
+                    cancel: None,
+                },
+            )
+            .map_err(|e| Error::SafetySnapshotFailed {
+                source: Box::new(e),
+            })?;
+        let id =
+            safety
+                .version
+                .as_ref()
+                .map(|v| v.id)
+                .ok_or_else(|| Error::SafetySnapshotFailed {
+                    source: Box::new(Error::Corrupt("forced snapshot wrote no version".into())),
+                })?;
+        Ok((id, safety))
     }
 
     /// `id`, if it is a version of `project`; [`Error::NotFound`] otherwise.
@@ -147,27 +289,7 @@ impl Dsnap {
         }
 
         // 1. Safety snapshot.
-        let safety = self
-            .snapshot_forced(
-                project,
-                SnapshotOptions {
-                    label: Some(format!("Before restore to {}", version.label)),
-                    kind: VersionKind::Safety,
-                    progress: None,
-                    cancel: None,
-                },
-            )
-            .map_err(|e| Error::SafetySnapshotFailed {
-                source: Box::new(e),
-            })?;
-        let safety_version =
-            safety
-                .version
-                .as_ref()
-                .map(|v| v.id)
-                .ok_or_else(|| Error::SafetySnapshotFailed {
-                    source: Box::new(Error::Corrupt("forced snapshot wrote no version".into())),
-                })?;
+        let (safety_version, safety) = self.safety_snapshot(project, &version.label)?;
 
         let report = self.restore_from(&proj, target, scope, safety_version, &safety);
         // 6. Retention, protecting the target and the undo point. The restore is done, so
@@ -253,6 +375,12 @@ impl Dsnap {
         report.failed.sort();
         Ok(())
     }
+}
+
+fn stale(path: &RelPath) -> Error {
+    Error::InvalidInput(format!(
+        "{path} changed since the diff was computed; compute it again"
+    ))
 }
 
 /// Whether paths that differ only in case name the same file (as `diff_entries` assumes).

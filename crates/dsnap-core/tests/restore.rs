@@ -7,7 +7,10 @@ mod project;
 use std::fs;
 
 use dsnap_core::store::Store;
-use dsnap_core::{BlobHash, Error, GlobalSettings, RelPath, VersionId, VersionKind};
+use dsnap_core::{
+    BlobHash, DiffOptions, Error, GlobalSettings, RelPath, RevertHunk, VersionId, VersionKind,
+    VersionRef,
+};
 use dsnap_test_support::{FixtureProject, symlinks_supported, tree_bytes, tree_dirs};
 
 use project::{Env, rewrite, rp, snap, versions};
@@ -419,4 +422,120 @@ fn case_only_rename_restores_name_and_content() {
         .collect();
     assert_eq!(names, ["Foo.rs"]);
     assert_eq!(read(&env, "Foo.rs"), "x");
+}
+
+// ---- revert_hunk (DSNA-59) ----
+
+fn revert_req(path: &str, from: Option<VersionId>, hunk_index: u32) -> RevertHunk {
+    RevertHunk {
+        from,
+        to: VersionRef::WorkingTree,
+        path: rp(path),
+        hunk_index,
+        opts: DiffOptions {
+            ignore_whitespace: false,
+            context: 1,
+        },
+        working_hash: None,
+    }
+}
+
+const OLD: &str = "a\r\nb\r\nc\r\nd\r\ne\r\nf\r\ng\r\nh\r\ni\r\nj\r\n";
+const NEW: &str = "A\r\nb\r\nc\r\nd\r\ne\r\nF\r\ng\r\nh\r\ni\r\nJ\r\n";
+
+#[test]
+fn revert_middle_hunk_keeps_the_others_and_crlf() {
+    let fx = FixtureProject::new().file("t.txt", OLD).build();
+    let env = Env::new(fx.root());
+    v(&env, "v1");
+    rewrite(&fx.path("t.txt"), NEW.as_bytes());
+
+    let r = env
+        .dsnap
+        .revert_hunk(env.project, &revert_req("t.txt", None, 1))
+        .unwrap();
+    assert_eq!(strs(&r.written), ["t.txt"]);
+    assert_eq!(
+        read(&env, "t.txt"),
+        "A\r\nb\r\nc\r\nd\r\ne\r\nf\r\ng\r\nh\r\ni\r\nJ\r\n"
+    );
+    let safety = env.db.get_version(r.safety_version).unwrap();
+    assert_eq!(safety.kind, VersionKind::Safety);
+    // The safety version holds the pre-revert file.
+    env.dsnap
+        .restore_file(env.project, r.safety_version, &rp("t.txt"))
+        .unwrap();
+    assert_eq!(read(&env, "t.txt"), NEW);
+}
+
+#[test]
+fn revert_with_a_stale_hash_is_refused() {
+    let fx = FixtureProject::new().file("t.txt", OLD).build();
+    let env = Env::new(fx.root());
+    v(&env, "v1");
+    rewrite(&fx.path("t.txt"), NEW.as_bytes());
+    let mut req = revert_req("t.txt", None, 0);
+    req.working_hash = Some(BlobHash::of(b"what the UI saw earlier"));
+    let e = env.dsnap.revert_hunk(env.project, &req);
+    assert!(matches!(e, Err(Error::InvalidInput(_))), "{e:?}");
+    assert_eq!(read(&env, "t.txt"), NEW);
+
+    req.working_hash = Some(BlobHash::of(NEW.as_bytes()));
+    env.dsnap.revert_hunk(env.project, &req).unwrap();
+    assert!(read(&env, "t.txt").starts_with("a\r\n"));
+}
+
+#[test]
+fn revert_needs_the_working_tree_and_an_existing_hunk() {
+    let fx = FixtureProject::new().file("t.txt", OLD).build();
+    let env = Env::new(fx.root());
+    let v1 = v(&env, "v1");
+    rewrite(&fx.path("t.txt"), NEW.as_bytes());
+    let mut req = revert_req("t.txt", None, 0);
+    req.to = VersionRef::Version(v1);
+    assert!(matches!(
+        env.dsnap.revert_hunk(env.project, &req),
+        Err(Error::InvalidInput(_))
+    ));
+    assert!(matches!(
+        env.dsnap
+            .revert_hunk(env.project, &revert_req("t.txt", None, 9)),
+        Err(Error::InvalidInput(_))
+    ));
+    assert_eq!(versions(&env), 1, "no safety version for a refused revert");
+    assert_eq!(read(&env, "t.txt"), NEW);
+}
+
+#[test]
+fn revert_recreates_lines_of_a_deleted_file() {
+    let fx = FixtureProject::new().file("t.txt", "x\ny\n").build();
+    let env = Env::new(fx.root());
+    v(&env, "v1");
+    fs::remove_file(fx.path("t.txt")).unwrap();
+    env.dsnap
+        .revert_hunk(env.project, &revert_req("t.txt", None, 0))
+        .unwrap();
+    assert_eq!(read(&env, "t.txt"), "x\ny\n");
+}
+
+#[test]
+fn revert_over_an_uncaptured_file_writes_nothing() {
+    // v0 and v1 differ; the working file then grows over the size cap, so its current
+    // content is in no version and the diff shows v1's carried entry.
+    let fx = FixtureProject::new().file("t.txt", "a\nb\n").build();
+    let env = Env::new(fx.root());
+    let v0 = v(&env, "v0");
+    rewrite(&fx.path("t.txt"), b"a\nc\n");
+    v(&env, "v1");
+    set_cap(&env, 100);
+    let big = vec![b'z'; 500];
+    rewrite(&fx.path("t.txt"), &big);
+
+    let r = env
+        .dsnap
+        .revert_hunk(env.project, &revert_req("t.txt", Some(v0), 0))
+        .unwrap();
+    assert_eq!(strs(&r.uncaptured), ["t.txt"]);
+    assert!(r.written.is_empty());
+    assert_eq!(fs::read(fx.path("t.txt")).unwrap(), big);
 }
