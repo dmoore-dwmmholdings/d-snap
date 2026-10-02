@@ -723,6 +723,27 @@ pub struct RestoreReport {
     pub uncaptured: Vec<RelPath>,
 }
 
+/// Which hunk [`crate::Dsnap::revert_hunk`] undoes: hunk `hunk_index` of
+/// `file_diff(project, from, to, path, opts)`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RevertHunk {
+    /// Old side of the diff; `None` = the latest version.
+    pub from: Option<VersionId>,
+    /// New side; must be [`VersionRef::WorkingTree`].
+    pub to: VersionRef,
+    /// File the diff is of.
+    pub path: RelPath,
+    /// Index into the diff's hunks.
+    pub hunk_index: u32,
+    /// The options the diff view used.
+    pub opts: DiffOptions,
+    /// Hash of the working file the diff was computed from. When set, a file that has
+    /// changed since is refused instead of reverting a hunk that may now be different.
+    #[serde(default)]
+    pub working_hash: Option<BlobHash>,
+}
+
 /// Outcome of applying retention to a project.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

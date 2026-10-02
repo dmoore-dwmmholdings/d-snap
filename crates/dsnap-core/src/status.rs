@@ -32,6 +32,16 @@ use crate::types::{
 /// [`Dsnap::changes`] computes line counts only for text files up to this size (both sides).
 pub const MAX_LINE_COUNT_BYTES: u64 = 1024 * 1024;
 
+fn side(s: &Option<(Entry, Vec<u8>)>) -> Option<DiffSide<'_>> {
+    s.as_ref().map(|(e, b)| (e, b.as_slice()))
+}
+
+/// One file on both sides of a comparison, with its bytes (`None`: absent on that side).
+pub(crate) struct FilePair {
+    pub(crate) old: Option<(Entry, Vec<u8>)>,
+    pub(crate) new: Option<(Entry, Vec<u8>)>,
+}
+
 /// Two entry lists to compare, plus where to read the new side's files from.
 struct Sides {
     old: Vec<Entry>,
@@ -113,6 +123,25 @@ impl Dsnap {
         path: &RelPath,
         opts: &DiffOptions,
     ) -> Result<FileDiff> {
+        let pair = self.file_pair(project, from, to, path)?;
+        Ok(build_file_diff(
+            path,
+            side(&pair.old),
+            side(&pair.new),
+            opts,
+        ))
+    }
+
+    /// Both sides of [`Dsnap::file_diff`] with their bytes: what the diff compares.
+    ///
+    /// Errors: [`Error::NotFound`] when `path` is on neither side.
+    pub(crate) fn file_pair(
+        &self,
+        project: ProjectId,
+        from: Option<VersionId>,
+        to: VersionRef,
+        path: &RelPath,
+    ) -> Result<FilePair> {
         let sides = self.sides(project, from, to)?;
         let find = |list: &[Entry], p: &RelPath| list.iter().position(|e| e.path == *p);
         let new_i = find(&sides.new, path);
@@ -134,13 +163,13 @@ impl Dsnap {
         if old.is_none() && new.is_none() {
             return Err(Error::NotFound(format!("{path} on either side")));
         }
-        let old_bytes = old.map(|e| self.side_bytes(e, None)).transpose()?;
-        let new_bytes = new
-            .map(|e| self.side_bytes(e, sides.new_root(e)))
+        let old = old
+            .map(|e| Ok::<_, Error>((e.clone(), self.side_bytes(e, None)?)))
             .transpose()?;
-        let o: Option<DiffSide<'_>> = old.zip(old_bytes.as_deref());
-        let n: Option<DiffSide<'_>> = new.zip(new_bytes.as_deref());
-        Ok(build_file_diff(path, o, n, opts))
+        let new = new
+            .map(|e| Ok::<_, Error>((e.clone(), self.side_bytes(e, sides.new_root(e))?)))
+            .transpose()?;
+        Ok(FilePair { old, new })
     }
 
     /// Resolve `from` and `to` into entry lists for `project`.

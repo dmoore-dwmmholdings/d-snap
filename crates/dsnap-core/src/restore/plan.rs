@@ -189,6 +189,22 @@ impl Guard<'_> {
     }
 }
 
+/// Whether writing `path` as a file would replace or remove content no snapshot holds
+/// (see [`Guard::holds`]); also true when `path` itself is held.
+pub(crate) fn uncaptured_file(
+    root: &Path,
+    current: &Current,
+    rules: &IgnoreRules,
+    path: &RelPath,
+) -> Result<bool> {
+    Guard {
+        root,
+        current,
+        rules,
+    }
+    .holds(path, true)
+}
+
 /// What a restore will do.
 #[derive(Debug, Default)]
 pub(crate) struct Plan {
