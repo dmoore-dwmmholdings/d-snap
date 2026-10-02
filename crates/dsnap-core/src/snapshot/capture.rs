@@ -471,7 +471,8 @@ fn unchanged_stat(old: &Entry, now: &Entry, racy_from_ns: i64) -> bool {
 /// bytes read differ from the stat size, read it once more. If it changed during that read
 /// too, keep the second capture and mark it unstable. The recorded mtime is the one from the
 /// stat before the kept read, so a later change is never hidden by the fast path. If the
-/// second read fails, the first capture is kept and marked unstable.
+/// second read fails (locked, unreadable), the file is skipped with that reason: the first
+/// capture may be torn, so it is never recorded.
 ///
 /// A locked file is retried after each pause in `rules.lock_delays`, then skipped as
 /// [`SkipReason::Locked`]. A file that is gone is [`Hashed::Gone`]; other read errors are
@@ -511,8 +512,10 @@ pub(crate) fn capture_file(
             let mtime_ns = before.map_or(walked.mtime_ns, |(_, m)| m);
             Ok(captured(second, mtime_ns, !stable))
         }
-        Err(Hashed::Gone) => Ok(Hashed::Gone),
-        Err(_) => Ok(captured(first, walked.mtime_ns, true)),
+        // Gone: deleted. Skipped: the first capture may be torn (the file changed during or
+        // after that read), so it is not recorded; the path is skipped and its previous entry
+        // carried forward, like any other unreadable file.
+        Err(other) => Ok(other),
     }
 }
 
@@ -832,7 +835,7 @@ mod tests {
     }
 
     #[test]
-    fn second_read_failure_keeps_first_capture_as_unstable() {
+    fn second_read_failure_skips_the_possibly_torn_first_capture() {
         let dir = tempfile::tempdir().unwrap();
         let (abs, e) = walked(dir.path(), "a", b"first");
         let calls = AtomicUsize::new(0);
@@ -848,10 +851,10 @@ mod tests {
                 ))
             }
         };
-        let (r, mtime, unstable) = captured(capture_file(&read, &abs, &e, RECHECK).unwrap());
-        assert_eq!(r.hash, BlobHash::of(b"first"));
-        assert_eq!(mtime, e.mtime_ns);
-        assert!(unstable);
+        assert!(matches!(
+            capture_file(&read, &abs, &e, RECHECK).unwrap(),
+            Hashed::Skip(SkipReason::Unreadable { .. })
+        ));
     }
 
     #[test]
