@@ -1,0 +1,293 @@
+{
+  "ApiError": [
+    {
+      "code": "not_found",
+      "message": "m"
+    }
+  ],
+  "AutoSnapshot": [
+    {
+      "kind": "off"
+    },
+    {
+      "kind": "every",
+      "secs": 60
+    },
+    {
+      "kind": "afterIdle",
+      "secs": 30
+    }
+  ],
+  "ChangeCounts": [
+    {
+      "added": 1,
+      "deleted": 3,
+      "modified": 2
+    }
+  ],
+  "ChangeStatus": [
+    {
+      "kind": "added"
+    },
+    {
+      "kind": "modified"
+    },
+    {
+      "kind": "deleted"
+    },
+    {
+      "from": "old",
+      "kind": "renamed"
+    }
+  ],
+  "DiffBody": [
+    {
+      "hunks": [],
+      "kind": "text"
+    },
+    {
+      "kind": "binary",
+      "newHash": null,
+      "newSize": null,
+      "oldHash": "3ae7d805f6789a6402acb70ad4096a85a56bf6804eaf25c0493ac697548d30b5",
+      "oldSize": 1
+    },
+    {
+      "kind": "image",
+      "mime": "image/png",
+      "new": "3ae7d805f6789a6402acb70ad4096a85a56bf6804eaf25c0493ac697548d30b5",
+      "old": null
+    },
+    {
+      "kind": "tooLarge",
+      "size": 9
+    }
+  ],
+  "DiffLine": [
+    {
+      "newNo": null,
+      "oldNo": 1,
+      "tag": "delete",
+      "text": "a"
+    }
+  ],
+  "DiffOptions": [
+    {
+      "context": 3,
+      "ignoreWhitespace": false
+    }
+  ],
+  "Entry": [
+    {
+      "blob": "3ae7d805f6789a6402acb70ad4096a85a56bf6804eaf25c0493ac697548d30b5",
+      "kind": {
+        "kind": "file"
+      },
+      "mtimeNs": 1700000000000000000,
+      "path": "src/a.rs",
+      "readonly": false,
+      "size": 3
+    }
+  ],
+  "EntryKind": [
+    {
+      "kind": "file"
+    },
+    {
+      "kind": "symlink",
+      "target": "b"
+    },
+    {
+      "kind": "dir"
+    }
+  ],
+  "FileChange": [
+    {
+      "linesAdded": 1,
+      "linesRemoved": null,
+      "new": null,
+      "old": {
+        "blob": "3ae7d805f6789a6402acb70ad4096a85a56bf6804eaf25c0493ac697548d30b5",
+        "kind": {
+          "kind": "file"
+        },
+        "mtimeNs": 1700000000000000000,
+        "path": "src/a.rs",
+        "readonly": false,
+        "size": 3
+      },
+      "path": "a",
+      "status": {
+        "kind": "modified"
+      }
+    }
+  ],
+  "FileDiff": [
+    {
+      "body": {
+        "kind": "tooLarge",
+        "size": 9
+      },
+      "path": "a"
+    }
+  ],
+  "GlobalSettings": [
+    {
+      "retentionKeep": 200,
+      "sizeCapBytes": 52428800
+    }
+  ],
+  "Hunk": [
+    {
+      "lines": [
+        {
+          "newNo": null,
+          "oldNo": 1,
+          "tag": "delete",
+          "text": "a"
+        }
+      ],
+      "newLen": 1,
+      "newStart": 1,
+      "oldLen": 1,
+      "oldStart": 1
+    }
+  ],
+  "LineTag": ["equal", "insert", "delete"],
+  "Progress": [
+    {
+      "done": 0,
+      "op": "snapshot",
+      "opId": "op-1",
+      "path": null,
+      "phase": "walk",
+      "projectId": 1,
+      "total": null
+    }
+  ],
+  "ProgressOp": ["snapshot", "restore"],
+  "ProgressPhase": ["queued", "walk", "hash", "restore", "done"],
+  "Project": [
+    {
+      "id": 1,
+      "missing": false,
+      "name": "p",
+      "root": "C:/p",
+      "settings": {
+        "autoSnapshot": {
+          "kind": "off"
+        },
+        "extraIgnore": [],
+        "respectGitignore": true
+      }
+    }
+  ],
+  "ProjectChangedEvent": [
+    {
+      "changedCount": 4,
+      "projectId": 1
+    }
+  ],
+  "ProjectSettings": [
+    {
+      "autoSnapshot": {
+        "kind": "off"
+      },
+      "extraIgnore": [],
+      "respectGitignore": true
+    }
+  ],
+  "RestorePlan": [
+    {
+      "createDirs": [],
+      "delete": [],
+      "target": 2,
+      "uncaptured": [],
+      "write": ["a"]
+    }
+  ],
+  "RestoreReport": [
+    {
+      "deleted": [],
+      "failed": [["a", "locked"]],
+      "safetyVersion": 3,
+      "uncaptured": [],
+      "written": []
+    }
+  ],
+  "SkipReason": [
+    {
+      "kind": "tooLarge",
+      "size": 1
+    },
+    {
+      "kind": "locked"
+    },
+    {
+      "kind": "nonUtf8Name"
+    },
+    {
+      "kind": "unreadable",
+      "msg": "m"
+    }
+  ],
+  "SkippedFile": [
+    {
+      "path": "big.bin",
+      "reason": {
+        "kind": "locked"
+      }
+    }
+  ],
+  "SnapshotReport": [
+    {
+      "skipped": [],
+      "unstablePaths": ["log"],
+      "version": {
+        "counts": {
+          "added": 1,
+          "deleted": 3,
+          "modified": 2
+        },
+        "createdAtMs": 1700000000000,
+        "id": 2,
+        "kind": "manual",
+        "label": "v",
+        "pinned": false,
+        "projectId": 1,
+        "unstable": false
+      }
+    }
+  ],
+  "Version": [
+    {
+      "counts": {
+        "added": 1,
+        "deleted": 3,
+        "modified": 2
+      },
+      "createdAtMs": 1700000000000,
+      "id": 2,
+      "kind": "manual",
+      "label": "v",
+      "pinned": false,
+      "projectId": 1,
+      "unstable": false
+    }
+  ],
+  "VersionKind": ["manual", "auto", "cli", "safety"],
+  "VersionRef": [
+    {
+      "id": 2,
+      "kind": "version"
+    },
+    {
+      "kind": "workingTree"
+    }
+  ],
+  "VersionsChangedEvent": [
+    {
+      "projectId": 1
+    }
+  ]
+}

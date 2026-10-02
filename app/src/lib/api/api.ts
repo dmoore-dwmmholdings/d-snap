@@ -119,9 +119,9 @@ export interface Api {
 
   // Changes (F13–F18)
   /**
-   * Changed files from `from` to `to`, sorted by path. `from: null` compares with
-   * nothing (every file added); to compare a version with the one before it, pass
-   * the previous version's id.
+   * Changed files from `from` to `to`, sorted by path. `from: null` means the
+   * version before `to` (for the working tree, the latest version); with no such
+   * version, every file is added. The same holds for `fileDiff` and `revertHunk`.
    */
   changes(projectId: ProjectId, from: VersionId | null, to: VersionRef): Promise<FileChange[]>;
   /** Diff of one file. For a rename, `path` is the new path. */

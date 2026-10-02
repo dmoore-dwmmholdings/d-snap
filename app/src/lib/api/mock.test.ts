@@ -1,5 +1,5 @@
 import { ApiError, type Api } from './api';
-import { defaultApiKind, selectApi } from './index';
+import { TauriApi, defaultApiKind, selectApi } from './index';
 import { COMMANDS, EVENTS } from './commands';
 import { createMockApi, MockApi } from './mock';
 import { DEFAULT_DIFF_OPTIONS, type Project, type Version } from './types';
@@ -207,12 +207,22 @@ describe('status and snapshot', () => {
 });
 
 describe('changes and diffs', () => {
-  it('compares a version with nothing (all added)', async () => {
+  it('compares the first version with nothing (all added)', async () => {
     const { api, tool } = await setup();
     const first = (await api.listVersions(tool.id)).at(-1)!;
     const changes = await api.changes(tool.id, null, v(first.id));
     expect(changes.every((c) => c.status.kind === 'added')).toBe(true);
     expect(changes.length).toBe(first.counts.added);
+  });
+
+  it('compares a version with the one before it by default', async () => {
+    const { api, tool } = await setup();
+    const versions = await api.listVersions(tool.id);
+    const [newest, previous] = [versions[0]!.id, versions[1]!.id];
+    expect(await api.changes(tool.id, null, v(newest))).toEqual(
+      await api.changes(tool.id, previous, v(newest)),
+    );
+    expect(await api.changes(tool.id, null, WT)).toEqual(await api.changes(tool.id, newest, WT));
   });
 
   it('compares any two versions', async () => {
@@ -239,7 +249,7 @@ describe('changes and diffs', () => {
   it('reads an image blob as a data URL', async () => {
     const { api, shop } = await setup();
     const versions = await api.listVersions(shop.id);
-    const changes = await api.changes(shop.id, null, v(versions[0]!.id));
+    const changes = await api.changes(shop.id, null, v(versions.at(-1)!.id));
     const logo = changes.find((c) => c.path === 'assets/logo.svg')!;
     const url = await api.readBlobAsDataUrl(logo.new!.blob!, 'image/svg+xml');
     expect(url.startsWith('data:image/svg+xml;base64,')).toBe(true);
@@ -681,10 +691,11 @@ describe('ApiError.from', () => {
 
 describe('selectApi', () => {
   it('defaults to the mock only in dev and test builds', () => {
-    expect(defaultApiKind(true)).toBe('mock');
-    expect(defaultApiKind(false)).toBe('tauri');
+    expect(defaultApiKind(true, false)).toBe('mock');
+    expect(defaultApiKind(true, true)).toBe('tauri');
+    expect(defaultApiKind(false, false)).toBe('tauri');
     expect(selectApi('mock')).toBeInstanceOf(MockApi);
-    expect(() => selectApi('tauri')).toThrow(/not implemented/);
+    expect(selectApi('tauri')).toBeInstanceOf(TauriApi);
     expect(() => selectApi('bogus')).toThrow(/Unknown/);
   });
 });

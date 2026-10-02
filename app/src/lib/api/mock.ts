@@ -513,6 +513,14 @@ export class MockApi implements Api {
     return id === null ? null : this.versionIn(rec, id).entries;
   }
 
+  /** Default old side: the version before `to`, or the latest one for the folder. */
+  private before(rec: ProjectRecord, to: VersionRef): VersionId | null {
+    const ids = rec.versions.map((v) => v.version.id);
+    if (to.kind === 'workingTree') return ids.at(-1) ?? null;
+    const i = ids.indexOf(to.id);
+    return i > 0 ? ids[i - 1]! : null;
+  }
+
   private target(rec: ProjectRecord, to: VersionRef): Tree {
     if (to.kind === 'version') return this.versionIn(rec, to.id).entries;
     if (rec.project.missing) throw missing(rec);
@@ -530,7 +538,7 @@ export class MockApi implements Api {
    * restored or reverted over.
    */
   private sides(rec: ProjectRecord, from: VersionId | null, to: VersionRef): [Tree | null, Tree] {
-    const older = this.side(rec, from);
+    const older = this.side(rec, from ?? this.before(rec, to));
     const newer = this.target(rec, to);
     if (to.kind !== 'workingTree' || !older) return [older, newer];
     const { check } = this.guard(rec);
