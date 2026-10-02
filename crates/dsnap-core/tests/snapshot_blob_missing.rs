@@ -125,3 +125,92 @@ fn file_changed_before_the_retry_is_recaptured() {
     assert_eq!(entries[0].size, 34);
     assert_all_blobs_readable(&env);
 }
+
+/// Keeps `path` unreadable until dropped: an exclusive open on Windows, mode 000 on unix.
+/// `None` when that does not stop reads (unix as root).
+struct Unreadable {
+    #[cfg(windows)]
+    _guard: std::fs::File,
+    #[cfg(unix)]
+    path: PathBuf,
+}
+
+impl Unreadable {
+    fn hold(path: PathBuf) -> Option<Self> {
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            let guard = std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(0)
+                .open(&path)
+                .unwrap();
+            Some(Self { _guard: guard })
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let held = Self { path };
+            std::fs::read(&held.path).is_err().then_some(held)
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Unreadable {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o644));
+    }
+}
+
+/// DSNA-104: when the retry fails too, the error is returned and nothing is committed.
+///
+/// The unreadable file is carried forward with v1's blob. The hook deletes v1 and prunes that
+/// blob, the recapture skips the file again (still unreadable), so the retry inserts the same
+/// missing blob and fails.
+#[test]
+fn retry_double_failure_commits_nothing() {
+    let fx = FixtureProject::new()
+        .file("locked.txt", "v1")
+        .file("other.txt", "o1")
+        .build();
+    let env = Env::new(fx.root());
+    let v1 = snap(&env, None).version.unwrap();
+    project::rewrite(&fx.path("locked.txt"), b"v2 changed");
+    project::rewrite(&fx.path("other.txt"), b"o2 changed");
+    let Some(held) = Unreadable::hold(fx.path("locked.txt")) else {
+        eprintln!("cannot make a file unreadable here (root?); skipping");
+        return;
+    };
+
+    let (db, store) = other_process(&env);
+    let pruned = Arc::new(Mutex::new(RetentionReport::default()));
+    let p = pruned.clone();
+    let fired = AtomicBool::new(false);
+    let progress = Progress::new(move |e| {
+        if e.stage == Stage::Hash && e.path.is_none() && !fired.swap(true, Ordering::SeqCst) {
+            db.delete_version(v1.id).unwrap();
+            *p.lock().unwrap() = db.prune_unreferenced(&store, PRUNE_BATCH).unwrap();
+        }
+    });
+    let err = env
+        .dsnap
+        .snapshot(
+            env.project,
+            SnapshotOptions {
+                progress: Some(progress),
+                ..SnapshotOptions::default()
+            },
+        )
+        .unwrap_err();
+    assert_eq!(pruned.lock().unwrap().blobs_pruned, 2);
+    assert!(matches!(err, dsnap_core::Error::BlobMissing(_)), "{err}");
+    assert_eq!(project::versions(&env), 0);
+
+    drop(held);
+    let v = snap(&env, None).version.unwrap();
+    assert_eq!(v.counts.added, 2);
+    assert_all_blobs_readable(&env);
+}
