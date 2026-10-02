@@ -16,9 +16,13 @@ path = "src/main.rs"
 anyhow.workspace = true
 clap.workspace = true
 dsnap-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+time.workspace = true
 
 [dev-dependencies]
 dsnap-test-support.workspace = true
+serde_json.workspace = true
 tempfile.workspace = true
 
 [lints]
