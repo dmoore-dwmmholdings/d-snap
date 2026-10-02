@@ -368,3 +368,55 @@ fn labels_are_trimmed_and_capped() {
     let v = snap(&env, Some(&long)).version.unwrap();
     assert_eq!(v.label.len(), dsnap_core::snapshot::MAX_LABEL_CHARS);
 }
+
+/// Keep only `keep` unpinned versions.
+fn set_keep(env: &Env, keep: u32) {
+    env.dsnap
+        .set_global_settings(&GlobalSettings {
+            retention_keep: keep,
+            ..GlobalSettings::default()
+        })
+        .unwrap();
+}
+
+/// DSNA-109: each committed snapshot runs retention.
+#[test]
+fn snapshot_runs_retention_after_commit() {
+    let fx = FixtureProject::new().file("a.txt", "1").build();
+    let env = Env::new(fx.root());
+    set_keep(&env, 2);
+    for content in ["2", "3", "4"] {
+        snap(&env, None).version.unwrap();
+        fs::write(fx.path("a.txt"), content).unwrap();
+    }
+    let v4 = snap(&env, None).version.unwrap();
+    let kept = env.db.list_versions(env.project).unwrap();
+    assert_eq!(kept.len(), 2);
+    assert_eq!(kept[0].id, v4.id, "newest is kept");
+    assert_eq!(stored_bytes(&env)[&rp("a.txt")], b"4");
+}
+
+/// DSNA-109 / DSNA-55: a safety snapshot never runs retention, so a restore's own safety
+/// version cannot prune the version being restored.
+#[test]
+fn safety_snapshot_does_not_run_retention() {
+    let fx = FixtureProject::new().file("a.txt", "1").build();
+    let env = Env::new(fx.root());
+    snap(&env, None).version.unwrap();
+    fs::write(fx.path("a.txt"), "2").unwrap();
+    snap(&env, None).version.unwrap();
+    set_keep(&env, 1);
+    fs::write(fx.path("a.txt"), "3").unwrap();
+    env.dsnap
+        .snapshot(
+            env.project,
+            SnapshotOptions {
+                kind: VersionKind::Safety,
+                ..SnapshotOptions::default()
+            },
+        )
+        .unwrap()
+        .version
+        .unwrap();
+    assert_eq!(versions(&env), 3);
+}

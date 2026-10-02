@@ -37,6 +37,9 @@ impl Dsnap {
     /// The label is trimmed and cut to [`MAX_LABEL_CHARS`] characters; an empty label uses
     /// the local time (`YYYY-MM-DD HH:MM:SS`).
     ///
+    /// After a version commits, retention runs ([`Dsnap::after_snapshot`]; skipped for
+    /// safety versions). A retention error does not fail the snapshot.
+    ///
     /// Errors: [`crate::Error::ProjectMissing`] if the folder is gone,
     /// [`crate::Error::Cancelled`] if `opts.cancel` fires before the commit (nothing is
     /// committed then), [`Error::BlobMissing`] if a blob is still missing after one retry,
@@ -87,6 +90,9 @@ impl Dsnap {
             hooks.check_cancel()?;
             match self.db.insert_version(&nv, &self.store) {
                 Ok(v) => {
+                    // Retention (DSNA-55) runs after the commit; the version is saved, so a
+                    // retention error is only a warning and the next run retries (DSNA-109).
+                    let _ = self.after_snapshot(&v);
                     report.version = Some(v);
                     return Ok(report);
                 }
