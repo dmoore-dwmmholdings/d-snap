@@ -47,7 +47,12 @@ fn census(store: &Store) -> (Vec<String>, Vec<String>) {
         if e.file_type().unwrap().is_dir() {
             for f in fs::read_dir(e.path()).unwrap() {
                 let f = f.unwrap().file_name().into_string().unwrap();
-                objects.push(format!("{name}{f}"));
+                // Objects are named by 62 hex digits; anything else is a temp file.
+                if f.len() != 62 {
+                    temps.push(format!("{name}/{f}"));
+                } else {
+                    objects.push(format!("{name}{f}"));
+                }
             }
         } else {
             temps.push(name);
@@ -554,4 +559,185 @@ fn repair_from_missing_file_is_an_io_error() {
         .unwrap_err();
     assert!(matches!(err, Error::Io { .. }), "{err:?}");
     assert_eq!(fs::read(&path).unwrap(), b"junk");
+}
+
+// --- PutBatch (DSNA-102) ---
+
+#[test]
+fn batch_blobs_are_invisible_until_commit() {
+    let (tmp, store) = store();
+    let small = data(10_000, 21);
+    let big = data(3 << 20, 22);
+    let big_path = write(tmp.path(), "big", &big);
+
+    let batch = store.batch();
+    let a = batch.put(&small).unwrap();
+    let b = batch.put_file(&big_path).unwrap();
+    assert_eq!(batch.len(), 2);
+    assert_eq!((a.hash, a.size), (BlobHash::of(&small), small.len() as u64));
+    assert_eq!((b.hash, b.size), (BlobHash::of(&big), big.len() as u64));
+    // Staged, not stored: no object, only temp files.
+    assert!(!store.contains(&a.hash) && !store.contains(&b.hash));
+    assert!(matches!(store.get(&a.hash), Err(Error::NotFound(_))));
+    let (objects, temps) = census(&store);
+    assert!(objects.is_empty(), "{objects:?}");
+    assert_eq!(temps.len(), 2, "small one in its shard, big one at the top");
+    assert_eq!(temps.iter().filter(|t| t.contains('/')).count(), 1);
+
+    batch.commit().unwrap();
+    for (info, bytes) in [(a, &small), (b, &big)] {
+        assert!(store.contains(&info.hash));
+        assert_eq!(store.get(&info.hash).unwrap(), *bytes);
+        assert_eq!(
+            fs::metadata(store.path_of(&info.hash)).unwrap().len(),
+            info.stored_size
+        );
+        // Same object as put() writes.
+        assert_eq!(store.put(bytes).unwrap(), info);
+    }
+    assert_eq!(census(&store).0.len(), 2);
+    assert!(census(&store).1.is_empty(), "no temp files left");
+}
+
+#[test]
+fn batch_dedupes_against_the_store_and_itself() {
+    let (tmp, store) = store();
+    let old = store.put(&data(5_000, 31)).unwrap();
+    let new = data(5_000, 32);
+    let p = write(tmp.path(), "new", &new);
+
+    let batch = store.batch();
+    assert_eq!(batch.put(&data(5_000, 31)).unwrap(), old);
+    assert!(batch.is_empty(), "already stored: nothing staged");
+    let first = batch.put(&new).unwrap();
+    assert_eq!(batch.put_file(&p).unwrap(), first);
+    assert_eq!(batch.put(&new).unwrap(), first);
+    assert_eq!(batch.len(), 1);
+    assert_eq!(
+        census(&store).1.len(),
+        1,
+        "one temp file for the duplicates"
+    );
+    batch.commit().unwrap();
+    assert_eq!(store.get(&first.hash).unwrap(), new);
+    assert_eq!(census(&store).0.len(), 2);
+    assert!(census(&store).1.is_empty());
+}
+
+#[test]
+fn dropped_batch_stores_nothing_and_cleans_up() {
+    let (tmp, store) = store();
+    let big_path = write(tmp.path(), "big", &data(2 << 20, 41));
+    let batch = store.batch();
+    let a = batch.put(&data(1_000, 40)).unwrap();
+    let b = batch.put_file(&big_path).unwrap();
+    drop(batch);
+    assert!(!store.contains(&a.hash) && !store.contains(&b.hash));
+    let (objects, temps) = census(&store);
+    assert!(
+        objects.is_empty() && temps.is_empty(),
+        "{objects:?} {temps:?}"
+    );
+    store.batch().commit().unwrap(); // empty commit
+}
+
+#[test]
+fn batch_commit_after_an_object_appeared_keeps_it() {
+    let (_tmp, store) = store();
+    let bytes = data(20_000, 51);
+    let batch = store.batch();
+    let staged = batch.put(&bytes).unwrap();
+    // Another writer stores the same content before the commit.
+    let direct = store.put(&bytes).unwrap();
+    assert_eq!(staged, direct);
+    batch.commit().unwrap();
+    assert_eq!(store.get(&direct.hash).unwrap(), bytes);
+    assert!(census(&store).1.is_empty());
+}
+
+#[test]
+fn batch_commit_reports_a_lost_temp_file() {
+    let (_tmp, store) = store();
+    let batch = store.batch();
+    let ok = batch.put(&data(1_000, 61)).unwrap();
+    let lost = batch.put(&data(1_000, 62)).unwrap();
+    // Simulate a stale-temp cleanup that removed one staged file.
+    let (_, temps) = census(&store);
+    assert_eq!(temps.len(), 2);
+    let lost_shard = &lost.hash.to_string()[..2];
+    let victim = temps
+        .iter()
+        .find(|t| t.starts_with(lost_shard))
+        .or(temps.first())
+        .unwrap();
+    fs::remove_file(store.dir().join(victim)).unwrap();
+
+    let err = batch.commit().unwrap_err();
+    assert!(matches!(err, Error::Io { .. }), "{err:?}");
+    // Nothing is half-stored: no temp files remain, and every object that exists is intact.
+    assert!(census(&store).1.is_empty());
+    for info in [ok, lost] {
+        if store.contains(&info.hash) {
+            store.get(&info.hash).unwrap();
+        }
+    }
+}
+
+#[test]
+fn batch_from_many_threads() {
+    let (tmp, store) = store();
+    let files: Vec<_> = (0..300)
+        .map(|i| {
+            // Every 10th file repeats an earlier one's content.
+            let seed = if i % 10 == 9 { i - 1 } else { i };
+            let bytes = data(100 + (i as usize % 7) * 900, seed);
+            (write(tmp.path(), &format!("f{i}"), &bytes), bytes)
+        })
+        .collect();
+    let batch = store.batch();
+    let infos: Vec<_> = std::thread::scope(|s| {
+        let handles: Vec<_> = files
+            .chunks(25)
+            .map(|chunk| {
+                let batch = &batch;
+                s.spawn(move || {
+                    chunk
+                        .iter()
+                        .map(|(p, _)| batch.put_file(p).unwrap())
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap())
+            .collect()
+    });
+    batch.commit().unwrap();
+    for (info, (_, bytes)) in infos.iter().zip(&files) {
+        assert_eq!(store.get(&info.hash).unwrap(), *bytes);
+    }
+    let unique: std::collections::HashSet<_> = infos.iter().map(|i| i.hash).collect();
+    assert_eq!(census(&store).0.len(), unique.len());
+    assert!(census(&store).1.is_empty());
+}
+
+#[test]
+fn writes_recreate_a_removed_shard() {
+    let (_tmp, store) = store();
+    let bytes = data(3_000, 71);
+    let info = store.put(&bytes).unwrap();
+    let shard = store.path_of(&info.hash).parent().unwrap().to_path_buf();
+    // The store remembers the shard; remove it behind its back.
+    store.delete(&info.hash).unwrap();
+    fs::remove_dir(&shard).unwrap();
+    assert_eq!(store.put(&bytes).unwrap(), info);
+    assert_eq!(store.get(&info.hash).unwrap(), bytes);
+
+    store.delete(&info.hash).unwrap();
+    fs::remove_dir(&shard).unwrap();
+    let batch = store.batch();
+    batch.put(&bytes).unwrap();
+    batch.commit().unwrap();
+    assert_eq!(store.get(&info.hash).unwrap(), bytes);
 }

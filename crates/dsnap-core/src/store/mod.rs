@@ -3,11 +3,16 @@
 //! A blob is named by the BLAKE3 hash of its uncompressed bytes: the first two hex digits pick
 //! the shard directory, the other 62 name the file. Each object is one zstd frame (level 3).
 //!
-//! Writes go to a uniquely named temp file (`.tmp-*`) directly under `objects/` (same volume
-//! as the object), are fsynced, then renamed into place. A reader or [`Store::contains`]
-//! therefore never sees a partial blob. If the object already exists the temp file is dropped
-//! (dedupe); two writers racing on the same hash both succeed, because the content is
-//! identical.
+//! Writes go to a uniquely named temp file (`XXXXXXXX.TMP`), are fsynced, then renamed into
+//! place. A reader or [`Store::contains`] therefore never sees a partial blob. If the object
+//! already exists the temp file is dropped (dedupe); two writers racing on the same hash both
+//! succeed, because the content is identical. A blob whose hash is known before it is
+//! compressed (up to 1 MiB) is staged in its shard directory, so parallel writers do not all
+//! create and rename files in one directory; a larger, streamed blob is staged directly under
+//! `objects/`.
+//!
+//! Many new blobs (a project's first snapshot) are cheaper through a [`PutBatch`]: it defers
+//! the fsyncs and issues them all at once in [`PutBatch::commit`] (DSNA-102).
 //!
 //! Reads verify the hash of the decompressed bytes and return [`Error::Corrupt`] on mismatch.
 //! Dedupe trusts any non-empty object, so damage found by [`Store::verify_all`] is fixed with
@@ -18,7 +23,7 @@
 use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::{Error, IoResultExt, Result};
@@ -35,26 +40,58 @@ const SMALL_FILE_LIMIT: u64 = 1 << 20;
 /// Read buffer for streaming.
 const BUF_SIZE: usize = 256 * 1024;
 
-/// File-name prefix of in-flight writes under `objects/`.
-pub(crate) const TEMP_PREFIX: &str = ".tmp-";
+/// File-name prefix of in-flight writes made by earlier builds. Still recognized as temp
+/// files by the scans in `gc`.
+const LEGACY_TEMP_PREFIX: &str = ".tmp-";
 
+/// Extension of in-flight writes: `XXXXXXXX.TMP`, 8 uppercase hex digits.
+const TEMP_EXT: &str = ".TMP";
+
+/// Whether `name` is an in-flight write (a temp file) rather than an object.
+pub(crate) fn is_temp_name(name: &str) -> bool {
+    if name.starts_with(LEGACY_TEMP_PREFIX) {
+        return true;
+    }
+    match name.strip_suffix(TEMP_EXT) {
+        Some(stem) => {
+            stem.len() == 8 && stem.bytes().all(|b| matches!(b, b'0'..=b'9' | b'A'..=b'F'))
+        }
+        None => false,
+    }
+}
+
+mod batch;
 mod gc;
 mod repair;
 
+pub use batch::PutBatch;
 pub use gc::{SweepReport, TEMP_GRACE};
 pub use repair::RepairOutcome;
 
 /// Blob store rooted at the `objects` directory.
-#[derive(Debug)]
 pub struct Store {
     pub(crate) dir: PathBuf,
+    /// Shard directories this handle has created or seen, by first hash byte. Only a cache:
+    /// a shard deleted behind our back is recreated when a write finds it missing.
+    shards: [AtomicBool; 256],
+}
+
+impl std::fmt::Debug for Store {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Store")
+            .field("dir", &self.dir)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Store {
     /// Open the store at `dir`, creating it if missing.
     pub fn open(dir: PathBuf) -> Result<Self> {
         fs::create_dir_all(&dir).at(&dir)?;
-        Ok(Self { dir })
+        Ok(Self {
+            dir,
+            shards: std::array::from_fn(|_| AtomicBool::new(false)),
+        })
     }
 
     /// The `objects` directory.
@@ -80,7 +117,7 @@ impl Store {
                 stored_size,
             });
         }
-        let temp = self.stage_bytes(bytes)?;
+        let (temp, _) = self.stage_bytes(bytes, &hash)?;
         let stored_size = self.persist(temp, &hash)?;
         Ok(BlobInfo {
             hash,
@@ -141,14 +178,15 @@ impl Store {
         Ok((temp, BlobHash::from(hasher.finalize()), size))
     }
 
-    /// Compress `bytes` into a new temp file.
-    fn stage_bytes(&self, bytes: &[u8]) -> Result<TempFile> {
+    /// Compress `bytes` (whose hash is `hash`) into a new temp file in `hash`'s shard
+    /// directory; returns it with the compressed size.
+    fn stage_bytes(&self, bytes: &[u8], hash: &BlobHash) -> Result<(TempFile, u64)> {
         let compressed = zstd::bulk::compress(bytes, ZSTD_LEVEL)
             .map_err(|e| Error::Corrupt(format!("zstd compression failed: {e}")))?;
-        let mut temp = self.temp_file()?;
+        let mut temp = self.shard_temp_file(hash)?;
         let temp_path = temp.path.clone();
         temp.file()?.write_all(&compressed).at(&temp_path)?;
-        Ok(temp)
+        Ok((temp, compressed.len() as u64))
     }
 
     /// Read and decompress a blob, verifying its hash ([`crate::Error::Corrupt`] on mismatch).
@@ -228,32 +266,53 @@ impl Store {
         }
     }
 
-    /// Create a new, uniquely named temp file under `objects/`.
-    fn temp_file(&self) -> Result<TempFile> {
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let mut attempt = 0;
-        loop {
-            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-            let name = format!("{TEMP_PREFIX}{}-{n}-{nanos}", std::process::id());
-            let path = self.dir.join(name);
-            match File::options().write(true).create_new(true).open(&path) {
-                Ok(file) => {
-                    return Ok(TempFile {
-                        path,
-                        file: Some(file),
-                        keep: false,
-                    });
-                }
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists && attempt < 16 => {
-                    attempt += 1;
-                }
-                Err(e) => return Err(Error::io(path, e)),
+    /// Index of `hash`'s shard directory in [`Store::shards`].
+    fn shard_index(hash: &BlobHash) -> usize {
+        usize::from(hash.0.first().copied().unwrap_or(0))
+    }
+
+    /// The shard directory of `hash`.
+    fn shard_of(&self, hash: &BlobHash) -> PathBuf {
+        let dest = self.path_of(hash);
+        dest.parent().unwrap_or(&self.dir).to_path_buf()
+    }
+
+    /// The shard directory of `hash`, created if this handle has not seen it yet.
+    fn ensure_shard(&self, hash: &BlobHash) -> Result<PathBuf> {
+        let shard = self.shard_of(hash);
+        let seen = self.shards.get(Self::shard_index(hash));
+        if !seen.is_some_and(|s| s.load(Ordering::Acquire)) {
+            fs::create_dir_all(&shard).at(&shard)?;
+            if let Some(s) = seen {
+                s.store(true, Ordering::Release);
             }
         }
+        Ok(shard)
+    }
+
+    /// Forget that `hash`'s shard exists (a write found it missing) and create it again.
+    fn recreate_shard(&self, hash: &BlobHash) -> Result<PathBuf> {
+        if let Some(s) = self.shards.get(Self::shard_index(hash)) {
+            s.store(false, Ordering::Release);
+        }
+        self.ensure_shard(hash)
+    }
+
+    /// Create a new temp file in `hash`'s shard directory.
+    fn shard_temp_file(&self, hash: &BlobHash) -> Result<TempFile> {
+        let shard = self.ensure_shard(hash)?;
+        match temp_file_in(&shard) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                let shard = self.recreate_shard(hash)?;
+                temp_file_in(&shard).at(&shard)
+            }
+            other => other.at(&shard),
+        }
+    }
+
+    /// Create a new, uniquely named temp file directly under `objects/`.
+    fn temp_file(&self) -> Result<TempFile> {
+        temp_file_in(&self.dir).at(&self.dir)
     }
 
     /// Fsync `temp` and move it to `hash`'s object path; returns the stored size.
@@ -276,20 +335,36 @@ impl Store {
         file.sync_all().at(&temp_path)?;
         let len = file.metadata().at(&temp_path)?.len();
         temp.close();
+        let stored = self.install_with(&mut temp, len, hash, &mut rename)?;
+        if temp.keep {
+            sync_dir(&self.shard_of(hash));
+        }
+        Ok(stored)
+    }
 
+    /// Close the already fsynced `temp` (`len` bytes) and rename it to `hash`'s object path,
+    /// unless the object exists; returns the stored size. Sets `temp.keep` if it was renamed;
+    /// the caller then makes the rename durable with [`sync_dir`] on the shard.
+    fn install_with(
+        &self,
+        temp: &mut TempFile,
+        len: u64,
+        hash: &BlobHash,
+        rename: &mut impl FnMut(&Path, &Path) -> io::Result<()>,
+    ) -> Result<u64> {
+        temp.close();
         if let Some(existing) = self.stored_size(hash)? {
             return Ok(existing);
         }
         let dest = self.path_of(hash);
-        let shard = dest.parent().unwrap_or(&self.dir).to_path_buf();
-        fs::create_dir_all(&shard).at(&shard)?;
+        self.ensure_shard(hash)?;
 
         let mut attempt = 0u64;
+        let mut recreated = false;
         loop {
-            match rename(&temp_path, &dest) {
+            match rename(&temp.path, &dest) {
                 Ok(()) => {
                     temp.keep = true;
-                    sync_dir(&shard);
                     return Ok(len);
                 }
                 Err(e) => {
@@ -297,6 +372,13 @@ impl Store {
                     // file that is open); its object has the same content.
                     if let Some(existing) = self.stored_size(hash)? {
                         return Ok(existing);
+                    }
+                    // The shard was removed behind our back (a temp under `objects/` survives
+                    // that; one inside the shard did not, and the retry fails again).
+                    if e.kind() == io::ErrorKind::NotFound && !recreated {
+                        recreated = true;
+                        self.recreate_shard(hash)?;
+                        continue;
                     }
                     // Transient sharing violations on Windows (e.g. a virus scanner).
                     if e.kind() == io::ErrorKind::PermissionDenied && attempt < 5 {
@@ -309,6 +391,47 @@ impl Store {
             }
         }
     }
+}
+
+/// Create a new, uniquely named temp file in `dir`.
+///
+/// The name is a valid 8.3 name (`XXXXXXXX.TMP`), so NTFS volumes that create short names
+/// (usually the system volume) need not make one for it; that is a large part of the cost of
+/// creating a file there. The 32 random-looking bits come from the process id, a counter and
+/// the clock; a clash is retried.
+fn temp_file_in(dir: &Path) -> io::Result<TempFile> {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let seed = u64::from(std::process::id()).rotate_left(32) ^ (nanos as u64);
+    let mut attempt = 0;
+    loop {
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let name = format!("{:08X}{TEMP_EXT}", mix(seed ^ n) as u32);
+        let path = dir.join(name);
+        match File::options().write(true).create_new(true).open(&path) {
+            Ok(file) => {
+                return Ok(TempFile {
+                    path,
+                    file: Some(file),
+                    keep: false,
+                });
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists && attempt < 16 => {
+                attempt += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// splitmix64 finalizer: spreads `x` over all 64 bits.
+fn mix(mut x: u64) -> u64 {
+    x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^ (x >> 31)
 }
 
 /// Hash a file's bytes without storing it; returns the hash and size.

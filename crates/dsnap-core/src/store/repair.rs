@@ -56,7 +56,7 @@ impl Store {
         if actual != *hash {
             return Ok(RepairOutcome::SourceMismatch { actual });
         }
-        let temp = self.stage_bytes(bytes)?;
+        let (temp, _) = self.stage_bytes(bytes, hash)?;
         let stored_size = self.replace(temp, hash)?;
         Ok(RepairOutcome::Repaired { stored_size })
     }
@@ -116,8 +116,7 @@ impl Store {
         temp.close();
 
         let dest = self.path_of(hash);
-        let shard = dest.parent().unwrap_or(&self.dir).to_path_buf();
-        fs::create_dir_all(&shard).at(&shard)?;
+        let shard = self.ensure_shard(hash)?;
 
         let mut attempt = 0u64;
         loop {

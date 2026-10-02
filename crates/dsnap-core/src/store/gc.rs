@@ -10,7 +10,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use super::{Store, TEMP_PREFIX, remove_file_len};
+use super::{Store, is_temp_name, remove_file_len};
 use crate::error::{Error, IoResultExt, Result};
 use crate::types::BlobHash;
 
@@ -114,7 +114,7 @@ impl Store {
         Ok(bad)
     }
 
-    /// List objects (`ab/<62 hex>`) and temp files (`.tmp-*`, at any level).
+    /// List objects (`ab/<62 hex>`) and temp files (`XXXXXXXX.TMP` or legacy `.tmp-*`, at any level).
     fn scan(&self) -> Result<Vec<Item>> {
         let mut items = Vec::new();
         for entry in read_dir(&self.dir)? {
@@ -125,7 +125,7 @@ impl Store {
                         if fdir {
                             continue;
                         }
-                        if file.starts_with(TEMP_PREFIX) {
+                        if is_temp_name(&file) {
                             items.push(Item::Temp(fpath));
                         } else if file.len() == 62 && is_lower_hex(&file) {
                             if let Ok(hash) = format!("{name}{file}").parse() {
@@ -134,7 +134,7 @@ impl Store {
                         }
                     }
                 }
-            } else if name.starts_with(TEMP_PREFIX) {
+            } else if is_temp_name(&name) {
                 items.push(Item::Temp(path));
             }
         }
