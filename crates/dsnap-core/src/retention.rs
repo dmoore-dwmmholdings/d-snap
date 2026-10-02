@@ -17,7 +17,9 @@ use crate::db::PRUNE_BATCH;
 use crate::error::{Error, Result};
 use crate::facade::Dsnap;
 use crate::store::RepairOutcome;
-use crate::types::{BlobHash, EntryKind, ProjectId, RetentionReport, VersionId};
+use crate::types::{
+    BlobHash, EntryKind, ProjectId, RetentionReport, Version, VersionId, VersionKind,
+};
 use crate::versions::version_counts;
 
 /// Versions deleted per write transaction during retention, so the write lock is released
@@ -33,13 +35,31 @@ impl Dsnap {
     /// by another process meanwhile is kept. Blob files that cannot be deleted end the prune
     /// as a warning (`blobs_failed`), not an error.
     pub fn apply_retention(&self, project: ProjectId) -> Result<RetentionReport> {
+        self.apply_retention_protecting(project, &[])
+    }
+
+    /// [`Dsnap::apply_retention`], also keeping the versions in `protect`: they are treated
+    /// like pinned versions (never deleted, not counted toward `retention_keep`), checked
+    /// inside each delete transaction.
+    ///
+    /// Restore calls this once it has finished, protecting its target and its safety
+    /// version, so the version the user just restored to is not pruned by that run.
+    pub fn apply_retention_protecting(
+        &self,
+        project: ProjectId,
+        protect: &[VersionId],
+    ) -> Result<RetentionReport> {
         self.db.get_project(project)?;
         let keep = self.db.global_settings()?.retention_keep.max(1);
         let mut versions_deleted = 0u32;
         loop {
-            let n =
-                self.db
-                    .delete_unpinned_beyond(project, keep, RETENTION_BATCH, &version_counts)?;
+            let n = self.db.delete_unpinned_beyond(
+                project,
+                keep,
+                protect,
+                RETENTION_BATCH,
+                &version_counts,
+            )?;
             if n == 0 {
                 break;
             }
@@ -50,10 +70,19 @@ impl Dsnap {
         Ok(report)
     }
 
-    /// Hook for snapshot (Chain K): call after a new version is committed. Runs
-    /// [`Dsnap::apply_retention`] for `project`.
-    pub fn after_snapshot(&self, project: ProjectId) -> Result<RetentionReport> {
-        self.apply_retention(project)
+    /// Hook for snapshot (Chain K): call after `version` has committed. Runs
+    /// [`Dsnap::apply_retention`] for its project, except for a
+    /// [`VersionKind::Safety`] version, where it does nothing: a restore takes that snapshot
+    /// before writing, and retention then could delete the very version being restored
+    /// (Rule 1). Restore runs [`Dsnap::apply_retention_protecting`] itself once it is done.
+    ///
+    /// The version is already committed when this runs, so callers must treat an error as a
+    /// warning, never as a failed snapshot.
+    pub fn after_snapshot(&self, version: &Version) -> Result<RetentionReport> {
+        if version.kind == VersionKind::Safety {
+            return Ok(RetentionReport::default());
+        }
+        self.apply_retention(version.project_id)
     }
 
     /// Manual full prune: delete blobs no version references by calling

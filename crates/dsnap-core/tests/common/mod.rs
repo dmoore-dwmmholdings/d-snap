@@ -26,6 +26,16 @@ impl Cli {
     /// Commit a version holding exactly `files` (path, content), with counts against the
     /// project's latest version.
     pub fn commit(&self, project: ProjectId, files: &[(&str, &[u8])]) -> Version {
+        self.commit_kind(project, VersionKind::Cli, files)
+    }
+
+    /// [`Cli::commit`] with a given version kind.
+    pub fn commit_kind(
+        &self,
+        project: ProjectId,
+        kind: VersionKind,
+        files: &[(&str, &[u8])],
+    ) -> Version {
         let mut entries = Vec::new();
         let mut new_blobs = Vec::new();
         for (path, content) in files {
@@ -51,7 +61,7 @@ impl Cli {
                     project_id: project,
                     label: "v".into(),
                     created_at_ms: 0,
-                    kind: VersionKind::Cli,
+                    kind,
                     unstable: false,
                     counts: version_counts(&prev, &entries),
                     entries,

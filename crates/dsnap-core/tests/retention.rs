@@ -138,12 +138,67 @@ fn after_snapshot_hook_applies_retention() {
     let (_h, _d, ds, cli, p) = setup();
     set_keep(&ds, 1);
     cli.commit_one(p, b"a");
-    cli.commit_one(p, b"b");
-    assert_eq!(ds.after_snapshot(p).unwrap().versions_deleted, 1);
+    let v = cli.commit(p, &[("f", b"b")]);
+    assert_eq!(ds.after_snapshot(&v).unwrap().versions_deleted, 1);
     assert!(matches!(
         ds.apply_retention(ProjectId(999)),
         Err(Error::NotFound(_))
     ));
+}
+
+/// Review round 1 (Rule 1): a restore's safety snapshot must not let retention delete the
+/// version being restored. With N unpinned versions and keep = N, restoring to the oldest
+/// commits a safety version; `after_snapshot` skips it, and the restore's own retention run
+/// protects the target.
+#[test]
+fn safety_snapshot_never_prunes_the_restore_target() {
+    let (_h, _d, ds, cli, p) = setup();
+    const N: u32 = 5;
+    set_keep(&ds, N);
+    let target = cli.commit(p, &[("f", b"target only")]);
+    for i in 1..N {
+        cli.commit(p, &[("f", format!("v{i}").as_bytes())]);
+    }
+    let target_blob = hash_bytes(b"target only");
+
+    let safety = cli.commit_kind(p, dsnap_core::VersionKind::Safety, &[("f", b"now")]);
+    assert_eq!(
+        ds.after_snapshot(&safety).unwrap(),
+        RetentionReport::default()
+    );
+    assert!(ds.version(target.id).is_ok());
+    assert_eq!(ds.read_blob(&target_blob).unwrap(), b"target only");
+
+    // Restore finished: its retention run protects the target and the safety version.
+    let r = ds
+        .apply_retention_protecting(p, &[target.id, safety.id])
+        .unwrap();
+    assert_eq!(r.versions_deleted, 0);
+    assert!(ds.version(target.id).is_ok());
+    assert_eq!(ds.read_blob(&target_blob).unwrap(), b"target only");
+
+    // Protection lasts only for that call; a later plain run applies the policy.
+    let r = ds.apply_retention(p).unwrap();
+    assert_eq!(r.versions_deleted, 1);
+    assert!(ds.version(target.id).is_err());
+    assert!(ds.read_blob(&target_blob).is_err());
+    assert_counts_consistent(&cli, p);
+}
+
+/// Protected versions do not count toward N: the newest N others are still kept.
+#[test]
+fn protected_versions_are_kept_beyond_n() {
+    let (_h, _d, ds, cli, p) = setup();
+    set_keep(&ds, 2);
+    let ids: Vec<_> = (0..5)
+        .map(|i| cli.commit(p, &[("f", format!("p{i}").as_bytes())]).id)
+        .collect();
+    let r = ds.apply_retention_protecting(p, &[ids[0], ids[3]]).unwrap();
+    assert_eq!(r.versions_deleted, 1);
+    let mut kept: Vec<_> = ds.list_versions(p).unwrap().iter().map(|v| v.id).collect();
+    kept.sort();
+    assert_eq!(kept, [ids[0], ids[2], ids[3], ids[4]]);
+    assert_counts_consistent(&cli, p);
 }
 
 /// A blob an in-flight snapshot has stored but not yet committed (no `blobs` row) is not

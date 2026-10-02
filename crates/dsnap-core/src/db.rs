@@ -365,33 +365,37 @@ impl Db {
 
     /// Retention step: delete up to `limit` of a project's oldest unpinned versions beyond
     /// the newest `keep` unpinned ones, recomputing successor counts like
-    /// [`Db::delete_versions`]. The candidates are chosen inside the same `BEGIN IMMEDIATE`
-    /// transaction, so a version pinned or added by another process meanwhile is honored.
-    /// Returns the number deleted; call again until it returns 0.
+    /// [`Db::delete_versions`]. Versions in `protect` are treated like pinned ones: never
+    /// deleted and not counted toward `keep`. The candidates are chosen inside the same
+    /// `BEGIN IMMEDIATE` transaction, so a version pinned or added by another process
+    /// meanwhile is honored. Returns the number deleted; call again until it returns 0.
     pub fn delete_unpinned_beyond(
         &self,
         project: ProjectId,
         keep: u32,
+        protect: &[VersionId],
         limit: usize,
         recount: &Recount<'_>,
     ) -> Result<u32> {
-        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let keep = usize::try_from(keep).unwrap_or(usize::MAX);
         self.write(|tx| {
             let ids = {
                 let mut stmt = tx.prepare_cached(
                     "SELECT id FROM versions WHERE project_id = ?1 AND pinned = 0
-                     ORDER BY id DESC LIMIT -1 OFFSET ?2",
+                     ORDER BY id DESC",
                 )?;
-                stmt.query_map(params![project.0, keep], |r| r.get::<_, i64>(0))?
+                stmt.query_map([project.0], |r| r.get::<_, i64>(0))?
                     .collect::<rusqlite::Result<Vec<_>>>()?
             };
-            // Oldest first, at most `limit`.
-            let ids: Vec<VersionId> = ids
+            // Newest first: skip protected ones and the newest `keep`; delete oldest first.
+            let mut ids: Vec<VersionId> = ids
                 .into_iter()
-                .rev()
-                .take(usize::try_from(limit).unwrap_or(usize::MAX))
                 .map(VersionId)
+                .filter(|id| !protect.contains(id))
+                .skip(keep)
                 .collect();
+            ids.reverse();
+            ids.truncate(limit);
             delete_versions_tx(tx, &ids, recount)
         })
     }
