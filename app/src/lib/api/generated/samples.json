@@ -153,7 +153,11 @@
       "oldStart": 1
     }
   ],
-  "LineTag": ["equal", "insert", "delete"],
+  "LineTag": [
+    "equal",
+    "insert",
+    "delete"
+  ],
   "Progress": [
     {
       "done": 0,
@@ -165,8 +169,17 @@
       "total": null
     }
   ],
-  "ProgressOp": ["snapshot", "restore"],
-  "ProgressPhase": ["queued", "walk", "hash", "restore", "done"],
+  "ProgressOp": [
+    "snapshot",
+    "restore"
+  ],
+  "ProgressPhase": [
+    "queued",
+    "walk",
+    "hash",
+    "restore",
+    "done"
+  ],
   "Project": [
     {
       "id": 1,
@@ -203,13 +216,20 @@
       "delete": [],
       "target": 2,
       "uncaptured": [],
-      "write": ["a"]
+      "write": [
+        "a"
+      ]
     }
   ],
   "RestoreReport": [
     {
       "deleted": [],
-      "failed": [["a", "locked"]],
+      "failed": [
+        [
+          "a",
+          "locked"
+        ]
+      ],
       "safetyVersion": 3,
       "uncaptured": [],
       "written": []
@@ -242,7 +262,9 @@
   "SnapshotReport": [
     {
       "skipped": [],
-      "unstablePaths": ["log"],
+      "unstablePaths": [
+        "log"
+      ],
       "version": {
         "counts": {
           "added": 1,
@@ -275,7 +297,12 @@
       "unstable": false
     }
   ],
-  "VersionKind": ["manual", "auto", "cli", "safety"],
+  "VersionKind": [
+    "manual",
+    "auto",
+    "cli",
+    "safety"
+  ],
   "VersionRef": [
     {
       "id": 2,
