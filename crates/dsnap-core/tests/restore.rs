@@ -295,6 +295,23 @@ fn project_round_trip_is_byte_identical() {
 }
 
 #[test]
+fn read_only_file_added_since_is_deleted() {
+    let fx = FixtureProject::new().file("a.txt", "a").build();
+    let env = Env::new(fx.root());
+    let v1 = v(&env, "v1");
+    let added = fx.path("ro-added.txt");
+    fs::write(&added, "added").unwrap();
+    let mut perms = fs::metadata(&added).unwrap().permissions();
+    perms.set_readonly(true);
+    fs::set_permissions(&added, perms).unwrap();
+
+    let r = env.dsnap.restore_project(env.project, v1).unwrap();
+    assert!(r.failed.is_empty(), "{:?}", r.failed);
+    assert_eq!(strs(&r.deleted), ["ro-added.txt"]);
+    assert!(!added.exists());
+}
+
+#[test]
 fn restore_replaces_a_file_with_a_directory_and_back() {
     let fx = FixtureProject::new().file("x/inner.txt", "inner").build();
     let env = Env::new(fx.root());
