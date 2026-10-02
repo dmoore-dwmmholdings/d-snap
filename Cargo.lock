@@ -1039,7 +1039,10 @@ dependencies = [
  "clap",
  "dsnap-core",
  "dsnap-test-support",
+ "serde",
+ "serde_json",
  "tempfile",
+ "time",
 ]
 
 [[package]]
