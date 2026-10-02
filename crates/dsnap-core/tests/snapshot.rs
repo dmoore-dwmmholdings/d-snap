@@ -16,7 +16,7 @@ use dsnap_core::{
 };
 use dsnap_test_support::{FixtureProject, TestHome, tree_bytes, tree_dirs};
 
-use project::{Env, rp, snap, versions};
+use project::{Env, rp, snap, store_files, versions};
 
 /// Every file of the latest version, read back from the store.
 fn stored_bytes(env: &Env) -> BTreeMap<RelPath, Vec<u8>> {
@@ -216,6 +216,9 @@ fn cancel_before_commit_leaves_no_version() {
         .unwrap_err();
     assert!(matches!(err, Error::Cancelled), "{err}");
     assert_eq!(versions(&env), 0);
+    // The last hash event comes after the batch was committed: its blobs stay in the store
+    // unreferenced (removed by the next prune), but no temp file is left behind.
+    assert_eq!(temp_files(&env), 0);
 
     // A later snapshot still works.
     assert!(snap(&env, None).version.is_some());
@@ -419,4 +422,55 @@ fn safety_snapshot_does_not_run_retention() {
         .version
         .unwrap();
     assert_eq!(versions(&env), 3);
+}
+
+/// Temp files left in the store (`XXXXXXXX.TMP` in a shard, or legacy `.tmp-*`).
+fn temp_files(env: &Env) -> usize {
+    let mut n = 0;
+    let mut dirs = vec![env.dsnap.home().objects_dir()];
+    while let Some(d) = dirs.pop() {
+        for e in fs::read_dir(d).unwrap().flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if e.file_type().unwrap().is_dir() {
+                dirs.push(e.path());
+            } else if name.starts_with(".tmp-") || name.ends_with(".TMP") {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+/// DSNA-110: a snapshot cancelled while files are being stored commits nothing; the store
+/// batch is dropped with its temp files, so neither blobs nor temp files are left.
+#[test]
+fn cancel_while_storing_leaves_no_blobs_or_temp_files() {
+    let mut fx = FixtureProject::new();
+    for i in 0..200 {
+        fx = fx.file(&format!("f{i:03}.txt"), format!("content {i}"));
+    }
+    let fx = fx.build();
+    let env = Env::new(fx.root());
+    let cancel = CancelToken::new();
+    let c = cancel.clone();
+    // The first hash event comes after 32 of 200 files: cancel mid-way.
+    let progress = Progress::new(move |e| {
+        if e.stage == Stage::Hash && e.total.is_some_and(|t| e.done < t) {
+            c.cancel();
+        }
+    });
+    let err = env
+        .dsnap
+        .snapshot(
+            env.project,
+            SnapshotOptions {
+                cancel: Some(cancel),
+                progress: Some(progress),
+                ..SnapshotOptions::default()
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(err, Error::Cancelled), "{err}");
+    assert_eq!(versions(&env), 0);
+    assert_eq!(store_files(&env), 0, "no blobs or temp files left");
 }

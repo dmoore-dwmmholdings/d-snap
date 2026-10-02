@@ -32,7 +32,13 @@ fn snapshot_10k_files_with_49_changes_under_1s_and_status_under_500ms() {
 
     let t = Instant::now();
     let first = snap(&env, None).version.unwrap();
-    eprintln!("first snapshot ({FILES} files): {:?}", t.elapsed());
+    let first_time = t.elapsed();
+    eprintln!("first snapshot ({FILES} files): {first_time:?}");
+    // DSNA-110: new blobs go through one store batch.
+    assert!(
+        first_time < Duration::from_secs(15),
+        "first snapshot of {FILES} files took {first_time:?}"
+    );
     assert_eq!(first.counts.added as usize, FILES);
 
     let mut snaps = Vec::new();

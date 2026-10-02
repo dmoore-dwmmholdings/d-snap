@@ -207,9 +207,13 @@ impl Dsnap {
             }
         }
 
-        let store = &self.store;
+        // New blobs are written through one batch (DSNA-110): fsyncs are deferred and done
+        // in rounds, which is far faster on Windows than one fsync per file. A blob is
+        // referenced only after `batch.commit()` below returned `Ok` (Rule 1, DSNA-80);
+        // returning early drops the batch and removes its temp files.
+        let batch = self.store.batch();
         let read_store = |abs: &Path| {
-            store.put_file(abs).map(|info| Read {
+            batch.put_file(abs).map(|info| Read {
                 hash: info.hash,
                 size: info.size,
                 stored: Some(info),
@@ -309,6 +313,9 @@ impl Dsnap {
             EntryDiffOptions::default().case_insensitive,
         );
 
+        if mode == Mode::Store {
+            batch.commit()?;
+        }
         let mut new_blobs: Vec<BlobInfo> = new_blobs.into_values().collect();
         new_blobs.sort_by_key(|b| b.hash);
         Ok(Capture {
