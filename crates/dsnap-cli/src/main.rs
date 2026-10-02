@@ -2,6 +2,7 @@
 //!
 //! Exit codes: 0 ok (including "no changes"), 1 error, 2 usage, 3 partial restore.
 
+mod hook;
 mod output;
 
 use std::io::{self, BufRead, IsTerminal, Write};
@@ -45,6 +46,10 @@ enum Cmd {
         /// Print nothing on success.
         #[arg(short, long)]
         quiet: bool,
+        /// Hook mode for Claude Code: ignore stdin, never prompt, always exit 0 (problems
+        /// go to stderr and the hook log).
+        #[arg(long)]
+        hook: bool,
     },
     /// List versions, newest first.
     List {
@@ -99,11 +104,22 @@ enum Cmd {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Claude Code hooks.
+    Hooks {
+        #[command(subcommand)]
+        cmd: HooksCmd,
+    },
     /// Manage tracked projects (default: list).
     Projects {
         #[command(subcommand)]
         cmd: Option<ProjectsCmd>,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum HooksCmd {
+    /// Print the hooks JSON for Claude Code settings (snapshot before and after each turn).
+    Print,
 }
 
 #[derive(Debug, Subcommand)]
@@ -152,6 +168,16 @@ const EXIT_PARTIAL: u8 = 3;
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    if let Cmd::Snap {
+        path,
+        label,
+        hook: true,
+        ..
+    } = &cli.cmd
+    {
+        hook::snap(cli.home.clone(), path, label.clone());
+        return ExitCode::SUCCESS;
+    }
     match run(cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => match e.downcast_ref::<Exit>() {
@@ -171,7 +197,15 @@ fn run(cli: Cli) -> Result<()> {
         style: Style::detect(),
     };
     match cli.cmd {
-        Cmd::Snap { path, label, quiet } => snap(&dsnap, &out, &path, label, quiet),
+        Cmd::Snap {
+            path, label, quiet, ..
+        } => snap(&dsnap, &out, &path, label, quiet),
+        Cmd::Hooks {
+            cmd: HooksCmd::Print,
+        } => {
+            print!("{}", hook::snippet());
+            Ok(())
+        }
         Cmd::List { path, limit } => {
             let p = find_project(&dsnap, &path)?;
             let mut versions = dsnap.list_versions(p.id)?;
@@ -434,7 +468,7 @@ fn find_project(dsnap: &Dsnap, path: &Path) -> Result<Project> {
 }
 
 /// The tracked project whose folder is `path` or contains it (the innermost one).
-fn try_find_project(dsnap: &Dsnap, path: &Path) -> Result<Option<Project>> {
+pub(crate) fn try_find_project(dsnap: &Dsnap, path: &Path) -> Result<Option<Project>> {
     let target = key(&normalize_root(path)?);
     Ok(dsnap
         .list_projects()?
