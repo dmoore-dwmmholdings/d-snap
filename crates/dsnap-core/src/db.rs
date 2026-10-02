@@ -72,6 +72,10 @@ use codec::{
 /// well under the 5 s busy timeout other processes wait for.
 pub const REMOVE_BATCH_BUDGET: Duration = Duration::from_millis(250);
 
+/// Pause between project-removal batches, so a writer waiting in SQLite's busy handler
+/// (which polls at most every 100 ms) gets the lock before the next batch takes it.
+const REMOVE_BATCH_PAUSE: Duration = Duration::from_millis(100);
+
 /// Blobs deleted per [`Db::prune_unreferenced`] call when pruning everything in batches.
 ///
 /// Small enough that one batch (one store file delete per blob) finishes well inside the
@@ -352,6 +356,7 @@ impl Db {
             if !more {
                 break;
             }
+            std::thread::sleep(REMOVE_BATCH_PAUSE);
         }
         let t = Instant::now();
         self.write(|tx| {

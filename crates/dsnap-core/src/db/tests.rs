@@ -1062,19 +1062,46 @@ fn perf_insert_version_stays_flat_over_200_versions() {
     );
     assert_refs_exact(&db);
 
-    // DSNA-111: removing the project runs in short transactions.
+    // DSNA-111: removing the project runs in short transactions. What matters is how long
+    // another process waits for the write lock, so a second connection keeps taking it
+    // (like a snapshot would) and records its longest wait. A transaction's own time also
+    // includes the WAL auto-checkpoint after COMMIT, which runs after the lock is released.
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let stop = Arc::new(AtomicBool::new(false));
+    let probe = {
+        let stop = Arc::clone(&stop);
+        let path = path.clone();
+        thread::spawn(move || {
+            let mut conn = rusqlite::Connection::open(&path).unwrap();
+            conn.busy_timeout(schema::BUSY_TIMEOUT).unwrap();
+            let mut longest = std::time::Duration::ZERO;
+            while !stop.load(Ordering::Relaxed) {
+                let t = Instant::now();
+                let tx = conn
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .expect("probe got SQLITE_BUSY: removal held the lock past the timeout");
+                longest = longest.max(t.elapsed());
+                tx.commit().unwrap();
+                thread::sleep(std::time::Duration::from_millis(20));
+            }
+            longest
+        })
+    };
     let t = Instant::now();
     let txs = db.delete_project_timed(p, REMOVE_BATCH_BUDGET).unwrap();
-    let longest = txs.iter().max().copied().unwrap_or_default();
+    let total = t.elapsed();
+    stop.store(true, Ordering::Relaxed);
+    let waited = probe.join().unwrap();
     eprintln!(
-        "delete_project with {} versions: {:?} in {} transactions, longest {longest:?}",
+        "delete_project with {} versions: {total:?} in {} transactions {txs:?}; \
+         longest wait of another writer {waited:?}",
         VERSIONS - 1,
-        t.elapsed(),
         txs.len()
     );
     assert!(
-        longest <= std::time::Duration::from_secs(1),
-        "a project-removal transaction took {longest:?}"
+        waited <= std::time::Duration::from_secs(1),
+        "another writer waited {waited:?} for the lock during project removal"
     );
     assert!(db.referenced_hashes().unwrap().is_empty());
     assert_refs_exact(&db);
