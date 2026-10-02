@@ -147,10 +147,20 @@ impl Db {
     /// `COMMIT` itself can fail with `SQLITE_BUSY` in WAL mode (seen on Windows while another
     /// connection checkpoints), and that path does not wait on the busy handler. The
     /// transaction stays open after such a failure, so the commit is retried within the busy
-    /// timeout and rolled back only if it still fails (DSNA-112).
+    /// timeout and rolled back only if it still fails (DSNA-112). `BEGIN IMMEDIATE` can fail
+    /// the same way without waiting (seen on windows-latest CI), so it is retried too.
     fn write<T>(&self, f: impl FnOnce(&Transaction<'_>) -> Result<T>) -> Result<T> {
         let mut conn = self.conn();
-        let mut tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let start = std::time::Instant::now();
+        let mut tx = loop {
+            match conn.transaction_with_behavior(TransactionBehavior::Immediate) {
+                Ok(tx) => break tx,
+                Err(e) if schema::is_busy(&e) && start.elapsed() < schema::BUSY_TIMEOUT => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(e) => return Err(e.into()),
+            }
+        };
         let out = f(&tx)?; // an error drops `tx`, which rolls back
         tx.set_drop_behavior(rusqlite::DropBehavior::Ignore);
         commit_with_retry(&tx)?;
