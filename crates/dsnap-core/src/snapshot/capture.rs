@@ -559,7 +559,7 @@ fn read_retrying(
 
 /// A sharing or lock violation: another process holds the file open.
 #[cfg(windows)]
-fn is_locked(e: &io::Error) -> bool {
+pub(crate) fn is_locked(e: &io::Error) -> bool {
     const ERROR_SHARING_VIOLATION: i32 = 32;
     const ERROR_LOCK_VIOLATION: i32 = 33;
     matches!(
@@ -569,7 +569,7 @@ fn is_locked(e: &io::Error) -> bool {
 }
 
 #[cfg(not(windows))]
-fn is_locked(_e: &io::Error) -> bool {
+pub(crate) fn is_locked(_e: &io::Error) -> bool {
     false
 }
 

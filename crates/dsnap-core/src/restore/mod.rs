@@ -4,6 +4,8 @@
 //! ([`crate::Error::SafetySnapshotFailed`]).
 #![allow(unused_variables)] // stub signatures; remove when implemented
 
+mod write;
+
 use crate::error::Result;
 use crate::facade::Dsnap;
 use crate::types::{Hunk, ProjectId, RelPath, RestorePlan, RestoreReport, VersionId};

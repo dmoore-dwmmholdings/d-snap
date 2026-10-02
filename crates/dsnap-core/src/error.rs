@@ -49,6 +49,13 @@ pub enum Error {
     /// write lock for longer than the busy timeout. Nothing was committed; retry later.
     #[error("another D-Snap operation holds the database; try again")]
     Busy,
+    /// A file is locked by another program (sharing violation), so it could not be written
+    /// or replaced. Nothing was changed at that path.
+    #[error("{} is locked by another program", path.display())]
+    Locked {
+        /// The locked file.
+        path: PathBuf,
+    },
     /// Stored data is inconsistent (bad blob, hash mismatch, malformed row).
     #[error("corrupt data: {0}")]
     Corrupt(String),
