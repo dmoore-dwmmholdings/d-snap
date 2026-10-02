@@ -1,16 +1,13 @@
 //! Writing one entry into the project folder (DSNA-56).
 //!
-//! A file is never written in place. Its blob is streamed to a temp file in the target's
-//! own directory (same volume), fsynced, given the recorded mtime, and then moved over the
-//! target with one atomic rename (`MoveFileExW(MOVEFILE_REPLACE_EXISTING)` on Windows). The
-//! target therefore always holds either its old or its new content. A temp file is removed
-//! on every error path.
+//! A file is never written in place. Its blob is first staged: streamed to a temp file on
+//! the same volume, fsynced and given the recorded mtime ([`stage`]). [`Staged::place`] then
+//! moves it over the target with one atomic rename (`MoveFileExW(MOVEFILE_REPLACE_EXISTING)`
+//! on Windows), so the target always holds either its old or its new content. A temp file is
+//! removed on every error path.
 //!
 //! The workspace forbids `unsafe`, so `ReplaceFileW` (which keeps the replaced file's ACL)
 //! is not used; a restored file gets the default security of its directory.
-
-// Used by the restore engine (DSNA-57); until then only tests call it.
-#![cfg_attr(not(test), allow(dead_code))]
 
 use std::fs::{self, File};
 use std::io;
@@ -29,8 +26,8 @@ pub(crate) const TEMP_PREFIX: &str = ".dsnap-restore-";
 
 /// Write `entry` (relative to `root`) from `store`, replacing what is there.
 ///
-/// - File: atomic replace (see the module docs), then mtime and read-only as recorded. An
-///   existing read-only target is made writable first.
+/// - File: staged in the target's directory, then placed (see the module docs) with the
+///   recorded mtime and read-only flag. An existing read-only target is made writable first.
 /// - Directory: created with its parents.
 /// - Symlink: recreated (a directory link if the target is a directory; on Windows a
 ///   junction when symlinks need privileges and the target is an absolute directory).
@@ -40,35 +37,60 @@ pub(crate) const TEMP_PREFIX: &str = ".dsnap-restore-";
 /// Errors: [`Error::Locked`] if another program holds the target open, [`Error::Io`] for
 /// other filesystem errors, [`Error::Corrupt`] for a file entry without a blob, and store
 /// errors if the blob cannot be read.
+#[cfg_attr(not(test), allow(dead_code))] // the engine stages first; kept for single writes
 pub(crate) fn write_entry(root: &Path, entry: &Entry, store: &Store) -> Result<()> {
     let target = entry.path.to_path(root);
     match &entry.kind {
-        EntryKind::Dir => match fs::symlink_metadata(&target) {
-            Ok(m) if m.is_dir() => Ok(()),
-            Ok(_) => Err(Error::InvalidInput(format!(
-                "{} exists and is not a directory",
-                target.display()
-            ))),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                fs::create_dir_all(&target).at(&target)
-            }
-            Err(e) => Err(Error::io(&target, e)),
-        },
-        EntryKind::File => write_file(&target, entry, store),
+        EntryKind::Dir => create_dir(&target),
+        EntryKind::File => {
+            let dir = parent(&target)?;
+            refuse_dir(&target)?;
+            fs::create_dir_all(dir).at(dir)?;
+            stage(dir, entry, store)?.place(&target, entry)
+        }
         EntryKind::Symlink { target: link } => write_symlink(&target, link),
     }
 }
 
-/// Removes the temp file unless the write completed.
-struct TempGuard {
-    path: PathBuf,
-    armed: bool,
+/// Create the directory `path` with its parents; an existing directory is fine.
+pub(crate) fn create_dir(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(m) if m.is_dir() => Ok(()),
+        Ok(_) => Err(Error::InvalidInput(format!(
+            "{} exists and is not a directory",
+            path.display()
+        ))),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => fs::create_dir_all(path).at(path),
+        Err(e) => Err(Error::io(path, e)),
+    }
 }
 
-impl Drop for TempGuard {
+fn parent(path: &Path) -> Result<&Path> {
+    path.parent()
+        .ok_or_else(|| Error::InvalidInput(format!("{} has no parent", path.display())))
+}
+
+fn refuse_dir(target: &Path) -> Result<()> {
+    if fs::symlink_metadata(target).is_ok_and(|m| m.is_dir()) {
+        return Err(Error::InvalidInput(format!(
+            "{} is a directory; refusing to replace it with a file",
+            target.display()
+        )));
+    }
+    Ok(())
+}
+
+/// A file's content, fsynced in a temp file and ready to be placed. Dropping it removes the
+/// temp file.
+#[derive(Debug)]
+pub(crate) struct Staged {
+    temp: PathBuf,
+}
+
+impl Drop for Staged {
     fn drop(&mut self) {
-        if self.armed {
-            let _ = fs::remove_file(&self.path);
+        if !self.temp.as_os_str().is_empty() {
+            let _ = fs::remove_file(&self.temp);
         }
     }
 }
@@ -79,61 +101,65 @@ fn temp_path(dir: &Path) -> PathBuf {
     dir.join(format!("{TEMP_PREFIX}{}-{n}.tmp", std::process::id()))
 }
 
-fn write_file(target: &Path, entry: &Entry, store: &Store) -> Result<()> {
+/// Copy `entry`'s blob into a new temp file in `dir` (which must exist), fsync it and set
+/// the recorded mtime. Fails if the blob is missing or unreadable.
+pub(crate) fn stage(dir: &Path, entry: &Entry, store: &Store) -> Result<Staged> {
     let hash = entry
         .blob
         .ok_or_else(|| Error::Corrupt(format!("file entry {} has no blob", entry.path)))?;
-    let dir = target
-        .parent()
-        .ok_or_else(|| Error::InvalidInput(format!("{} has no parent", target.display())))?;
-    let existing = match fs::symlink_metadata(target) {
-        Ok(m) => Some(m),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
-        Err(e) => return Err(Error::io(target, e)),
-    };
-    if existing.as_ref().is_some_and(fs::Metadata::is_dir) {
-        return Err(Error::InvalidInput(format!(
-            "{} is a directory; refusing to replace it with a file",
-            target.display()
-        )));
-    }
-    fs::create_dir_all(dir).at(dir)?;
-
     let temp = temp_path(dir);
-    let mut guard = TempGuard {
-        path: temp.clone(),
-        armed: true,
-    };
-    {
-        let mut file = File::options()
-            .write(true)
-            .create_new(true)
-            .open(&temp)
-            .at(&temp)?;
-        store.copy_to(&hash, &mut file)?;
-        file.sync_all().at(&temp)?;
-    }
-    filetime::set_file_mtime(&temp, mtime(entry.mtime_ns)).at(&temp)?;
+    let mut file = File::options()
+        .write(true)
+        .create_new(true)
+        .open(&temp)
+        .at(&temp)?;
+    let staged = Staged { temp };
+    store.copy_to(&hash, &mut file)?;
+    file.sync_all().at(&staged.temp)?;
+    drop(file);
+    filetime::set_file_mtime(&staged.temp, mtime(entry.mtime_ns)).at(&staged.temp)?;
+    Ok(staged)
+}
 
-    let was_readonly = existing
-        .as_ref()
-        .is_some_and(|m| m.is_file() && m.permissions().readonly());
-    if was_readonly {
-        set_readonly(target, false)?;
-    }
-    if let Err(e) = fs::rename(&temp, target) {
-        if was_readonly {
-            // Leave the untouched target as it was.
-            let _ = set_readonly(target, true);
+impl Staged {
+    /// Move the staged content over `target` (whose directory must exist) and apply
+    /// `entry.readonly`. Refuses to replace a directory.
+    ///
+    /// A temp file on another volume (a mount point inside the project) cannot be renamed;
+    /// that fails with [`Error::Io`] and the target is untouched.
+    pub(crate) fn place(mut self, target: &Path, entry: &Entry) -> Result<()> {
+        let existing = match fs::symlink_metadata(target) {
+            Ok(m) => Some(m),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Err(e) => return Err(Error::io(target, e)),
+        };
+        if existing.as_ref().is_some_and(fs::Metadata::is_dir) {
+            return Err(Error::InvalidInput(format!(
+                "{} is a directory; refusing to replace it with a file",
+                target.display()
+            )));
         }
-        return Err(locked_or_io(target, e));
+        let was_readonly = existing
+            .as_ref()
+            .is_some_and(|m| m.is_file() && m.permissions().readonly());
+        if was_readonly {
+            set_readonly(target, false)?;
+        }
+        if let Err(e) = fs::rename(&self.temp, target) {
+            if was_readonly {
+                // Leave the untouched target as it was.
+                let _ = set_readonly(target, true);
+            }
+            return Err(locked_or_io(target, e));
+        }
+        // Disarm: the temp name no longer exists.
+        self.temp = PathBuf::new();
+        sync_dir(parent(target)?);
+        if entry.readonly {
+            set_readonly(target, true)?;
+        }
+        Ok(())
     }
-    guard.armed = false;
-    sync_dir(dir);
-    if entry.readonly {
-        set_readonly(target, true)?;
-    }
-    Ok(())
 }
 
 /// Make the rename durable. Best effort: the content itself is already fsynced.
@@ -146,26 +172,38 @@ fn sync_dir(dir: &Path) {
     let _ = dir; // NTFS journals the rename; directories cannot be opened for fsync here.
 }
 
-/// Map a failed replace of `target` to [`Error::Locked`] when another program holds it.
+/// Map a failed replace or delete of `target` to [`Error::Locked`] when another program
+/// holds it.
 ///
 /// Replacing a file that is open without delete sharing fails with "access denied" on
-/// Windows rather than a sharing violation, so that case is confirmed by opening the file.
-fn locked_or_io(target: &Path, e: io::Error) -> Error {
+/// Windows rather than a sharing violation, so that case is confirmed by opening the file
+/// for delete access, which such a holder refuses with a sharing violation.
+pub(crate) fn locked_or_io(target: &Path, e: io::Error) -> Error {
+    let locked = Error::Locked {
+        path: target.to_path_buf(),
+    };
     if is_locked(&e) {
-        return Error::Locked {
-            path: target.to_path_buf(),
-        };
+        return locked;
     }
-    if e.kind() == io::ErrorKind::PermissionDenied {
-        if let Err(open) = File::open(target) {
-            if is_locked(&open) {
-                return Error::Locked {
-                    path: target.to_path_buf(),
-                };
-            }
-        }
+    if e.kind() == io::ErrorKind::PermissionDenied && held_open(target) {
+        return locked;
     }
     Error::io(target, e)
+}
+
+#[cfg(windows)]
+fn held_open(target: &Path) -> bool {
+    use std::os::windows::fs::OpenOptionsExt;
+    const DELETE: u32 = 0x0001_0000;
+    File::options()
+        .access_mode(DELETE)
+        .open(target)
+        .is_err_and(|e| is_locked(&e))
+}
+
+#[cfg(not(windows))]
+fn held_open(_target: &Path) -> bool {
+    false
 }
 
 fn set_readonly(path: &Path, readonly: bool) -> Result<()> {
@@ -185,7 +223,7 @@ fn mtime(ns: i64) -> FileTime {
     FileTime::from_unix_time(secs, nanos)
 }
 
-fn write_symlink(path: &Path, link: &str) -> Result<()> {
+pub(crate) fn write_symlink(path: &Path, link: &str) -> Result<()> {
     let dir = path
         .parent()
         .ok_or_else(|| Error::InvalidInput(format!("{} has no parent", path.display())))?;

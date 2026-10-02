@@ -698,6 +698,12 @@ pub struct RestorePlan {
     pub delete: Vec<RelPath>,
     /// Directories to recreate.
     pub create_dirs: Vec<RelPath>,
+    /// Paths the restore would change but leaves alone, because that could replace or
+    /// remove content no snapshot holds (Rule 1, F20, DSNA-87). A path is uncaptured when
+    /// it is ignored now; or the folder holds it but a snapshot cannot (over the size cap,
+    /// locked, unreadable, kept changing); or such a path is its ancestor; or, for a path to
+    /// be written as a file, its descendant. The confirm dialog lists them.
+    pub uncaptured: Vec<RelPath>,
 }
 
 /// Outcome of a restore.
@@ -712,6 +718,9 @@ pub struct RestoreReport {
     pub deleted: Vec<RelPath>,
     /// Paths that could not be written or removed, with the error.
     pub failed: Vec<(RelPath, String)>,
+    /// Paths left untouched because no snapshot holds their current content (see
+    /// [`RestorePlan::uncaptured`]); also paths that changed after the safety snapshot.
+    pub uncaptured: Vec<RelPath>,
 }
 
 /// Outcome of applying retention to a project.
@@ -1164,12 +1173,14 @@ mod tests {
             write: vec![rp("a")],
             delete: vec![rp("b")],
             create_dirs: vec![rp("c")],
+            uncaptured: vec![rp("big.bin")],
         });
         round_trip(&RestoreReport {
             safety_version: VersionId(9),
             written: vec![rp("a")],
             deleted: vec![],
             failed: vec![(rp("locked.txt"), "in use".into())],
+            uncaptured: vec![rp("node_modules/x")],
         });
         round_trip(&RetentionReport::default());
         round_trip(&BlobInfo {
