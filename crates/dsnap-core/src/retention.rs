@@ -118,6 +118,8 @@ impl Dsnap {
     pub(crate) fn prune_unreferenced_all(&self) -> Result<RetentionReport> {
         let mut total = RetentionReport::default();
         loop {
+            #[cfg(test)]
+            tests::run_before_batch_hook();
             match self.db.prune_unreferenced(&self.store, PRUNE_BATCH) {
                 Ok(r) if r.blobs_pruned == 0 => return Ok(total),
                 Ok(r) => {
@@ -239,5 +241,85 @@ impl Dsnap {
             }
         }
         Ok(BlobRepairOutcome::NoIntactSource { versions, error })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+
+    use super::*;
+    use crate::db::{Db, NewVersion};
+    use crate::store::Store;
+    use crate::types::{ChangeCounts, Entry, RelPath};
+
+    thread_local! {
+        /// Test seam (DSNA-106): runs before every `Db::prune_unreferenced` batch.
+        static BEFORE_BATCH: RefCell<Option<Box<dyn FnMut()>>> = RefCell::new(None);
+    }
+
+    pub(super) fn run_before_batch_hook() {
+        BEFORE_BATCH.with(|h| {
+            if let Some(f) = h.borrow_mut().as_mut() {
+                f();
+            }
+        });
+    }
+
+    fn version(project: ProjectId, info: crate::types::BlobInfo) -> NewVersion {
+        NewVersion {
+            project_id: project,
+            label: "v".into(),
+            created_at_ms: 0,
+            kind: VersionKind::Cli,
+            unstable: false,
+            counts: ChangeCounts::default(),
+            entries: vec![Entry {
+                path: RelPath::new("f").unwrap(),
+                kind: EntryKind::File,
+                blob: Some(info.hash),
+                size: info.size,
+                mtime_ns: 0,
+                readonly: false,
+            }],
+            new_blobs: vec![info],
+        }
+    }
+
+    /// Deterministic interleaving: between the moment a prune could have read its
+    /// candidates and the batch that deletes them, another handle commits a version reusing
+    /// the only candidate. The blob must survive (it is re-read under the write lock).
+    #[test]
+    fn commit_between_batches_keeps_the_reused_blob() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ds = Dsnap::open(Some(tmp.path().join("home"))).unwrap();
+        let root = tmp.path().join("proj");
+        std::fs::create_dir(&root).unwrap();
+        let p = ds.add_project(&root, None).unwrap().id;
+        let other_db = Db::open(&ds.home().db_path()).unwrap();
+        let other_store = Store::open(ds.home().objects_dir()).unwrap();
+
+        let x = ds.store.put(b"reused").unwrap();
+        let old = ds.db.insert_version(&version(p, x), &ds.store).unwrap();
+        ds.db.delete_version(old.id).unwrap();
+        assert!(!ds.db.blob_referenced(&x.hash).unwrap());
+
+        let mut fired = false;
+        BEFORE_BATCH.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                if !fired {
+                    fired = true;
+                    other_db
+                        .insert_version(&version(p, x), &other_store)
+                        .unwrap();
+                }
+            }));
+        });
+        let r = ds.prune_blobs();
+        BEFORE_BATCH.with(|h| *h.borrow_mut() = None);
+        let r = r.unwrap();
+
+        assert_eq!(r.blobs_pruned, 0);
+        assert_eq!(ds.read_blob(&x.hash).unwrap(), b"reused");
     }
 }
