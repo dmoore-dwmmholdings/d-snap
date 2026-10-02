@@ -3,11 +3,11 @@
   beside the diff of the selected file. "Restore" brings one file back.
 -->
 <script lang="ts">
-  import type { FileChange, RelPath, Version, VersionId } from '../api';
+  import type { FileChange, VersionId } from '../api';
   import { useStore } from '../stores/app.svelte';
   import { plural, splitPath, statusLetter } from '../util/format';
   import ConfirmRestoreDialog from '../dialogs/ConfirmRestoreDialog.svelte';
-  import DiffPane from './DiffPane.svelte';
+  import DiffPane, { type RestoreTarget } from './DiffPane.svelte';
   import VirtualList from './VirtualList.svelte';
 
   let { onback }: { onback?: () => void } = $props();
@@ -17,7 +17,7 @@
 
   let filter = $state('');
   let listbox: HTMLDivElement | undefined = $state();
-  let confirming = $state<{ path: RelPath; version: Version } | null>(null);
+  let confirming = $state<RestoreTarget | null>(null);
   let busy = $state(false);
 
   const shown = $derived.by(() => {
@@ -31,25 +31,30 @@
   });
   const active = $derived(shown.findIndex((c) => c.path === store.path));
 
-  /** The version to restore `c` from, and the path in it; `null` when not restorable. */
-  function restoreTarget(c: FileChange): { version: Version; path: RelPath } | null {
+  /** Where `c` can be restored from: one version, or A and B in compare mode. */
+  function restoreTargets(c: FileChange): RestoreTarget[] {
     const sides = store.sides;
-    if (!sides) return null;
-    let id: VersionId | null;
-    let path: RelPath;
+    if (!sides) return [];
+    const find = (id: VersionId | null) => store.versions.find((v) => v.id === id);
+    const out: RestoreTarget[] = [];
+    if (store.compare) {
+      // Explicit sides: never ambiguous which version is restored.
+      const a = find(sides.from);
+      if (a && c.old) out.push({ version: a, path: c.old.path, side: 'A' });
+      const b = sides.to.kind === 'version' ? find(sides.to.id) : undefined;
+      if (b && c.new) out.push({ version: b, path: c.path, side: 'B' });
+      return out;
+    }
     if (sides.to.kind === 'workingTree') {
       // Discard the change: bring back the old side.
-      if (!c.old) return null;
-      id = sides.from ?? store.versions[0]?.id ?? null;
-      path = c.old.path;
+      const v = find(sides.from ?? store.versions[0]?.id ?? null);
+      if (v && c.old) out.push({ version: v, path: c.old.path, side: null });
     } else {
       // Bring the file back as it is in the selected version.
-      if (!c.new) return null;
-      id = sides.to.id;
-      path = c.path;
+      const v = find(sides.to.id);
+      if (v && c.new) out.push({ version: v, path: c.path, side: null });
     }
-    const version = store.versions.find((v) => v.id === id);
-    return version ? { version, path } : null;
+    return out;
   }
 
   function select(i: number) {
@@ -81,11 +86,16 @@
     if (active < 0) select(0);
   }
 
+  const label = (id: VersionId | null) =>
+    id === null ? null : (store.versions.find((v) => v.id === id)?.label ?? `#${id}`);
+
   const title = $derived.by(() => {
     const s = store.sides;
     if (!s) return '';
-    const label = (id: VersionId | null) =>
-      id === null ? null : (store.versions.find((v) => v.id === id)?.label ?? `#${id}`);
+    if (store.compare) {
+      const b = s.to.kind === 'workingTree' ? 'Unsaved changes' : label(s.to.id);
+      return `A: ${label(s.from)} → B: ${b}`;
+    }
     if (s.to.kind === 'workingTree') {
       return `Folder vs ${label(s.from) ?? store.versions[0]?.label ?? 'nothing'}`;
     }
@@ -99,6 +109,18 @@
   <div class="files">
     <div class="toolbar">
       <h3 class="pane-title" {title}>{title}</h3>
+      {#if store.compare}
+        <div class="compare-actions">
+          {#if store.compare.to.kind === 'version'}
+            <button type="button" class="small" onclick={() => void store.swapCompare()}
+              >Swap A ⇄ B</button
+            >
+          {/if}
+          <button type="button" class="small" onclick={() => void store.exitCompare()}
+            >Exit compare</button
+          >
+        </div>
+      {/if}
       <input
         type="search"
         placeholder="Filter files"
@@ -141,7 +163,6 @@
           {#snippet row(c: FileChange, i: number)}
             {@const s = statusLetter(c.status)}
             {@const p = splitPath(c.path)}
-            {@const target = restoreTarget(c)}
             <div
               id="f-{i}"
               class="row"
@@ -164,18 +185,18 @@
                   <span class="d">-{c.linesRemoved ?? 0}</span>
                 </span>
               {/if}
-              {#if target}
+              {#each restoreTargets(c) as t (t.side ?? '')}
                 <button
                   type="button"
                   class="restore"
-                  aria-label="Restore {target.path}"
-                  title="Restore this file to {target.version.label}"
+                  aria-label="Restore {t.path}{t.side ? ` to ${t.side}` : ''}"
+                  title="Restore this file to {t.version.label}"
                   onclick={(e) => {
                     e.stopPropagation();
-                    confirming = target;
-                  }}>Restore</button
+                    confirming = t;
+                  }}>{t.side ? `Restore ${t.side}` : 'Restore'}</button
                 >
-              {/if}
+              {/each}
             </div>
           {/snippet}
         </VirtualList>
@@ -183,13 +204,7 @@
     {/if}
   </div>
 
-  <DiffPane
-    onrestore={(c: FileChange) => {
-      const t = restoreTarget(c);
-      if (t) confirming = t;
-    }}
-    canRestore={(c: FileChange) => restoreTarget(c) !== null}
-  />
+  <DiffPane targets={restoreTargets} onrestore={(t: RestoreTarget) => (confirming = t)} />
 </section>
 
 {#if confirming}
@@ -298,6 +313,15 @@
   }
   .d {
     color: var(--status-deleted);
+  }
+  .compare-actions {
+    display: flex;
+    gap: var(--space-1);
+    flex-basis: 100%;
+  }
+  .small {
+    font-size: var(--text-xs);
+    padding: 1px 8px;
   }
   .restore {
     visibility: hidden;

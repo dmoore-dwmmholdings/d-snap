@@ -4,6 +4,7 @@ import { getContext, setContext } from 'svelte';
 import {
   ApiError,
   type Api,
+  type DiffOptions,
   type FileChange,
   type Progress,
   type Project,
@@ -40,6 +41,8 @@ export function provideStore(store: AppStore): void {
 
 /** Context map holding `store`, for mounting a component on its own (tests). */
 export function storeContext(store: AppStore): Map<unknown, unknown> {
+  // Svelte reads context once at mount; this map is never mutated.
+  // eslint-disable-next-line svelte/prefer-svelte-reactivity
   return new Map([[KEY, store]]);
 }
 
@@ -308,6 +311,52 @@ export class AppStore {
     await this.loadChanges();
   }
 
+  /** Compare mode (F16): the first row picked, waiting for the second. */
+  comparing = $state(false);
+  compareA = $state<Selection | null>(null);
+
+  startCompare(): void {
+    this.comparing = true;
+    this.compareA = null;
+  }
+
+  async exitCompare(): Promise<void> {
+    this.comparing = false;
+    this.compareA = null;
+    await this.setCompare(null);
+  }
+
+  /** Pick a side in compare mode; the second pick shows older → newer. */
+  async pickCompare(sel: Selection): Promise<void> {
+    const a = this.compareA;
+    if (!a) {
+      this.compareA = sel;
+      return;
+    }
+    if (
+      a.kind === sel.kind &&
+      (a.kind === 'unsaved' || (sel.kind === 'version' && a.id === sel.id))
+    )
+      return;
+    // Lower index = newer; Unsaved changes is newest of all.
+    const rank = (x: Selection) =>
+      x.kind === 'unsaved' ? -1 : this.versions.findIndex((v) => v.id === x.id);
+    const [older, newer] = rank(a) > rank(sel) ? [a, sel] : [sel, a];
+    if (older.kind !== 'version') return;
+    this.compareA = null;
+    await this.setCompare({
+      from: older.id,
+      to: newer.kind === 'unsaved' ? { kind: 'workingTree' } : { kind: 'version', id: newer.id },
+    });
+  }
+
+  /** Swap the two versions being compared (both must be versions). */
+  async swapCompare(): Promise<void> {
+    const c = this.compare;
+    if (!c || c.from === null || c.to.kind !== 'version') return;
+    await this.setCompare({ from: c.to.id, to: { kind: 'version', id: c.from } });
+  }
+
   /** Compare any two sides (F16). */
   async setCompare(sides: Sides | null): Promise<void> {
     this.compare = sides;
@@ -403,7 +452,7 @@ export class AppStore {
     if (id === null) return null;
     try {
       const r = await this.api.restoreFile(id, versionId, path);
-      await this.afterRestore(id, r, `Restored ${path}`);
+      await this.afterRestore(id, r, `Restored ${path}`, path);
       return r;
     } catch (err) {
       this.toasts.error('Restore failed', err);
@@ -411,8 +460,92 @@ export class AppStore {
     }
   }
 
-  private async afterRestore(id: ProjectId, r: RestoreReport, done: string): Promise<void> {
-    const undo = { label: 'Undo', run: () => void this.restoreProject(r.safetyVersion) };
+  /**
+   * Revert one hunk of the working file (F22). A stale diff (the file changed since it was
+   * shown) is reported and the changes reload. Returns whether it was reverted.
+   */
+  async revertHunk(path: RelPath, hunkIndex: number, opts: DiffOptions): Promise<boolean> {
+    const id = this.projectId;
+    const sides = this.sides;
+    if (id === null || !sides || sides.to.kind !== 'workingTree') return false;
+    try {
+      const r = await this.api.revertHunk(id, sides.from, sides.to, path, hunkIndex, opts);
+      if (r.uncaptured.length > 0) {
+        this.toasts.push('warning', `${path} is not in any snapshot now, so it was left alone.`);
+      } else {
+        await this.afterRestore(id, r, `Reverted the change in ${path}`, path);
+      }
+      await this.loadChanges();
+      return r.written.length > 0;
+    } catch (err) {
+      const e = ApiError.from(err);
+      if (e.code === 'invalid_input' && /changed since/.test(e.message)) {
+        this.toasts.push('warning', 'File changed since the diff was shown — refreshed.');
+      } else {
+        this.toasts.error('Could not revert', e);
+      }
+      await this.loadChanges();
+      return false;
+    }
+  }
+
+  // ---- version management (F11) ----
+
+  private patchVersion(v: Version): void {
+    this.versions = this.versions.map((x) => (x.id === v.id ? v : x));
+  }
+
+  /** Rename a version, showing the new label at once and rolling back on failure. */
+  async setLabel(id: VersionId, label: string): Promise<void> {
+    const old = this.versions.find((v) => v.id === id);
+    if (!old || !label.trim() || label === old.label) return;
+    this.patchVersion({ ...old, label: label.trim() });
+    try {
+      this.patchVersion(await this.api.setLabel(id, label.trim()));
+    } catch (err) {
+      this.patchVersion(old);
+      this.toasts.error('Could not rename the version', err);
+    }
+  }
+
+  async setPinned(id: VersionId, pinned: boolean): Promise<void> {
+    const old = this.versions.find((v) => v.id === id);
+    if (!old) return;
+    this.patchVersion({ ...old, pinned });
+    try {
+      this.patchVersion(await this.api.setPinned(id, pinned));
+    } catch (err) {
+      this.patchVersion(old);
+      this.toasts.error(pinned ? 'Could not pin' : 'Could not unpin', err);
+    }
+  }
+
+  async deleteVersion(id: VersionId): Promise<void> {
+    const before = this.versions;
+    this.versions = before.filter((v) => v.id !== id);
+    const sel = this.selection;
+    if (sel?.kind === 'version' && sel.id === id) await this.select({ kind: 'unsaved' });
+    try {
+      await this.api.deleteVersion(id);
+    } catch (err) {
+      this.versions = before;
+      this.toasts.error('Could not delete the version', err);
+    }
+  }
+
+  private async afterRestore(
+    id: ProjectId,
+    r: RestoreReport,
+    done: string,
+    file?: RelPath,
+  ): Promise<void> {
+    const undo = {
+      label: 'Undo',
+      run: () =>
+        void (file
+          ? this.restoreFile(r.safetyVersion, file)
+          : this.restoreProject(r.safetyVersion)),
+    };
     if (r.failed.length > 0) {
       this.restoreResult = r;
     } else if (r.uncaptured.length > 0) {

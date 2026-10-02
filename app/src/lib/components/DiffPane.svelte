@@ -2,19 +2,45 @@
   Diff pane of the changes view: loads the selected file's diff for the current sides and
   options, with the file header and "Restore this file". The diff itself is DiffViewer.
 -->
+<script lang="ts" module>
+  import type { RelPath, Version } from '../api';
+
+  /** A version a file can be restored from; `side` names it in compare mode. */
+  export interface RestoreTarget {
+    version: Version;
+    path: RelPath;
+    side: 'A' | 'B' | null;
+  }
+</script>
+
 <script lang="ts">
   import { ApiError, type FileChange, type FileDiff } from '../api';
+  import Dialog from '../dialogs/Dialog.svelte';
   import { useStore } from '../stores/app.svelte';
   import { diffPrefs } from '../stores/prefs.svelte';
   import DiffViewer from '../diff/DiffViewer.svelte';
 
   interface Props {
-    onrestore: (c: FileChange) => void;
-    canRestore: (c: FileChange) => boolean;
+    targets: (c: FileChange) => RestoreTarget[];
+    onrestore: (t: RestoreTarget) => void;
   }
-  let { onrestore, canRestore }: Props = $props();
+  let { targets, onrestore }: Props = $props();
 
   const store = useStore();
+
+  /** Hunk waiting for the user to confirm its revert. */
+  let reverting = $state<number | null>(null);
+  const canRevert = $derived(store.sides?.to.kind === 'workingTree');
+
+  async function revert(index: number) {
+    const c = change;
+    reverting = null;
+    if (!c) return;
+    await store.revertHunk(c.path, index, {
+      ignoreWhitespace: diffPrefs.ignoreWhitespace,
+      context: diffPrefs.context,
+    });
+  }
 
   let diff = $state<FileDiff | null>(null);
   let error = $state<string | null>(null);
@@ -63,9 +89,11 @@
         {#if change.status.kind === 'renamed'}{change.status.from} →
         {/if}{change.path}
       </span>
-      {#if canRestore(change)}
-        <button type="button" onclick={() => onrestore(change)}>Restore this file</button>
-      {/if}
+      {#each targets(change) as t (t.side ?? '')}
+        <button type="button" onclick={() => onrestore(t)}
+          >{t.side ? `Restore to ${t.side}` : 'Restore this file'}</button
+        >
+      {/each}
     </header>
     <div class="body">
       {#if error}
@@ -81,6 +109,7 @@
           onToggleWhitespace={(on) => (diffPrefs.ignoreWhitespace = on)}
           onExpand={() => (diffPrefs.context = Math.min(diffPrefs.context * 4 + 10, 100_000))}
           loadImage={(h, m) => store.api.readBlobAsDataUrl(h, m)}
+          onRevertHunk={canRevert ? (i) => (reverting = i) : undefined}
         />
       {:else if loading}
         <p class="note">Loading…</p>
@@ -88,6 +117,21 @@
     </div>
   {/if}
 </section>
+
+{#if reverting !== null}
+  {@const index = reverting}
+  <Dialog
+    title="Revert this change?"
+    confirmLabel="Revert"
+    oncancel={() => (reverting = null)}
+    onconfirm={() => void revert(index)}
+  >
+    <p>
+      The file in the folder gets this part back as it was. A safety snapshot is taken first, so you
+      can undo it.
+    </p>
+  </Dialog>
+{/if}
 
 <style>
   .pane {
