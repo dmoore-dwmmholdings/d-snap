@@ -67,6 +67,61 @@ fn snapshot_10k_files_with_49_changes_under_1s_and_status_under_500ms() {
     );
 }
 
+/// Versions of history for [`snapshot_with_200_versions_of_history_under_1s`] (the default
+/// retention, DSNA-3).
+const HISTORY: usize = 200;
+
+/// DSNA-101: the snapshot target must hold with a full retention window of history, not only
+/// on a fresh database. History is inserted straight into the index (copies of the first
+/// version, 2M entry rows), which is what made `insert_version` grow before schema v3.
+#[test]
+#[ignore = "release-only timing; run with --release -- --ignored"]
+fn snapshot_with_200_versions_of_history_under_1s() {
+    use dsnap_core::db::NewVersion;
+    use dsnap_core::store::Store;
+
+    let fx = FixtureProject::new().build();
+    generate_tree(fx.root(), FILES, 52);
+    let env = Env::new(fx.root());
+    snap(&env, None).version.unwrap();
+
+    let latest = env.db.latest_version(env.project).unwrap().unwrap();
+    let entries = env.db.entries(latest.id).unwrap();
+    let store = Store::open(env.home.path().join("objects")).unwrap();
+    let t = Instant::now();
+    for i in 1..HISTORY {
+        let nv = NewVersion {
+            project_id: env.project,
+            label: format!("history {i}"),
+            created_at_ms: latest.created_at_ms,
+            kind: dsnap_core::VersionKind::Auto,
+            unstable: false,
+            counts: dsnap_core::ChangeCounts::default(),
+            entries: entries.clone(),
+            new_blobs: Vec::new(),
+        };
+        env.db.insert_version(&nv, &store).unwrap();
+    }
+    eprintln!(
+        "{HISTORY} versions of history inserted in {:?}",
+        t.elapsed()
+    );
+
+    let mut snaps = Vec::new();
+    for _ in 0..ROUNDS {
+        touch_n(fx.root(), CHANGED);
+        let t = Instant::now();
+        let v = snap(&env, None).version.unwrap();
+        snaps.push(t.elapsed());
+        assert_eq!(v.counts.modified as usize, CHANGED);
+    }
+    let snap_med = median(snaps.clone());
+    eprintln!(
+        "snapshot with {CHANGED} changes after {HISTORY} versions: median {snap_med:?} of {snaps:?}"
+    );
+    assert!(snap_med < Duration::from_secs(1), "snapshot {snap_med:?}");
+}
+
 /// Print where a snapshot's time goes beyond the walk and hashing that `status()` covers:
 /// the index insert of a 10k-entry version, and storing 49 new blobs. Informational only.
 fn diagnose(env: &Env) {
