@@ -295,3 +295,30 @@ fn symlinks_are_stored_as_links() {
     snap(&env, None).version.unwrap();
     assert_eq!(stored_bytes(&env), tree_bytes(fx.root()));
 }
+
+/// Fast path (DSNA-49 review): same size, later mtime must be re-read. Every other modify
+/// test also changes the size, so only this one depends on the mtime check.
+#[test]
+fn same_size_edit_with_later_mtime_is_captured() {
+    let fx = FixtureProject::new().file("a.txt", "abc").build();
+    let env = Env::new(fx.root());
+    snap(&env, None).version.unwrap();
+
+    project::rewrite(&fx.path("a.txt"), b"xyz");
+    let st = env.dsnap.status(env.project).unwrap();
+    assert_eq!(st.len(), 1);
+    assert_eq!(st[0].path, rp("a.txt"));
+    assert_eq!(st[0].status, dsnap_core::ChangeStatus::Modified);
+
+    let v = snap(&env, None).version.unwrap();
+    assert_eq!(
+        v.counts,
+        ChangeCounts {
+            added: 0,
+            modified: 1,
+            deleted: 0
+        }
+    );
+    let e = env.db.entry(v.id, &rp("a.txt")).unwrap().unwrap();
+    assert_eq!(env.dsnap.read_blob(&e.blob.unwrap()).unwrap(), b"xyz");
+}
