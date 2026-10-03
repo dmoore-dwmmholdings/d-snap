@@ -107,6 +107,39 @@ pub(crate) const MIGRATIONS: &[&str] = &[
     "
     ALTER TABLE projects ADD COLUMN removing INTEGER NOT NULL DEFAULT 0;
     ",
+    // v5 (DSNA-117): agent turns. A turn pairs the snapshots the Claude Code hooks take
+    // when a prompt is submitted and when the agent stops, with the prompt as its title.
+    // Deleting a version (retention, the user) leaves the turn with a NULL side, which the
+    // UI shows as pruned. Review decisions are per file.
+    "
+    CREATE TABLE turns (
+        id             INTEGER PRIMARY KEY,
+        project_id     INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        seq            INTEGER NOT NULL,
+        session_id     TEXT,
+        prompt         TEXT    NOT NULL DEFAULT '',
+        started_at_ms  INTEGER NOT NULL,
+        ended_at_ms    INTEGER,
+        before_version INTEGER REFERENCES versions(id) ON DELETE SET NULL,
+        after_version  INTEGER REFERENCES versions(id) ON DELETE SET NULL,
+        added          INTEGER NOT NULL DEFAULT 0,
+        modified       INTEGER NOT NULL DEFAULT 0,
+        deleted        INTEGER NOT NULL DEFAULT 0,
+        reviewed_at_ms INTEGER,
+        UNIQUE (project_id, seq)
+    );
+    CREATE INDEX turns_project ON turns(project_id, id DESC);
+    CREATE INDEX turns_before ON turns(before_version) WHERE before_version IS NOT NULL;
+    CREATE INDEX turns_after ON turns(after_version) WHERE after_version IS NOT NULL;
+
+    CREATE TABLE turn_files (
+        turn_id       INTEGER NOT NULL REFERENCES turns(id) ON DELETE CASCADE,
+        path          TEXT    NOT NULL,
+        decision      TEXT    NOT NULL CHECK (decision IN ('kept', 'undone')),
+        decided_at_ms INTEGER NOT NULL,
+        PRIMARY KEY (turn_id, path)
+    ) WITHOUT ROWID;
+    ",
 ];
 
 /// Newest schema version this build knows.

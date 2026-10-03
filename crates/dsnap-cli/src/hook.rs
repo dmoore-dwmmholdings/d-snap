@@ -1,10 +1,15 @@
 //! Claude Code hook mode (DSNA-64): `dsnap snap --hook` and `dsnap hooks print`.
 //!
 //! A hook runs on every prompt and every Stop, so it must never block or fail an agent turn:
-//! it ignores its stdin, never prompts, and always exits 0. Problems go to stderr and to
+//! it never prompts and always exits 0. Problems go to stderr and to
 //! `<home>/logs/hook.log` (rotated at 1 MB). Hooks serialize with every other D-Snap
 //! operation on the project through [`ProjectLock`] (a file in the home directory, never in
 //! the project folder).
+//!
+//! Turns (DSNA-119): the hook reads Claude Code's JSON payload from stdin. A
+//! `UserPromptSubmit` begins a turn titled with the prompt, a `Stop` ends it, anything else
+//! is a plain snapshot. Without a payload, the `-m` labels the hooks have always used
+//! ("before agent turn" / "after agent turn") decide.
 
 use std::fs::{self, OpenOptions};
 use std::io::{self, IsTerminal, Read, Write};
@@ -12,7 +17,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use dsnap_core::lock::ProjectLock;
-use dsnap_core::{Dsnap, Home, SnapshotOptions, VersionKind};
+use dsnap_core::{Dsnap, Home, SnapshotOptions, SnapshotReport, TurnStart, VersionKind};
+use serde::Deserialize;
 use time::OffsetDateTime;
 use time::macros::format_description;
 
@@ -22,12 +28,68 @@ const LOG_MAX_BYTES: u64 = 1024 * 1024;
 const SLOW: Duration = Duration::from_secs(10);
 /// How long a hook waits for another hook on the same project.
 const LOCK_WAIT: Duration = Duration::from_secs(5);
+/// Most stdin bytes kept; the rest is read and dropped (a prompt is cut by core anyway).
+const MAX_INPUT: usize = 1024 * 1024;
+
+/// What a hook invocation does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Action {
+    /// A prompt was submitted: snapshot and begin a turn.
+    Begin {
+        /// Claude Code session id.
+        session: Option<String>,
+        /// The prompt.
+        prompt: String,
+    },
+    /// The agent stopped: snapshot and end the running turn.
+    End {
+        /// Claude Code session id.
+        session: Option<String>,
+    },
+    /// Any other hook: a plain snapshot.
+    Plain,
+}
+
+/// The fields of Claude Code's hook payload that D-Snap reads.
+#[derive(Debug, Deserialize)]
+struct Payload {
+    hook_event_name: Option<String>,
+    session_id: Option<String>,
+    prompt: Option<String>,
+}
+
+/// Decide what to do from the hook's stdin and its `-m` label.
+pub fn classify(input: &[u8], label: Option<&str>) -> Action {
+    if let Ok(p) = serde_json::from_slice::<Payload>(input) {
+        let session = p.session_id.filter(|s| !s.is_empty());
+        match p.hook_event_name.as_deref() {
+            Some("UserPromptSubmit") => {
+                return Action::Begin {
+                    session,
+                    prompt: p.prompt.unwrap_or_default(),
+                };
+            }
+            Some("Stop") => return Action::End { session },
+            Some(_) => return Action::Plain,
+            None => {}
+        }
+    }
+    match label.map(str::trim) {
+        Some(l) if l.eq_ignore_ascii_case("before agent turn") => Action::Begin {
+            session: None,
+            prompt: String::new(),
+        },
+        Some(l) if l.eq_ignore_ascii_case("after agent turn") => Action::End { session: None },
+        _ => Action::Plain,
+    }
+}
 
 /// `dsnap snap --hook`: snapshot `path`, logging instead of failing.
 pub fn snap(home: Option<PathBuf>, path: &Path, label: Option<String>) {
-    drain_stdin();
+    let input = read_stdin();
+    let action = classify(&input, label.as_deref());
     let log = Log::new(home.clone());
-    if let Err(e) = snap_inner(home, path, label, &log) {
+    if let Err(e) = snap_inner(home, path, label, &action, &log) {
         log.write(&format!("snapshot of {} failed: {e:#}", path.display()));
     }
 }
@@ -36,6 +98,7 @@ fn snap_inner(
     home: Option<PathBuf>,
     path: &Path,
     label: Option<String>,
+    action: &Action,
     log: &Log,
 ) -> anyhow::Result<()> {
     let dsnap = Dsnap::open(home)?;
@@ -56,14 +119,22 @@ fn snap_inner(
         return Ok(());
     };
     let start = Instant::now();
-    let report = dsnap.snapshot(
-        project.id,
-        SnapshotOptions {
-            label,
-            kind: VersionKind::Cli,
-            ..SnapshotOptions::default()
-        },
-    )?;
+    let opts = SnapshotOptions {
+        label,
+        kind: VersionKind::Cli,
+        ..SnapshotOptions::default()
+    };
+    let report: SnapshotReport = match action {
+        Action::Begin { session, prompt } => {
+            let start = TurnStart {
+                session_id: session.clone(),
+                prompt: prompt.clone(),
+            };
+            dsnap.begin_turn(project.id, start, opts)?.0
+        }
+        Action::End { session } => dsnap.end_turn(project.id, session.as_deref(), opts)?.0,
+        Action::Plain => dsnap.snapshot(project.id, opts)?,
+    };
     let took = start.elapsed();
     if took > SLOW {
         log.write(&format!(
@@ -77,12 +148,18 @@ fn snap_inner(
     Ok(())
 }
 
-/// Read and drop the hook's JSON input so the caller never blocks on a full pipe.
-fn drain_stdin() {
+/// Read the hook's JSON input (all of it, so the caller never blocks on a full pipe),
+/// keeping at most [`MAX_INPUT`] bytes. Empty from a terminal.
+fn read_stdin() -> Vec<u8> {
     let stdin = io::stdin();
-    if !stdin.is_terminal() {
-        let _ = stdin.lock().read_to_end(&mut Vec::new());
+    if stdin.is_terminal() {
+        return Vec::new();
     }
+    let mut lock = stdin.lock();
+    let mut kept = Vec::new();
+    let _ = (&mut lock).take(MAX_INPUT as u64).read_to_end(&mut kept);
+    let _ = io::copy(&mut lock, &mut io::sink());
+    kept
 }
 
 /// Appends to `<home>/logs/hook.log`, and always to stderr.
@@ -163,4 +240,51 @@ fn command_name() -> String {
     let s = me.to_string_lossy();
     let s = s.strip_prefix(r"\\?\").unwrap_or(&s).replace('\\', "/");
     format!("\"{s}\"")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prompt_submit_begins_a_turn_with_the_prompt() {
+        let input = br#"{"session_id":"abc","hook_event_name":"UserPromptSubmit","prompt":"Add tests","cwd":"/x"}"#;
+        assert_eq!(
+            classify(input, Some("before agent turn")),
+            Action::Begin {
+                session: Some("abc".into()),
+                prompt: "Add tests".into()
+            }
+        );
+    }
+
+    #[test]
+    fn stop_ends_the_turn_and_other_events_snapshot() {
+        let stop = br#"{"session_id":"abc","hook_event_name":"Stop","stop_hook_active":false}"#;
+        assert_eq!(
+            classify(stop, None),
+            Action::End {
+                session: Some("abc".into())
+            }
+        );
+        let other = br#"{"hook_event_name":"SubagentStop"}"#;
+        assert_eq!(classify(other, Some("after agent turn")), Action::Plain);
+    }
+
+    #[test]
+    fn without_a_payload_the_label_decides() {
+        assert_eq!(
+            classify(b"", Some("Before agent turn ")),
+            Action::Begin {
+                session: None,
+                prompt: String::new()
+            }
+        );
+        assert_eq!(
+            classify(b"not json", Some("after agent turn")),
+            Action::End { session: None }
+        );
+        assert_eq!(classify(b"", Some("my label")), Action::Plain);
+        assert_eq!(classify(b"{}", None), Action::Plain);
+    }
 }

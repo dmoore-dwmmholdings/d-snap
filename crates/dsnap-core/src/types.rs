@@ -431,6 +431,8 @@ pub struct GlobalSettings {
     pub size_cap_bytes: u64,
     /// Unpinned versions kept per project (default 200).
     pub retention_keep: u32,
+    /// Closing the app window keeps D-Snap running in the system tray (default true).
+    pub keep_in_tray: bool,
 }
 
 impl GlobalSettings {
@@ -445,6 +447,7 @@ impl Default for GlobalSettings {
         Self {
             size_cap_bytes: Self::DEFAULT_SIZE_CAP_BYTES,
             retention_keep: Self::DEFAULT_RETENTION_KEEP,
+            keep_in_tray: true,
         }
     }
 }
@@ -849,6 +852,125 @@ pub struct SnapshotOptions {
     pub progress: Option<Progress>,
     /// Optional cancellation token.
     pub cancel: Option<CancelToken>,
+}
+
+/// Database id of an agent turn (DSNA-118).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct TurnId(pub i64);
+
+impl fmt::Display for TurnId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+/// Where an agent turn stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TurnState {
+    /// Started (prompt submitted) and not ended yet.
+    Running,
+    /// Ended with changes nobody has reviewed yet.
+    Pending,
+    /// Every changed file has a decision.
+    Reviewed,
+    /// Ended without changing anything.
+    Empty,
+    /// Its before or after version was deleted, so it can no longer be compared or undone.
+    Pruned,
+}
+
+/// One agent turn: the snapshots taken when a prompt was submitted and when the agent
+/// stopped, with the prompt as its title (DSNA-113).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Turn {
+    /// Turn id.
+    pub id: TurnId,
+    /// Owning project.
+    pub project_id: ProjectId,
+    /// 1-based number within the project ("Turn 9").
+    pub seq: u32,
+    /// Claude Code session id, when the hook reported one.
+    pub session_id: Option<String>,
+    /// The prompt that started the turn (empty when unknown).
+    pub prompt: String,
+    /// When the prompt was submitted, ms since the Unix epoch.
+    pub started_at_ms: i64,
+    /// When the agent stopped; `None` while running.
+    pub ended_at_ms: Option<i64>,
+    /// The folder before the turn; `None` once that version is deleted.
+    pub before: Option<VersionId>,
+    /// The folder after the turn; `None` while running or once deleted.
+    pub after: Option<VersionId>,
+    /// Changes from `before` to `after` (stored when the turn ends).
+    pub counts: ChangeCounts,
+    /// Files decided "kept".
+    pub kept: u32,
+    /// Files decided "undone".
+    pub undone: u32,
+    /// When the last file was decided; `None` while any is pending.
+    pub reviewed_at_ms: Option<i64>,
+    /// Derived state.
+    pub state: TurnState,
+}
+
+/// A review decision on one file of a turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum FileDecision {
+    /// The turn's change stays.
+    Kept,
+    /// The file was put back as it was before the turn.
+    Undone,
+}
+
+/// One file a turn changed ([`crate::Dsnap::turn_files`]).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnFile {
+    /// The change from the turn's before to its after version, with line counts.
+    pub change: FileChange,
+    /// The decision, or `None` while pending.
+    pub decision: Option<FileDecision>,
+    /// The folder's file differs from the turn's after version: it was edited (or undone)
+    /// since. Undoing it would discard those later edits.
+    pub changed_since: bool,
+}
+
+/// What [`crate::Dsnap::undo_turn`] undoes.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UndoTurn {
+    /// Paths to undo (a renamed file by its new path); `None` = every file of the turn.
+    #[serde(default)]
+    pub paths: Option<Vec<RelPath>>,
+    /// Also undo files that changed after the turn, discarding those later edits.
+    #[serde(default)]
+    pub include_changed: bool,
+}
+
+/// Outcome of [`crate::Dsnap::undo_turn`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UndoTurnReport {
+    /// The restore that put the files back (its safety version undoes the undo).
+    pub restore: RestoreReport,
+    /// Files left alone because they changed after the turn.
+    pub skipped_changed: Vec<RelPath>,
+    /// The turn with its new decisions.
+    pub turn: Turn,
+}
+
+/// One point in a file's history ([`crate::Dsnap::path_history`]).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PathVersion {
+    /// The version where the path changed.
+    pub version: Version,
+    /// The path's entry there; `None` = deleted in this version.
+    pub entry: Option<Entry>,
 }
 
 #[cfg(test)]

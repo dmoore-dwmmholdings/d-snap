@@ -60,6 +60,14 @@ enum Cmd {
         #[arg(long, short = 'n')]
         limit: Option<usize>,
     },
+    /// List agent turns (prompt to stop, from the Claude Code hooks), newest first.
+    Turns {
+        /// Project folder.
+        path: PathBuf,
+        /// Show at most this many turns.
+        #[arg(long, short = 'n')]
+        limit: Option<usize>,
+    },
     /// Show unsaved changes since the latest version.
     Status {
         /// Project folder.
@@ -214,6 +222,14 @@ fn run(cli: Cli) -> Result<()> {
                 versions.truncate(n);
             }
             out.print(&versions, || output::versions(&versions))
+        }
+        Cmd::Turns { path, limit } => {
+            let p = find_project(&dsnap, &path)?;
+            let mut turns = dsnap.list_turns(p.id)?;
+            if let Some(n) = limit {
+                turns.truncate(n);
+            }
+            out.print(&turns, || output::turns(&turns))
         }
         Cmd::Status { path } => {
             let p = find_project(&dsnap, &path)?;

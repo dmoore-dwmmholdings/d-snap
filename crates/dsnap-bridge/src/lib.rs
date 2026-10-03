@@ -36,6 +36,15 @@ pub const COMMAND_NAMES: &[&str] = &[
     "restore_project",
     "restore_file",
     "revert_hunk",
+    "list_turns",
+    "turn_files",
+    "set_turn_decisions",
+    "keep_turn",
+    "undo_turn",
+    "redo_turn",
+    "undo_turn_hunk",
+    "path_history",
+    "known_paths",
 ];
 
 /// Whether two name lists are equal, usable in a `const` assertion.

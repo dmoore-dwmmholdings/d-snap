@@ -19,7 +19,14 @@ import type {
   RelPath,
   RestorePlan,
   RestoreReport,
+  PathVersion,
   SnapshotReport,
+  Turn,
+  TurnDecisionChange,
+  TurnFile,
+  TurnId,
+  UndoTurnReport,
+  UndoTurnRequest,
   Version,
   VersionId,
   VersionRef,
@@ -169,6 +176,48 @@ export class TauriApi implements Api {
     opts: DiffOptions,
   ): Promise<RestoreReport> {
     return call(COMMANDS.revertHunk, { projectId, from, to, path, hunkIndex, opts });
+  }
+
+  listTurns(projectId: ProjectId): Promise<Turn[]> {
+    return call(COMMANDS.listTurns, { projectId });
+  }
+
+  turnFiles(turnId: TurnId): Promise<TurnFile[]> {
+    return call(COMMANDS.turnFiles, { turnId });
+  }
+
+  setTurnDecisions(turnId: TurnId, changes: TurnDecisionChange[]): Promise<Turn> {
+    return call(COMMANDS.setTurnDecisions, { turnId, changes });
+  }
+
+  keepTurn(turnId: TurnId): Promise<Turn> {
+    return call(COMMANDS.keepTurn, { turnId });
+  }
+
+  undoTurn(projectId: ProjectId, turnId: TurnId, req: UndoTurnRequest): Promise<UndoTurnReport> {
+    return call(COMMANDS.undoTurn, { projectId, turnId, req });
+  }
+
+  redoTurn(projectId: ProjectId, turnId: TurnId, paths: RelPath[] | null): Promise<UndoTurnReport> {
+    return call(COMMANDS.redoTurn, { projectId, turnId, paths });
+  }
+
+  undoTurnHunk(
+    projectId: ProjectId,
+    turnId: TurnId,
+    path: RelPath,
+    hunkIndex: number,
+    opts: DiffOptions,
+  ): Promise<RestoreReport> {
+    return call(COMMANDS.undoTurnHunk, { projectId, turnId, path, hunkIndex, opts });
+  }
+
+  pathHistory(projectId: ProjectId, path: RelPath): Promise<PathVersion[]> {
+    return call(COMMANDS.pathHistory, { projectId, path });
+  }
+
+  knownPaths(projectId: ProjectId): Promise<RelPath[]> {
+    return call(COMMANDS.knownPaths, { projectId });
   }
 
   onProjectChanged(cb: (e: ProjectChangedEvent) => void): Unsubscribe {

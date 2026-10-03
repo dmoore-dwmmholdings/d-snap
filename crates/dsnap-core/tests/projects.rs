@@ -288,6 +288,7 @@ fn global_settings_round_trip_and_validation() {
     let g = GlobalSettings {
         size_cap_bytes: 1024,
         retention_keep: 5,
+        keep_in_tray: false,
     };
     ds.set_global_settings(&g).unwrap();
     assert_eq!(ds.global_settings().unwrap(), g);

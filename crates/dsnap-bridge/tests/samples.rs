@@ -9,7 +9,9 @@
 
 use std::path::PathBuf;
 
-use dsnap_bridge::backend::{Op, Phase, ProgressPayload, ProjectChanged, VersionsChanged};
+use dsnap_bridge::backend::{
+    Op, Phase, ProgressPayload, ProjectChanged, TurnDecisionChange, VersionsChanged,
+};
 use dsnap_bridge::error::ApiError;
 use dsnap_core::*;
 use serde_json::{Value, json};
@@ -47,6 +49,25 @@ fn version() -> Version {
             modified: 2,
             deleted: 3,
         },
+    }
+}
+
+fn turn(state: TurnState) -> Turn {
+    Turn {
+        id: TurnId(7),
+        project_id: ProjectId(1),
+        seq: 9,
+        session_id: Some("s".into()),
+        prompt: "Add a payment step".into(),
+        started_at_ms: 1_700_000_000_000,
+        ended_at_ms: Some(1_700_000_100_000),
+        before: Some(VersionId(2)),
+        after: Some(VersionId(3)),
+        counts: version().counts,
+        kept: 1,
+        undone: 0,
+        reviewed_at_ms: None,
+        state,
     }
 }
 
@@ -193,6 +214,43 @@ fn samples() -> Value {
             project_id: ProjectId(1),
         })],
         "ApiError": [v(&ApiError::new("not_found", "m"))],
+        "TurnState": [
+            v(&TurnState::Running),
+            v(&TurnState::Pending),
+            v(&TurnState::Reviewed),
+            v(&TurnState::Empty),
+            v(&TurnState::Pruned),
+        ],
+        "Turn": [v(&turn(TurnState::Pending))],
+        "FileDecision": [v(&FileDecision::Kept), v(&FileDecision::Undone)],
+        "TurnFile": [v(&TurnFile {
+            change: change(ChangeStatus::Modified),
+            decision: Some(FileDecision::Kept),
+            changed_since: false,
+        })],
+        "UndoTurnRequest": [v(&UndoTurn {
+            paths: Some(vec![rp("a")]),
+            include_changed: true,
+        })],
+        "UndoTurnReport": [v(&UndoTurnReport {
+            restore: RestoreReport {
+                safety_version: VersionId(4),
+                written: vec![rp("a")],
+                deleted: vec![],
+                failed: vec![],
+                uncaptured: vec![],
+            },
+            skipped_changed: vec![rp("b")],
+            turn: turn(TurnState::Reviewed),
+        })],
+        "TurnDecisionChange": [v(&TurnDecisionChange {
+            path: rp("a"),
+            decision: None,
+        })],
+        "PathVersion": [v(&PathVersion {
+            version: version(),
+            entry: Some(entry(EntryKind::File)),
+        })],
     })
 }
 

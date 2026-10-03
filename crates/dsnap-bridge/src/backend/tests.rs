@@ -201,3 +201,81 @@ fn a_write_waits_for_another_process_and_says_so() {
     drop(cli);
     assert!(worker.join().unwrap().unwrap().version.is_some());
 }
+
+#[test]
+fn turns_are_listed_reviewed_and_undone_through_the_backend() {
+    let home = TestHome::new();
+    let (b, events) = backend(&home);
+    let fx = FixtureProject::new().file("a.txt", "a\n").build();
+    let p = b.add_project(fx.root().to_str().unwrap()).unwrap();
+    let d = b.dsnap().unwrap();
+    let cli = || dsnap_core::SnapshotOptions {
+        kind: VersionKind::Cli,
+        ..Default::default()
+    };
+    d.begin_turn(
+        p.id,
+        dsnap_core::TurnStart {
+            session_id: None,
+            prompt: "edit a".into(),
+        },
+        cli(),
+    )
+    .unwrap();
+    fs::write(fx.path("a.txt"), "agent\n").unwrap();
+    fs::write(fx.path("b.txt"), "b\n").unwrap();
+    d.end_turn(p.id, None, cli()).unwrap();
+
+    let turns = b.list_turns(p.id).unwrap();
+    assert_eq!(turns.len(), 1);
+    let t = &turns[0];
+    assert_eq!(t.prompt, "edit a");
+    let files = b.turn_files(t.id).unwrap();
+    assert_eq!(files.len(), 2);
+
+    let t2 = b
+        .set_turn_decisions(
+            t.id,
+            &[TurnDecisionChange {
+                path: RelPath::new("b.txt").unwrap(),
+                decision: Some(FileDecision::Kept),
+            }],
+        )
+        .unwrap();
+    assert_eq!(t2.kept, 1);
+    assert!(!named(&events, EVENT_VERSIONS_CHANGED).is_empty());
+
+    let ctx = b.begin(p.id, Op::Restore);
+    let r = b
+        .undo_turn(
+            &ctx,
+            t.id,
+            &UndoTurn {
+                paths: Some(vec![RelPath::new("a.txt").unwrap()]),
+                include_changed: false,
+            },
+        )
+        .unwrap();
+    assert_eq!(r.turn.undone, 1);
+    assert_eq!(fs::read_to_string(fx.path("a.txt")).unwrap(), "a\n");
+    assert_eq!(fs::read_to_string(fx.path("b.txt")).unwrap(), "b\n");
+    assert_eq!(
+        named(&events, EVENT_PROGRESS).last().unwrap()["phase"],
+        "done"
+    );
+
+    // A turn of another project is refused and the announced operation ends.
+    let other = FixtureProject::new().build();
+    let q = b.add_project(other.root().to_str().unwrap()).unwrap();
+    let ctx = b.begin(q.id, Op::Restore);
+    let err = b.undo_turn(&ctx, t.id, &UndoTurn::default()).unwrap_err();
+    assert_eq!(err.code, "invalid_input");
+    assert!(b.cancel_operation(&ctx.op_id).is_err());
+
+    let hist = b
+        .path_history(p.id, &RelPath::new("a.txt").unwrap())
+        .unwrap();
+    assert!(hist.len() >= 2);
+    let known = b.known_paths(p.id).unwrap();
+    assert!(known.iter().any(|k| k.as_str() == "b.txt"));
+}

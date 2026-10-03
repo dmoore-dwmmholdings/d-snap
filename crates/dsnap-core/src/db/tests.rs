@@ -34,10 +34,18 @@ fn fresh_db_gets_current_schema() {
         schema::user_version(&db.conn()).unwrap(),
         schema::SCHEMA_VERSION
     );
-    assert_eq!(schema::SCHEMA_VERSION, 4);
+    assert_eq!(schema::SCHEMA_VERSION, 5);
     assert_eq!(
         table_names(&db),
-        ["blobs", "entries", "projects", "settings", "versions"]
+        [
+            "blobs",
+            "entries",
+            "projects",
+            "settings",
+            "turn_files",
+            "turns",
+            "versions"
+        ]
     );
 }
 
@@ -573,6 +581,7 @@ fn global_settings_default_and_round_trip() {
     let s = GlobalSettings {
         size_cap_bytes: 1234,
         retention_keep: 7,
+        keep_in_tray: false,
     };
     db.set_global_settings(&s).unwrap();
     db.set_global_settings(&s).unwrap();
@@ -1666,7 +1675,16 @@ fn migration_from_v2_builds_refs_and_drops_the_entries_blob_index() {
             .collect::<rusqlite::Result<_>>()
             .unwrap()
     };
-    assert_eq!(names("index"), ["blobs_unreferenced", "versions_project"]);
+    assert_eq!(
+        names("index"),
+        [
+            "blobs_unreferenced",
+            "turns_after",
+            "turns_before",
+            "turns_project",
+            "versions_project"
+        ]
+    );
     assert_eq!(
         names("trigger"),
         [

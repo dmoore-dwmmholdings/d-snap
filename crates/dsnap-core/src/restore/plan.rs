@@ -233,15 +233,16 @@ fn same(cur: &Entry, e: &Entry) -> bool {
 
 /// Plan restoring `target` (a version's entries) over `current`.
 ///
-/// With `scope`, only that path is restored (restore one file): the target is that one
-/// entry, and only current paths that collide with it are considered (the path itself, its
-/// ancestors and its descendants).
+/// With `scope`, only those paths are restored (restore one file, or a turn's files): the
+/// target is their entries, and only current paths that collide with one of them are
+/// considered (the path itself, its ancestors and its descendants). A scoped path the
+/// target lacks is deleted.
 pub(crate) fn plan(
     root: &Path,
     target: &[Entry],
     current: &Current,
     rules: &IgnoreRules,
-    scope: Option<&RelPath>,
+    scope: Option<&[RelPath]>,
 ) -> Result<Plan> {
     let ci = current.ci;
     let guard = Guard {
@@ -249,23 +250,35 @@ pub(crate) fn plan(
         current,
         rules,
     };
+    let scope_keys: Option<HashSet<String>> =
+        scope.map(|paths| paths.iter().map(|p| key(p.as_str(), ci)).collect());
     let target: HashMap<String, &Entry> = target
         .iter()
-        .filter(|e| match scope {
+        .filter(|e| match &scope_keys {
             None => true,
-            Some(s) => key(e.path.as_str(), ci) == key(s.as_str(), ci),
+            Some(keys) => keys.contains(&key(e.path.as_str(), ci)),
         })
         .map(|e| (key(e.path.as_str(), ci), e))
         .collect();
-    // Descendants collide only with a file or link written at the scoped path.
-    let scope_is_dir = target.values().all(|e| e.kind == EntryKind::Dir);
-    let in_scope = |p: &str| match scope {
+    // Descendants collide only with a file or link written at a scoped path; a scoped path
+    // the target has as a directory (or lacks) keeps what is below it.
+    let scopes: Option<Vec<(String, bool)>> = scope_keys.as_ref().map(|keys| {
+        keys.iter()
+            .map(|s| {
+                let is_dir = target.get(s).is_none_or(|e| e.kind == EntryKind::Dir);
+                (s.clone(), is_dir)
+            })
+            .collect()
+    });
+    let in_scope = |p: &str| match &scopes {
         None => true,
-        Some(s) => {
-            let (k, s) = (key(p, ci), key(s.as_str(), ci));
-            k == s
-                || s.starts_with(&format!("{k}/"))
-                || (!scope_is_dir && k.starts_with(&format!("{s}/")))
+        Some(scopes) => {
+            let k = key(p, ci);
+            scopes.iter().any(|(s, is_dir)| {
+                k == *s
+                    || s.starts_with(&format!("{k}/"))
+                    || (!is_dir && k.starts_with(&format!("{s}/")))
+            })
         }
     };
     // Directories the target has, explicitly or as an ancestor of an entry.
@@ -573,7 +586,7 @@ mod tests {
             false,
         );
         let target = [file("a.txt", "old"), file("c.txt", "c")];
-        let p = plan(&f.root, &target, &cur, &f.rules, Some(&rp("a.txt"))).unwrap();
+        let p = plan(&f.root, &target, &cur, &f.rules, Some(&[rp("a.txt")])).unwrap();
         assert_eq!(paths(&p.write), ["a.txt"]);
         assert!(p.delete.is_empty());
     }
@@ -582,7 +595,7 @@ mod tests {
     fn scoped_dir_restore_keeps_files_inside() {
         let f = fx(&[("d/x.txt", "x")], "");
         let cur = Current::new(vec![file("d/x.txt", "x")], &[], &[], false);
-        let p = plan(&f.root, &[dir("d")], &cur, &f.rules, Some(&rp("d"))).unwrap();
+        let p = plan(&f.root, &[dir("d")], &cur, &f.rules, Some(&[rp("d")])).unwrap();
         assert!(p.delete.is_empty());
         assert!(p.remove_dirs.is_empty());
         assert!(p.create_dirs.is_empty());

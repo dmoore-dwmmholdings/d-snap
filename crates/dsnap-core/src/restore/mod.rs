@@ -121,6 +121,17 @@ impl Dsnap {
     /// diff (`req.working_hash`, or a change between the diff and the safety snapshot);
     /// [`Error::NotFound`]; [`Error::SafetySnapshotFailed`].
     pub fn revert_hunk(&self, project: ProjectId, req: &RevertHunk) -> Result<RestoreReport> {
+        self.revert_hunk_labelled(project, req, None)
+    }
+
+    /// [`Dsnap::revert_hunk`] with the safety snapshot's label given (`None`: "Before
+    /// restore to <the from version's label>").
+    pub(crate) fn revert_hunk_labelled(
+        &self,
+        project: ProjectId,
+        req: &RevertHunk,
+        safety_label: Option<String>,
+    ) -> Result<RestoreReport> {
         if req.to != VersionRef::WorkingTree {
             return Err(Error::InvalidInput(
                 "only changes in the folder can be reverted".into(),
@@ -162,7 +173,8 @@ impl Dsnap {
                 .latest_version(project)?
                 .map_or_else(|| "empty".to_owned(), |v| v.label),
         };
-        let (safety_version, safety) = self.safety_snapshot(project, &label)?;
+        let label = safety_label.unwrap_or_else(|| format!("Before restore to {label}"));
+        let (safety_version, safety) = self.safety_snapshot(project, label)?;
         let report =
             self.revert_after_safety(&proj, path, diffed, &reverted, safety_version, &safety);
         let protect: Vec<VersionId> = req.from.into_iter().chain([safety_version]).collect();
@@ -233,13 +245,13 @@ impl Dsnap {
     fn safety_snapshot(
         &self,
         project: ProjectId,
-        target_label: &str,
+        label: String,
     ) -> Result<(VersionId, SnapshotReport)> {
         let safety = self
             .snapshot_forced(
                 project,
                 SnapshotOptions {
-                    label: Some(format!("Before restore to {target_label}")),
+                    label: Some(label),
                     kind: VersionKind::Safety,
                     progress: None,
                     cancel: None,
@@ -260,7 +272,7 @@ impl Dsnap {
     }
 
     /// `id`, if it is a version of `project`; [`Error::NotFound`] otherwise.
-    fn version_of(&self, project: ProjectId, id: VersionId) -> Result<Version> {
+    pub(crate) fn version_of(&self, project: ProjectId, id: VersionId) -> Result<Version> {
         match self.db.get_version(id) {
             Ok(v) if v.project_id == project => Ok(v),
             Ok(_) | Err(Error::NotFound(_)) => Err(Error::NotFound(format!(
@@ -277,7 +289,6 @@ impl Dsnap {
         target: VersionId,
         scope: Option<&RelPath>,
     ) -> Result<RestoreReport> {
-        let proj = self.load_project(project)?;
         let version = self.version_of(project, target)?;
         if let Some(path) = scope {
             if self.db.entry(target, path)?.is_none() {
@@ -287,9 +298,25 @@ impl Dsnap {
                 )));
             }
         }
+        let label = format!("Before restore to {}", version.label);
+        self.restore_scoped(project, target, scope.map(std::slice::from_ref), label)
+    }
+
+    /// Restore `scope` (every path when `None`) to `target`, after a safety snapshot
+    /// labelled `safety_label`. A scoped path `target` lacks is deleted (undoing a file a
+    /// turn added, DSNA-120). Same steps and errors as [`Dsnap::restore_project`].
+    pub(crate) fn restore_scoped(
+        &self,
+        project: ProjectId,
+        target: VersionId,
+        scope: Option<&[RelPath]>,
+        safety_label: String,
+    ) -> Result<RestoreReport> {
+        let proj = self.load_project(project)?;
+        self.version_of(project, target)?;
 
         // 1. Safety snapshot.
-        let (safety_version, safety) = self.safety_snapshot(project, &version.label)?;
+        let (safety_version, safety) = self.safety_snapshot(project, safety_label)?;
 
         let report = self.restore_from(&proj, target, scope, safety_version, &safety);
         // 6. Retention, protecting the target and the undo point. The restore is done, so
@@ -303,7 +330,7 @@ impl Dsnap {
         &self,
         proj: &Project,
         target: VersionId,
-        scope: Option<&RelPath>,
+        scope: Option<&[RelPath]>,
         safety_version: VersionId,
         safety: &SnapshotReport,
     ) -> Result<RestoreReport> {
