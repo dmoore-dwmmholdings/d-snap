@@ -18,6 +18,8 @@
     onModeChange?: (mode: 'split' | 'inline') => void;
     /** Shows a "Revert" button on each hunk when set. */
     onRevertHunk?: (hunkIndex: number) => void;
+    /** Label of the per-hunk button (default "Revert"). */
+    revertLabel?: string;
     /** "Show hidden lines" between hunks; omitted = no button. */
     onExpand?: () => void;
     /** Status of the file, for the "renamed, contents identical" note. */
@@ -35,6 +37,7 @@
     onToggleWhitespace,
     onModeChange,
     onRevertHunk,
+    revertLabel = 'Revert',
     onExpand,
     status,
     loadImage,
@@ -180,7 +183,7 @@
             <span class="hdr mono">{r.header}</span>
             {#if onRevertHunk}
               <button type="button" class="revert" onclick={() => onRevertHunk(r.hunk)}
-                >Revert</button
+                >{revertLabel}</button
               >
             {/if}
           </div>
@@ -418,6 +421,7 @@
   .revert {
     font-size: var(--text-xs);
     padding: 0 6px;
+    min-height: 0;
     line-height: 16px;
   }
   .gap {

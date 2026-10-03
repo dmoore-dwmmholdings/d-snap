@@ -12,6 +12,7 @@
   const store = useStore();
   const IGNORE_EXAMPLE = ['*.log', 'build/', '!keep.log'].join('\n');
 
+  // Claude Code sends the prompt on stdin; `--hook` reads it, so each turn gets its title.
   const HOOKS = JSON.stringify(
     {
       hooks: {
@@ -171,8 +172,8 @@
 
 <section class="settings" aria-label="Settings">
   <header>
-    <h2>Settings</h2>
-    <button type="button" onclick={() => store.setView('main')}>Close</button>
+    <h1>Settings</h1>
+    <button type="button" onclick={() => store.setView('main')}>Done</button>
   </header>
 
   {#if loadError}
@@ -185,7 +186,7 @@
       }}
     >
       <fieldset>
-        <legend>All projects</legend>
+        <legend>All folders</legend>
         <label>
           <span>Skip files larger than</span>
           <input
@@ -211,9 +212,13 @@
             bind:value={form.retentionKeep}
             aria-invalid={!!errors.retentionKeep}
           />
-          snapshots per project (pinned ones are always kept)
+          snapshots per folder (pinned ones, and turns waiting for review, are always kept)
         </label>
         {#if errors.retentionKeep}<p class="field-error">{errors.retentionKeep}</p>{/if}
+        <label class="check">
+          <input type="checkbox" bind:checked={form.keepInTray} />
+          Keep d-snap running in the menu bar / tray when the window is closed
+        </label>
         <div class="row">
           <span>Data folder</span>
           <span class="mono path" title={dataDir}>{dataDir}</span>
@@ -228,7 +233,7 @@
       {#if projectId !== null && store.projects.length > 0}
         <fieldset>
           <legend>
-            Project
+            Folder
             <select
               aria-label="Project"
               value={projectId}
@@ -248,7 +253,7 @@
           </label>
           <label class="check">
             <input type="checkbox" bind:checked={form.respectGitignore} />
-            Respect the project's .gitignore files
+            Respect the folder's .gitignore files
           </label>
           <div class="auto" role="radiogroup" aria-label="Auto-snapshot">
             <span>Auto-snapshot</span>
@@ -300,8 +305,10 @@
     <fieldset>
       <legend>Claude Code hooks</legend>
       <p>
-        Add this to <span class="mono">.claude/settings.json</span> to snapshot before and after
-        every agent turn. It needs <span class="mono">dsnap</span> on your PATH.
+        Add this to <span class="mono">.claude/settings.json</span>. Every prompt then starts a turn
+        titled with what you asked, and every stop ends it, ready for review here. It needs
+        <span class="mono">dsnap</span> on your PATH (<span class="mono">dsnap hooks print</span>
+        prints the exact command).
       </p>
       <pre class="snippet">{HOOKS}</pre>
       <button type="button" onclick={() => void copyHooks()}>{copied ? 'Copied' : 'Copy'}</button>
@@ -331,35 +338,50 @@
 
 <style>
   .settings {
-    overflow: auto;
-    padding: var(--space-4) var(--space-5);
-    max-width: 760px;
+    padding: 36px 48px 64px;
+    max-width: 820px;
   }
   header {
     display: flex;
     justify-content: space-between;
     align-items: center;
+    margin-bottom: var(--space-4);
   }
-  h2 {
+  h1 {
     margin: 0;
-    font-size: var(--text-xl);
+    font-size: var(--text-display);
+    font-weight: 600;
+    letter-spacing: -0.025em;
   }
   fieldset {
-    border: 1px solid var(--border);
-    border-radius: var(--radius-md);
-    margin: var(--space-4) 0;
-    padding: var(--space-3) var(--space-4);
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius-lg);
+    background: var(--surface-0);
+    margin: 0 0 var(--space-4);
+    padding: var(--space-4) var(--space-5) var(--space-5);
     display: flex;
     flex-direction: column;
-    gap: var(--space-2);
+    gap: var(--space-3);
   }
   legend {
+    float: left;
+    width: 100%;
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    padding: 0;
+    margin-bottom: var(--space-2);
+    font-size: 18px;
     font-weight: 600;
-    padding: 0 var(--space-1);
+    letter-spacing: -0.01em;
+  }
+  legend + * {
+    clear: both;
   }
   label,
   .row {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     gap: var(--space-2);
   }
@@ -372,10 +394,7 @@
   }
   textarea {
     font-family: var(--font-mono);
-    background: var(--bg);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-sm);
-    padding: var(--space-2);
+    font-size: 13px;
   }
   small {
     color: var(--text-muted);
@@ -383,10 +402,11 @@
   .auto {
     display: flex;
     flex-direction: column;
-    gap: var(--space-1);
+    gap: var(--space-2);
   }
   .path {
     flex: 1;
+    min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -396,14 +416,18 @@
     display: flex;
     justify-content: flex-end;
     gap: var(--space-2);
+    margin-bottom: var(--space-4);
   }
   .snippet {
+    margin: 0;
     background: var(--surface-1);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-sm);
-    padding: var(--space-2);
+    border-radius: var(--radius-md);
+    padding: var(--space-3);
     overflow: auto;
     font-size: var(--text-sm);
+  }
+  p {
+    margin: 0;
   }
   .field-error,
   .error {

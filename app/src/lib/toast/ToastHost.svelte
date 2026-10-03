@@ -28,45 +28,70 @@
 <style>
   .toasts {
     position: fixed;
-    right: var(--space-4);
-    bottom: var(--space-4);
+    left: var(--space-5);
+    bottom: var(--space-5);
     display: flex;
     flex-direction: column;
     gap: var(--space-2);
     z-index: 60;
-    max-width: min(440px, calc(100vw - 32px));
+    max-width: min(560px, calc(100vw - 48px));
   }
   .toast {
     display: flex;
-    align-items: flex-start;
-    gap: var(--space-2);
-    padding: var(--space-2) var(--space-3);
-    border-radius: var(--radius-md);
-    border: 1px solid var(--border);
-    border-left-width: 4px;
-    background: var(--surface-1);
-    box-shadow: 0 4px 14px rgb(0 0 0 / 15%);
+    align-items: center;
+    gap: var(--space-3);
+    padding: 10px 10px 10px 18px;
+    border-radius: var(--radius-lg);
+    background: var(--accent);
+    color: var(--accent-text);
+    box-shadow: var(--shadow-dialog);
+    animation: rise 0.18s ease-out;
   }
-  .success {
-    border-left-color: var(--status-added);
+  .toast.error {
+    background: var(--status-deleted);
+    color: #fff;
   }
-  .warning {
-    border-left-color: var(--status-modified);
-  }
-  .error {
-    border-left-color: var(--status-deleted);
-  }
-  .info {
-    border-left-color: var(--accent);
+  .toast.warning::before {
+    content: '';
+    flex: none;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--warn-strong);
   }
   .msg {
     flex: 1;
     overflow-wrap: anywhere;
   }
+  .toast :global(button.link) {
+    flex: none;
+    min-height: 34px;
+    padding: 0 12px;
+    border-radius: var(--radius-sm);
+    background: var(--marker);
+    color: var(--marker-ink);
+    font-weight: 600;
+    text-decoration: none;
+    white-space: nowrap;
+  }
   .close {
+    flex: none;
+    width: 34px;
+    min-height: 34px;
     border: none;
     background: none;
-    color: var(--text-muted);
-    padding: 0 var(--space-1);
+    color: inherit;
+    opacity: 0.8;
+    font-size: 18px;
+    padding: 0;
+  }
+  .close:hover:not(:disabled) {
+    background: rgb(255 255 255 / 12%);
+  }
+  @keyframes rise {
+    from {
+      opacity: 0;
+      transform: translateY(8px);
+    }
   }
 </style>

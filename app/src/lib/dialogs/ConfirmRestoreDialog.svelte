@@ -27,7 +27,7 @@
   const title = $derived(
     file
       ? `Restore ${file.slice(file.lastIndexOf('/') + 1)}?`
-      : `Restore project to “${version.label}”?`,
+      : `Restore folder to “${version.label}”?`,
   );
 </script>
 

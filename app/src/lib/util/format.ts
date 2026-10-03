@@ -14,6 +14,12 @@ export function relativeTime(ms: number, now: number = Date.now()): string {
   return new Date(ms).toLocaleDateString();
 }
 
+/** "5 min ago · 14:30" for recent times, the full date and time otherwise. */
+export function whenText(ms: number, now: number = Date.now()): string {
+  const abs = absoluteTime(ms);
+  return now - ms < 7 * 86_400_000 ? `${relativeTime(ms, now)} · ${abs}` : abs;
+}
+
 /** Full local date and time, for tooltips. */
 export function absoluteTime(ms: number): string {
   return new Date(ms).toLocaleString();
