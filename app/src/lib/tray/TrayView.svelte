@@ -69,7 +69,7 @@
       const r = await api.undoTurn(t.projectId, t.id, { paths: null, includeChanged: false });
       const left = r.skippedChanged.length;
       message = {
-        text: `Turn ${t.seq} undone.${left ? ` ${plural(left, 'file')} you changed since stayed.` : ''}`,
+        text: `Turn ${t.seq} undone.${left ? ` ${plural(left, 'file')} that changed since stayed.` : ''}`,
         undo: () => void api.redoTurn(t.projectId, t.id, null).then(() => load()),
       };
       await load();
@@ -138,7 +138,7 @@
           : ''}</span
       >
       {#if confirming}
-        <p class="confirm">Undo puts its files back. Files you changed since stay. Undo it?</p>
+        <p class="confirm">Undo puts its files back. Files that changed since stay. Undo it?</p>
       {/if}
       <div class="buttons">
         {#if confirming}

@@ -20,11 +20,7 @@ describe('App', () => {
     await setup();
     expect(screen.getByRole('button', { name: 'Keep all' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Undo the whole turn' })).toBeInTheDocument();
-    expect(
-      await screen.findByText(
-        'You changed this file after the turn. Undoing it would discard those edits.',
-      ),
-    ).toBeInTheDocument();
+    expect(await screen.findByText(/Changed again after this turn/)).toBeInTheDocument();
     const nav = screen.getByRole('navigation', { name: 'Folders' });
     expect(within(nav).getByRole('button', { name: /^web-shop/ })).toHaveAttribute(
       'aria-pressed',

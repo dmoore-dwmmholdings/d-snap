@@ -28,9 +28,9 @@ describe('TrayView', () => {
     render(TrayView, { props: { api } });
     await screen.findByText(/Turn 5 finished/);
     await fireEvent.click(screen.getByRole('button', { name: 'Undo turn' }));
-    expect(screen.getByText(/Files you changed since stay/)).toBeInTheDocument();
+    expect(screen.getByText(/Files that changed since stay/)).toBeInTheDocument();
     await fireEvent.click(screen.getByRole('button', { name: 'Undo turn' }));
-    await screen.findByText(/Turn 5 undone\. 1 file you changed since stayed\./);
+    await screen.findByText(/Turn 5 undone\. 1 file that changed since stayed\./);
     expect(screen.getByRole('button', { name: 'Put it back' })).toBeInTheDocument();
   });
 

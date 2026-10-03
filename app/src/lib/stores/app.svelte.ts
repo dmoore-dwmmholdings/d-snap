@@ -596,7 +596,7 @@ export class AppStore {
           ? `${one} is back as it was before Turn ${r.turn.seq}. A safety copy was saved.`
           : `Turn ${r.turn.seq} is undone. A safety copy was saved.`;
         if (r.skippedChanged.length > 0) {
-          text += ` Left alone, because you changed them since: ${r.skippedChanged.join(', ')}.`;
+          text += ` Left alone, because they changed again since: ${r.skippedChanged.join(', ')}.`;
         }
         if (r.restore.failed.length > 0) this.restoreResult = r.restore;
         else

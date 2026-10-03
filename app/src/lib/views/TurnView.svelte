@@ -227,7 +227,7 @@
             chipClass={f.decision === 'undone' ? 'ink' : ''}
             settled={f.decision !== null}
             note={f.decision === null && f.changedSince
-              ? 'You changed this file after the turn. Undoing it would discard those edits.'
+              ? 'Changed again after this turn (by you or a later turn). Undoing it would discard those changes.'
               : undefined}
             onHunk={!running &&
             f.decision === null &&
@@ -288,7 +288,7 @@
     {@const f = confirmFile}
     <Dialog
       title="Undo {f.change.path} anyway?"
-      confirmLabel="Undo and discard my edits"
+      confirmLabel="Undo and discard later changes"
       danger
       busy={store.busy !== null}
       oncancel={() => (confirmFile = null)}
@@ -298,8 +298,8 @@
       }}
     >
       <p>
-        You edited this file after Turn {turn.seq}. Undoing puts it back as it was before the
-        prompt, which also removes those later edits.
+        This file changed again after Turn {turn.seq}. Undoing puts it back as it was before the
+        prompt, which also removes those later changes.
       </p>
       <p class="muted">
         They stay in a safety copy, so “Undo” on the next message brings them back.
@@ -343,7 +343,7 @@
           </p>
           <label>
             <input type="checkbox" bind:checked={includeChanged} />
-            Undo them too, discarding my later edits
+            Undo them too, discarding the later changes
           </label>
         </div>
       {/if}
