@@ -1,7 +1,7 @@
 // Deterministic demo data for the mock Api: 3 projects with ~15 versions each.
 import type { ProjectRecord, Tree } from './state';
 import { MockState, compareTrees, countChanges } from './state';
-import type { ProjectSettings, VersionKind } from '../types';
+import type { FileDecision, ProjectSettings, VersionKind } from '../types';
 import { prng, timestampLabel } from './util';
 
 const HOUR = 3_600_000;
@@ -31,6 +31,7 @@ class Seeder {
       project: { id, name, root, settings: defaultSettings(), missing },
       tree: new Map(),
       versions: [],
+      turns: [],
     };
     this.state.projects.set(id, rec);
     return rec;
@@ -131,6 +132,44 @@ class Seeder {
       entries,
     });
   }
+}
+
+/**
+ * Pairs the hook snapshots into turns, oldest first: each "after agent turn" version ends a
+ * turn that began at the version just before it (the "before agent turn" one, or the latest
+ * version when nothing changed before the prompt). `turns` gives each its prompt and the
+ * decision for all its files (`null` = waiting for review).
+ */
+function pairTurns(
+  s: Seeder,
+  rec: ProjectRecord,
+  turns: { prompt: string; decision: FileDecision | null }[],
+): void {
+  let n = 0;
+  rec.versions.forEach((vr, i) => {
+    if (vr.version.label !== 'after agent turn' || i === 0) return;
+    const spec = turns[n++];
+    if (!spec) return;
+    const before = rec.versions[i - 1]!;
+    const decisions = new Map<string, FileDecision>();
+    if (spec.decision) {
+      for (const c of compareTrees(s.state, before.entries, vr.entries, false)) {
+        decisions.set(c.path, spec.decision);
+      }
+    }
+    rec.turns.push({
+      id: s.state.nextTurnId++,
+      seq: rec.turns.length + 1,
+      sessionId: 'demo-session',
+      prompt: spec.prompt,
+      startedAtMs: before.version.createdAtMs,
+      endedAtMs: vr.version.createdAtMs,
+      before: before.version.id,
+      after: vr.version.id,
+      decisions,
+      reviewedAtMs: spec.decision ? vr.version.createdAtMs + 60_000 : null,
+    });
+  });
 }
 
 function tsModule(name: string, fns: number): string {
@@ -260,6 +299,17 @@ function seedWebShop(s: Seeder): void {
   s.put(p, 'src/payment.ts', tsModule('payment', 3));
   s.snap(p, 'cli', 'after agent turn'); // 15
 
+  pairTurns(s, p, [
+    { prompt: 'Split checkout out of index.ts into its own module.', decision: 'kept' },
+    { prompt: 'Generate TypeScript types for the API schema.', decision: 'kept' },
+    { prompt: 'Regenerate the schema types from the new openapi.yaml.', decision: 'kept' },
+    { prompt: 'Remove the old notes and the empty log archive.', decision: 'kept' },
+    {
+      prompt: 'Add a payment step after checkout and cancel the order if the card is declined.',
+      decision: null,
+    },
+  ]);
+
   // Unsaved changes in the folder.
   s.tweak(p, 'src/cart.ts', 2);
   s.put(p, 'src/config.ts', "export const API_URL = 'http://localhost:3000';\n");
@@ -297,6 +347,11 @@ function seedRustTool(s: Seeder): void {
   const last = p.versions[p.versions.length - 1];
   if (last) last.version.kind = 'safety';
   if (last) last.version.label = 'Before restore to Step 9';
+  pairTurns(s, p, [
+    { prompt: 'Add a --json flag to the list command.', decision: 'kept' },
+    { prompt: 'Fix the off-by-one in parse_range.', decision: 'kept' },
+    { prompt: 'Move formatting helpers into fmt.rs.', decision: 'kept' },
+  ]);
 }
 
 /** Project 3: notes folder that was moved ("missing"). */

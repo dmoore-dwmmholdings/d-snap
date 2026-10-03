@@ -3,9 +3,12 @@ import { ApiError, type Api, type Unsubscribe } from './api';
 import type {
   BlobHash,
   DiffOptions,
+  Entry,
   FileChange,
+  FileDecision,
   FileDiff,
   GlobalSettings,
+  PathVersion,
   Progress,
   ProgressOp,
   ProgressPhase,
@@ -18,6 +21,12 @@ import type {
   RestoreReport,
   SkippedFile,
   SnapshotReport,
+  Turn,
+  TurnDecisionChange,
+  TurnFile,
+  TurnId,
+  UndoTurnReport,
+  UndoTurnRequest,
   Version,
   VersionId,
   VersionKind,
@@ -34,6 +43,7 @@ import {
   sameContent,
   type ProjectRecord,
   type Tree,
+  type TurnRecord,
 } from './mock/state';
 import { imageMime, textToBase64, timestampLabel } from './mock/util';
 
@@ -112,6 +122,46 @@ export class MockApi implements Api {
     return this.capture(rec, 'cli', label, false).version;
   }
 
+  /** Simulates the `UserPromptSubmit` hook: snapshot, then begin a turn. */
+  mockBeginTurn(projectId: ProjectId, prompt: string, sessionId = 'mock-session'): Turn {
+    const rec = this.rec(projectId);
+    const report = this.capture(rec, 'cli', 'before agent turn', false);
+    const before = report.version?.id ?? rec.versions.at(-1)?.version.id ?? null;
+    const open = rec.turns.find((t) => t.endedAtMs === null && t.sessionId === sessionId);
+    if (open) {
+      open.endedAtMs = this.now();
+      open.after = before;
+    }
+    const tr: TurnRecord = {
+      id: this.state.nextTurnId++,
+      seq: rec.turns.length + 1,
+      sessionId,
+      prompt: prompt.trim(),
+      startedAtMs: this.now(),
+      endedAtMs: null,
+      before,
+      after: null,
+      decisions: new Map(),
+      reviewedAtMs: null,
+    };
+    rec.turns.push(tr);
+    this.emitVersionsChanged(rec);
+    return clone(this.turnOf(rec, tr));
+  }
+
+  /** Simulates the `Stop` hook: snapshot, then end the running turn. */
+  mockEndTurn(projectId: ProjectId): Turn | null {
+    const rec = this.rec(projectId);
+    const report = this.capture(rec, 'cli', 'after agent turn', false);
+    const after = report.version?.id ?? rec.versions.at(-1)?.version.id ?? null;
+    const open = [...rec.turns].reverse().find((t) => t.endedAtMs === null);
+    if (!open) return null;
+    open.endedAtMs = this.now();
+    open.after = after;
+    this.emitVersionsChanged(rec);
+    return clone(this.turnOf(rec, open));
+  }
+
   // ---- Api ---------------------------------------------------------------
 
   listProjects(): Promise<Project[]> {
@@ -143,6 +193,7 @@ export class MockApi implements Api {
         },
         tree: new Map(),
         versions: [],
+        turns: [],
       };
       const t = this.now() * 1_000_000;
       const files: [string, string][] = [
@@ -418,6 +469,150 @@ export class MockApi implements Api {
       rec.tree.set(path, this.state.fileEntry(path, hash, this.now() * 1_000_000));
       this.emitProjectChanged(rec);
       return { safetyVersion: safety, written: [path], deleted: [], failed: [], uncaptured: [] };
+    });
+  }
+
+  listTurns(projectId: ProjectId): Promise<Turn[]> {
+    return this.call(() => {
+      const rec = this.rec(projectId);
+      return [...rec.turns].reverse().map((t) => this.turnOf(rec, t));
+    });
+  }
+
+  turnFiles(turnId: TurnId): Promise<TurnFile[]> {
+    return this.call(() => {
+      const { rec, tr } = this.turnRec(turnId);
+      return this.filesOf(rec, tr);
+    });
+  }
+
+  setTurnDecisions(turnId: TurnId, changes: TurnDecisionChange[]): Promise<Turn> {
+    return this.call(() => {
+      const { rec, tr } = this.turnRec(turnId);
+      const paths = new Set(this.filesOf(rec, this.ended(rec, tr)).map((f) => f.change.path));
+      for (const c of changes) {
+        if (!paths.has(c.path)) {
+          throw new ApiError('invalid_input', `${c.path} is not a file of Turn ${tr.seq}.`);
+        }
+      }
+      for (const c of changes) this.decide(tr, c.path, c.decision);
+      this.markReviewed(rec, tr);
+      this.emitVersionsChanged(rec);
+      return this.turnOf(rec, tr);
+    });
+  }
+
+  keepTurn(turnId: TurnId): Promise<Turn> {
+    return this.call(() => {
+      const { rec, tr } = this.turnRec(turnId);
+      for (const f of this.filesOf(rec, this.ended(rec, tr))) {
+        if (!tr.decisions.has(f.change.path)) tr.decisions.set(f.change.path, 'kept');
+      }
+      this.markReviewed(rec, tr);
+      this.emitVersionsChanged(rec);
+      return this.turnOf(rec, tr);
+    });
+  }
+
+  undoTurn(projectId: ProjectId, turnId: TurnId, req: UndoTurnRequest): Promise<UndoTurnReport> {
+    return this.operation('restore', projectId, (rec) => {
+      if (rec.project.missing) throw missing(rec);
+      const tr = this.ended(rec, this.turnIn(rec, turnId));
+      const files = this.select(tr, this.filesOf(rec, tr), req.paths);
+      const undo = files.filter((f) => req.includeChanged || !f.changedSince);
+      const skippedChanged = files.filter((f) => !undo.includes(f)).map((f) => f.change.path);
+      if (undo.length === 0) {
+        throw new ApiError(
+          'invalid_input',
+          'Nothing to undo: every selected file changed after the turn.',
+        );
+      }
+      const restore = this.putFiles(rec, tr.before!, undo, `Before undoing Turn ${tr.seq}`);
+      for (const f of undo) this.decide(tr, f.change.path, 'undone');
+      this.markReviewed(rec, tr);
+      return { restore, skippedChanged, turn: this.turnOf(rec, tr) };
+    });
+  }
+
+  redoTurn(projectId: ProjectId, turnId: TurnId, paths: RelPath[] | null): Promise<UndoTurnReport> {
+    return this.operation('restore', projectId, (rec) => {
+      if (rec.project.missing) throw missing(rec);
+      const tr = this.ended(rec, this.turnIn(rec, turnId));
+      const files = this.select(tr, this.filesOf(rec, tr), paths).filter(
+        (f) => paths !== null || f.decision === 'undone',
+      );
+      if (files.length === 0) {
+        throw new ApiError('invalid_input', `Nothing of Turn ${tr.seq} is undone.`);
+      }
+      const restore = this.putFiles(rec, tr.after!, files, `Before putting back Turn ${tr.seq}`);
+      for (const f of files) this.decide(tr, f.change.path, null);
+      this.markReviewed(rec, tr);
+      return { restore, skippedChanged: [], turn: this.turnOf(rec, tr) };
+    });
+  }
+
+  undoTurnHunk(
+    projectId: ProjectId,
+    turnId: TurnId,
+    path: RelPath,
+    hunkIndex: number,
+    opts: DiffOptions,
+  ): Promise<RestoreReport> {
+    return this.operation('restore', projectId, (rec) => {
+      if (rec.project.missing) throw missing(rec);
+      const tr = this.ended(rec, this.turnIn(rec, turnId));
+      const file = this.filesOf(rec, tr).find((f) => f.change.path === path);
+      if (!file) throw new ApiError('invalid_input', `${path} is not a file of Turn ${tr.seq}.`);
+      if (file.changedSince) {
+        throw new ApiError(
+          'invalid_input',
+          `${path} changed after Turn ${tr.seq}; undo the whole file instead.`,
+        );
+      }
+      const diff = this.diffOf(rec, tr.before, { kind: 'version', id: tr.after! }, path, opts);
+      if (diff.body.kind !== 'text')
+        throw new ApiError('invalid_input', `${path} has no text hunks.`);
+      const hunk = diff.body.hunks[hunkIndex];
+      if (!hunk) throw new ApiError('invalid_input', `Hunk ${hunkIndex} does not exist.`);
+      const text = revertHunkText(
+        this.state.entryText(file.change.old),
+        this.state.entryText(file.change.new),
+        hunk,
+      );
+      const safety = this.capture(rec, 'safety', `Before undoing part of Turn ${tr.seq}`, true)
+        .version!.id;
+      rec.tree.set(path, this.state.fileEntry(path, this.state.putText(text), this.now() * 1e6));
+      this.emitProjectChanged(rec);
+      return { safetyVersion: safety, written: [path], deleted: [], failed: [], uncaptured: [] };
+    });
+  }
+
+  pathHistory(projectId: ProjectId, path: RelPath): Promise<PathVersion[]> {
+    return this.call(() => {
+      const rec = this.rec(projectId);
+      const out: PathVersion[] = [];
+      let prev: Entry | null = null;
+      for (const vr of rec.versions) {
+        const e = vr.entries.get(path) ?? null;
+        const changed = prev === null ? e !== null : e === null || !sameContent(prev, e);
+        if (changed) out.push({ version: vr.version, entry: e });
+        prev = e;
+      }
+      return out.reverse();
+    });
+  }
+
+  knownPaths(projectId: ProjectId): Promise<RelPath[]> {
+    return this.call(() => {
+      const rec = this.rec(projectId);
+      const paths = new Set<RelPath>();
+      for (const [p, e] of this.latest(rec) ?? new Map<RelPath, Entry>()) {
+        if (e.kind.kind !== 'dir') paths.add(p);
+      }
+      if (!rec.project.missing) {
+        for (const c of this.statusOf(rec, false)) if (c.new) paths.add(c.path);
+      }
+      return [...paths].sort();
     });
   }
 
@@ -719,6 +914,169 @@ export class MockApi implements Api {
     rec.versions = rec.versions.filter((v) => !drop.has(v.version.id));
     this.state.recount(rec);
     this.emitVersionsChanged(rec);
+  }
+
+  // ---- turns ----
+
+  private turnRec(id: TurnId): { rec: ProjectRecord; tr: TurnRecord } {
+    for (const rec of this.state.projects.values()) {
+      const tr = rec.turns.find((t) => t.id === id);
+      if (tr) return { rec, tr };
+    }
+    throw new ApiError('not_found', `Turn ${id} not found.`);
+  }
+
+  private turnIn(rec: ProjectRecord, id: TurnId): TurnRecord {
+    const tr = rec.turns.find((t) => t.id === id);
+    if (!tr) throw new ApiError('invalid_input', `Turn ${id} is not in "${rec.project.name}".`);
+    return tr;
+  }
+
+  private has(rec: ProjectRecord, id: VersionId | null): boolean {
+    return id !== null && rec.versions.some((v) => v.version.id === id);
+  }
+
+  /** `tr` if it ended with both versions present. */
+  private ended(rec: ProjectRecord, tr: TurnRecord): TurnRecord {
+    if (tr.endedAtMs === null) {
+      throw new ApiError('invalid_input', `Turn ${tr.seq} is still running.`);
+    }
+    if (!this.has(rec, tr.before) || !this.has(rec, tr.after)) {
+      throw new ApiError(
+        'invalid_input',
+        `The snapshots of Turn ${tr.seq} were deleted, so it cannot be compared or undone.`,
+      );
+    }
+    return tr;
+  }
+
+  private turnOf(rec: ProjectRecord, tr: TurnRecord): Turn {
+    const before = this.has(rec, tr.before) ? tr.before : null;
+    const after = this.has(rec, tr.after) ? tr.after : null;
+    let counts = { added: 0, modified: 0, deleted: 0 };
+    if (before !== null && after !== null && before !== after) {
+      counts = countChanges(
+        compareTrees(
+          this.state,
+          this.versionIn(rec, before).entries,
+          this.versionIn(rec, after).entries,
+          false,
+        ),
+      );
+    }
+    const total = counts.added + counts.modified + counts.deleted;
+    const state: Turn['state'] =
+      tr.endedAtMs === null
+        ? 'running'
+        : before === null || after === null
+          ? 'pruned'
+          : total === 0
+            ? 'empty'
+            : tr.reviewedAtMs !== null
+              ? 'reviewed'
+              : 'pending';
+    const values = [...tr.decisions.values()];
+    return {
+      id: tr.id,
+      projectId: rec.project.id,
+      seq: tr.seq,
+      sessionId: tr.sessionId,
+      prompt: tr.prompt,
+      startedAtMs: tr.startedAtMs,
+      endedAtMs: tr.endedAtMs,
+      before,
+      after: tr.endedAtMs === null ? null : after,
+      counts,
+      kept: values.filter((d) => d === 'kept').length,
+      undone: values.filter((d) => d === 'undone').length,
+      reviewedAtMs: tr.reviewedAtMs,
+      state,
+    };
+  }
+
+  private filesOf(rec: ProjectRecord, tr: TurnRecord): TurnFile[] {
+    if (!this.has(rec, tr.before)) {
+      throw new ApiError('invalid_input', `The snapshots of Turn ${tr.seq} were deleted.`);
+    }
+    const older = this.versionIn(rec, tr.before!).entries;
+    if (tr.endedAtMs === null) {
+      const now = rec.project.missing ? older : this.state.capturable(rec).kept;
+      return compareTrees(this.state, older, now, true).map((change) => ({
+        change,
+        decision: null,
+        changedSince: false,
+      }));
+    }
+    this.ended(rec, tr);
+    const after = this.versionIn(rec, tr.after!).entries;
+    const working = rec.project.missing ? null : this.state.capturable(rec).kept;
+    const differs = (want: Entry | null | undefined, p: RelPath) => {
+      if (!working) return false;
+      const have = working.get(p);
+      if (!want) return have !== undefined;
+      return !have || !sameContent(want, have);
+    };
+    return compareTrees(this.state, older, after, true).map((change) => ({
+      change,
+      decision: tr.decisions.get(change.path) ?? null,
+      changedSince:
+        differs(change.new, change.path) ||
+        (change.status.kind === 'renamed' && differs(null, change.status.from)),
+    }));
+  }
+
+  private select(tr: TurnRecord, files: TurnFile[], paths: RelPath[] | null): TurnFile[] {
+    if (paths === null) return files;
+    return paths.map((p) => {
+      const f = files.find((x) => x.change.path === p);
+      if (!f) throw new ApiError('invalid_input', `${p} is not a file of Turn ${tr.seq}.`);
+      return f;
+    });
+  }
+
+  private decide(tr: TurnRecord, path: RelPath, d: FileDecision | null): void {
+    if (d === null) tr.decisions.delete(path);
+    else tr.decisions.set(path, d);
+  }
+
+  private markReviewed(rec: ProjectRecord, tr: TurnRecord): void {
+    const files = this.filesOf(rec, tr);
+    const all = files.length > 0 && files.every((f) => tr.decisions.has(f.change.path));
+    tr.reviewedAtMs = all ? (tr.reviewedAtMs ?? this.now()) : null;
+  }
+
+  /** Make `files` match version `target` (both paths of a rename), after a safety snapshot. */
+  private putFiles(
+    rec: ProjectRecord,
+    target: VersionId,
+    files: TurnFile[],
+    label: string,
+  ): RestoreReport {
+    const entries = this.versionIn(rec, target).entries;
+    const { check } = this.guard(rec);
+    const safety = this.capture(rec, 'safety', label, true).version!.id;
+    const written: RelPath[] = [];
+    const deleted: RelPath[] = [];
+    const uncaptured: RelPath[] = [];
+    const t = this.now() * 1_000_000;
+    for (const f of files) {
+      const paths = [f.change.path];
+      if (f.change.status.kind === 'renamed') paths.push(f.change.status.from);
+      for (const p of paths) {
+        if (check(p, true)) {
+          uncaptured.push(p);
+          continue;
+        }
+        const e = entries.get(p);
+        if (e) {
+          rec.tree.set(p, { ...e, mtimeNs: t });
+          written.push(p);
+        } else if (rec.tree.delete(p)) deleted.push(p);
+      }
+    }
+    this.emitProjectChanged(rec);
+    this.emitVersionsChanged(rec);
+    return { safetyVersion: safety, written, deleted, failed: [], uncaptured };
   }
 
   private emitProjectChanged(rec: ProjectRecord): void {

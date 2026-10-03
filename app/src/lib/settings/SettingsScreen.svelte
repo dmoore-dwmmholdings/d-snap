@@ -55,6 +55,7 @@
     return {
       sizeCapMb: String(Math.round(g.sizeCapBytes / (1024 * 1024))),
       retentionKeep: String(g.retentionKeep),
+      keepInTray: g.keepInTray,
       extraIgnore: p ? p.extraIgnore.join('\n') : '',
       respectGitignore: p?.respectGitignore ?? true,
       autoKind: a.kind,
@@ -111,6 +112,7 @@
       const global: GlobalSettings = {
         sizeCapBytes: Number(f.sizeCapMb) * 1024 * 1024,
         retentionKeep: Number(f.retentionKeep),
+        keepInTray: f.keepInTray,
       };
       await store.api.setGlobalSettings(global);
       let project: ProjectSettings | null = null;
