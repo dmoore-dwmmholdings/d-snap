@@ -1,7 +1,19 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Permissions for the main D-Snap window.",
-  "windows": ["main"],
-  "permissions": ["core:default", "dialog:allow-open", "opener:allow-reveal-item-in-dir"]
+  "description": "Permissions for the D-Snap window and its tray popover (DSNA-128).",
+  "windows": ["main", "tray"],
+  "permissions": [
+    "core:default",
+    "core:window:allow-show",
+    "core:window:allow-hide",
+    "core:window:allow-set-focus",
+    "core:window:allow-unminimize",
+    "core:tray:allow-get-by-id",
+    "core:tray:allow-set-title",
+    "core:event:allow-emit-to",
+    "core:tray:allow-set-tooltip",
+    "dialog:allow-open",
+    "opener:allow-reveal-item-in-dir"
+  ]
 }

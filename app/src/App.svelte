@@ -5,6 +5,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { api as defaultApi, type Api } from './lib/api';
+  import { onOpenTarget, setTrayWaiting } from './lib/desktop';
   import ConfirmRestoreDialog from './lib/dialogs/ConfirmRestoreDialog.svelte';
   import ProgressOverlay from './lib/dialogs/ProgressOverlay.svelte';
   import RestoreResultDialog from './lib/dialogs/RestoreResultDialog.svelte';
@@ -34,10 +35,22 @@
     void store.start();
     const onFocus = () => void store.refreshAll();
     window.addEventListener('focus', onFocus);
+    // The tray popover's "Review" opens a turn here (DSNA-128).
+    const stopOpen = onOpenTarget(async (t) => {
+      await store.selectProject(t.projectId);
+      if (t.turnId !== null) store.select({ kind: 'turn', id: t.turnId });
+    });
     return () => {
       window.removeEventListener('focus', onFocus);
+      stopOpen();
       store.stop();
     };
+  });
+
+  // The tray shows how many turns wait for review, across folders.
+  $effect(() => {
+    const total = Object.values(store.waiting).reduce((a, b) => a + b, 0);
+    void setTrayWaiting(total);
   });
 
   /** A missing folder shows its panel until the user chooses to browse its snapshots. */

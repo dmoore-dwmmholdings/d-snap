@@ -2,6 +2,7 @@
 //! events.
 
 pub mod commands;
+pub mod tray;
 
 use std::sync::Arc;
 
@@ -82,8 +83,13 @@ pub fn run() {
             let backend = Arc::new(Backend::open(None, emit));
             backend.start_live();
             app.manage(AppState(backend));
+            // Without a tray (a desktop with no status area) the app works as a plain window.
+            if let Err(e) = tray::install(app.handle()) {
+                eprintln!("d-snap: no tray icon: {e}");
+            }
             Ok(())
         })
+        .on_window_event(tray::on_window_event)
         .invoke_handler(handler())
         .run(tauri::generate_context!());
     if let Err(err) = result {
