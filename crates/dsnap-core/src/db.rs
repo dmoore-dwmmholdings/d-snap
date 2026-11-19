@@ -77,6 +77,11 @@ pub const REMOVE_BATCH_BUDGET: Duration = Duration::from_millis(250);
 /// (which polls at most every 100 ms) gets the lock before the next batch takes it.
 const REMOVE_BATCH_PAUSE: Duration = Duration::from_millis(100);
 
+/// Pause a background write loop (prune, sweep) takes between write transactions, so a
+/// writer waiting in SQLite's busy handler gets the lock (DSNA-129). Same reasoning and
+/// value as [`REMOVE_BATCH_PAUSE`].
+pub(crate) const WRITER_YIELD: Duration = REMOVE_BATCH_PAUSE;
+
 /// Blobs deleted per [`Db::prune_unreferenced`] call when pruning everything in batches.
 ///
 /// Small enough that one batch (one store file delete per blob) finishes well inside the
