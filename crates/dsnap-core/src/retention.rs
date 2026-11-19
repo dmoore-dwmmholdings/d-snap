@@ -96,7 +96,12 @@ impl Dsnap {
     /// delete store files directly (see the `db` module docs, DSNA-80).
     pub fn prune_blobs(&self) -> Result<RetentionReport> {
         let mut total = self.prune_unreferenced_all()?;
+        // Each step below is a `BEGIN IMMEDIATE` transaction. SQLite's busy handler sleeps
+        // between polls, so a writer waiting on this lock loses to a prune that releases and
+        // retakes it at once (DSNA-129: starvation, seen on macOS). Pause after every step.
+        std::thread::sleep(crate::db::WRITER_YIELD);
         let swept = self.db.sweep_orphans(&self.store)?;
+        std::thread::sleep(crate::db::WRITER_YIELD);
         total.blobs_pruned = total.blobs_pruned.saturating_add(swept.blobs_pruned);
         total.bytes_freed = total.bytes_freed.saturating_add(swept.bytes_freed);
         // The sweep visits every unreferenced object on disk, including the ones the prune
@@ -137,6 +142,8 @@ impl Dsnap {
                 Ok(r) => {
                     total.blobs_pruned = total.blobs_pruned.saturating_add(r.blobs_pruned);
                     total.bytes_freed = total.bytes_freed.saturating_add(r.bytes_freed);
+                    // Let a writer waiting in SQLite's busy handler take the lock (DSNA-129).
+                    std::thread::sleep(crate::db::WRITER_YIELD);
                 }
                 Err(Error::Io { .. }) => {
                     // Reporting only: the count is not used to delete anything.
