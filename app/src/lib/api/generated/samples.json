@@ -122,6 +122,10 @@
       }
     }
   ],
+  "FileDecision": [
+    "kept",
+    "undone"
+  ],
   "FileDiff": [
     {
       "body": {
@@ -133,6 +137,7 @@
   ],
   "GlobalSettings": [
     {
+      "keepInTray": true,
       "retentionKeep": 200,
       "sizeCapBytes": 52428800
     }
@@ -157,6 +162,34 @@
     "equal",
     "insert",
     "delete"
+  ],
+  "PathVersion": [
+    {
+      "entry": {
+        "blob": "3ae7d805f6789a6402acb70ad4096a85a56bf6804eaf25c0493ac697548d30b5",
+        "kind": {
+          "kind": "file"
+        },
+        "mtimeNs": 1700000000000000000,
+        "path": "src/a.rs",
+        "readonly": false,
+        "size": 3
+      },
+      "version": {
+        "counts": {
+          "added": 1,
+          "deleted": 3,
+          "modified": 2
+        },
+        "createdAtMs": 1700000000000,
+        "id": 2,
+        "kind": "manual",
+        "label": "v",
+        "pinned": false,
+        "projectId": 1,
+        "unstable": false
+      }
+    }
   ],
   "Progress": [
     {
@@ -279,6 +312,110 @@
         "projectId": 1,
         "unstable": false
       }
+    }
+  ],
+  "Turn": [
+    {
+      "after": 3,
+      "before": 2,
+      "counts": {
+        "added": 1,
+        "deleted": 3,
+        "modified": 2
+      },
+      "endedAtMs": 1700000100000,
+      "id": 7,
+      "kept": 1,
+      "projectId": 1,
+      "prompt": "Add a payment step",
+      "reviewedAtMs": null,
+      "seq": 9,
+      "sessionId": "s",
+      "startedAtMs": 1700000000000,
+      "state": "pending",
+      "undone": 0
+    }
+  ],
+  "TurnDecisionChange": [
+    {
+      "decision": null,
+      "path": "a"
+    }
+  ],
+  "TurnFile": [
+    {
+      "change": {
+        "linesAdded": 1,
+        "linesRemoved": null,
+        "new": null,
+        "old": {
+          "blob": "3ae7d805f6789a6402acb70ad4096a85a56bf6804eaf25c0493ac697548d30b5",
+          "kind": {
+            "kind": "file"
+          },
+          "mtimeNs": 1700000000000000000,
+          "path": "src/a.rs",
+          "readonly": false,
+          "size": 3
+        },
+        "path": "a",
+        "status": {
+          "kind": "modified"
+        }
+      },
+      "changedSince": false,
+      "decision": "kept"
+    }
+  ],
+  "TurnState": [
+    "running",
+    "pending",
+    "reviewed",
+    "empty",
+    "pruned"
+  ],
+  "UndoTurnReport": [
+    {
+      "restore": {
+        "deleted": [],
+        "failed": [],
+        "safetyVersion": 4,
+        "uncaptured": [],
+        "written": [
+          "a"
+        ]
+      },
+      "skippedChanged": [
+        "b"
+      ],
+      "turn": {
+        "after": 3,
+        "before": 2,
+        "counts": {
+          "added": 1,
+          "deleted": 3,
+          "modified": 2
+        },
+        "endedAtMs": 1700000100000,
+        "id": 7,
+        "kept": 1,
+        "projectId": 1,
+        "prompt": "Add a payment step",
+        "reviewedAtMs": null,
+        "seq": 9,
+        "sessionId": "s",
+        "startedAtMs": 1700000000000,
+        "state": "reviewed",
+        "undone": 0
+      }
+    }
+  ],
+  "UndoTurnRequest": [
+    {
+      "includeChanged": true,
+      "paths": [
+        "a"
+      ]
     }
   ],
   "Version": [

@@ -613,6 +613,7 @@ describe('projects, versions and settings', () => {
     expect(await api.getGlobalSettings()).toEqual({
       sizeCapBytes: 50 * 1024 * 1024,
       retentionKeep: 200,
+      keepInTray: true,
     });
     const s = await api.getProjectSettings(shop.id);
     expect(s).toEqual({ extraIgnore: [], respectGitignore: true, autoSnapshot: { kind: 'off' } });
@@ -626,7 +627,7 @@ describe('projects, versions and settings', () => {
       'invalid_input',
     );
     await rejectsWith(
-      api.setGlobalSettings({ sizeCapBytes: 1, retentionKeep: 0 }),
+      api.setGlobalSettings({ sizeCapBytes: 1, retentionKeep: 0, keepInTray: true }),
       'invalid_input',
     );
   });
@@ -634,7 +635,11 @@ describe('projects, versions and settings', () => {
   it('applies retention but keeps pinned versions', async () => {
     const { api, tool } = await setup();
     const pinned = (await api.listVersions(tool.id)).filter((x) => x.pinned);
-    await api.setGlobalSettings({ sizeCapBytes: 50 * 1024 * 1024, retentionKeep: 3 });
+    await api.setGlobalSettings({
+      sizeCapBytes: 50 * 1024 * 1024,
+      retentionKeep: 3,
+      keepInTray: true,
+    });
     const after = await api.listVersions(tool.id);
     expect(after.filter((x) => !x.pinned).length).toBe(3);
     for (const p of pinned) expect(after.some((x) => x.id === p.id)).toBe(true);

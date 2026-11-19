@@ -34,7 +34,7 @@ describe('ConfirmRestoreDialog', () => {
     const onconfirm = vi.fn();
     const oncancel = vi.fn();
     render(ConfirmRestoreDialog, { props: { version, plan, onconfirm, oncancel } });
-    const d = screen.getByRole('dialog', { name: /Restore project to/ });
+    const d = screen.getByRole('dialog', { name: /Restore folder to/ });
     expect(within(d).getByText('Overwrite 2 files (2)')).toBeInTheDocument();
     expect(within(d).getByText('Delete 1 file added since (1)')).toBeInTheDocument();
     expect(within(d).getByText('Recreate 1 empty folder (1)')).toBeInTheDocument();

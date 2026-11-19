@@ -9,6 +9,7 @@ import SettingsScreen from './SettingsScreen.svelte';
 const ok: Form = {
   sizeCapMb: '50',
   retentionKeep: '200',
+  keepInTray: true,
   extraIgnore: '',
   respectGitignore: true,
   autoKind: 'off',
@@ -58,6 +59,7 @@ describe('SettingsScreen', () => {
       expect(setGlobal).toHaveBeenCalledWith({
         sizeCapBytes: 100 * 1024 * 1024,
         retentionKeep: 200,
+        keepInTray: true,
       }),
     );
     expect(setProject).toHaveBeenCalledWith(shop.id, {

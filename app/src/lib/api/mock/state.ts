@@ -4,11 +4,14 @@ import type {
   ChangeCounts,
   Entry,
   FileChange,
+  FileDecision,
   GlobalSettings,
   Project,
   ProjectId,
   RelPath,
+  TurnId,
   Version,
+  VersionId,
 } from '../types';
 import { DEFAULT_DIFF_OPTIONS } from '../types';
 import { lineDiff } from './lines';
@@ -29,12 +32,28 @@ export interface VersionRecord {
   entries: Tree;
 }
 
+/** An agent turn as the mock stores it; `Turn` is derived from it (`MockApi.turnOf`). */
+export interface TurnRecord {
+  id: TurnId;
+  seq: number;
+  sessionId: string | null;
+  prompt: string;
+  startedAtMs: number;
+  endedAtMs: number | null;
+  before: VersionId | null;
+  after: VersionId | null;
+  decisions: Map<RelPath, FileDecision>;
+  reviewedAtMs: number | null;
+}
+
 export interface ProjectRecord {
   project: Project;
   /** The folder "on disk". */
   tree: Tree;
   /** Oldest first. */
   versions: VersionRecord[];
+  /** Agent turns, oldest first. */
+  turns: TurnRecord[];
 }
 
 /** Text diffs above this size come back as `tooLarge`. */
@@ -43,9 +62,14 @@ export const DIFF_SIZE_LIMIT = 5 * 1024 * 1024;
 export class MockState {
   readonly blobs = new Map<BlobHash, BlobData>();
   readonly projects = new Map<ProjectId, ProjectRecord>();
-  global: GlobalSettings = { sizeCapBytes: 50 * 1024 * 1024, retentionKeep: 200 };
+  global: GlobalSettings = {
+    sizeCapBytes: 50 * 1024 * 1024,
+    retentionKeep: 200,
+    keepInTray: true,
+  };
   nextProjectId = 1;
   nextVersionId = 1;
+  nextTurnId = 1;
 
   putText(text: string, size?: number): BlobHash {
     const hash = fakeHash(`t:${text}:${size ?? ''}`);

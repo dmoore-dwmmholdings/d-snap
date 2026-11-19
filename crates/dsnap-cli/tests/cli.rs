@@ -328,3 +328,31 @@ fn hooks_print_is_claude_code_settings_json() {
     assert!(cmd.contains("snap --hook \"$CLAUDE_PROJECT_DIR\""), "{cmd}");
     assert!(v["hooks"]["UserPromptSubmit"].is_array());
 }
+
+// ---- turns (DSNA-119) ----
+
+#[test]
+fn hooks_record_a_turn_with_its_prompt() {
+    let home = TestHome::new();
+    let fx = FixtureProject::new().file("a.txt", "a").build();
+    let begin =
+        r#"{"session_id":"s1","hook_event_name":"UserPromptSubmit","prompt":"Make a.txt say b"}"#;
+    let out = hook(&home, fx.root(), begin).wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", hook_log(&home));
+    fs::write(fx.path("a.txt"), "b").unwrap();
+    let stop = r#"{"session_id":"s1","hook_event_name":"Stop","stop_hook_active":false}"#;
+    let out = hook(&home, fx.root(), stop).wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", hook_log(&home));
+
+    let turns: Vec<serde_json::Value> =
+        serde_json::from_str(&ok(&home, &["--json", "turns", s(fx.root())])).unwrap();
+    assert_eq!(turns.len(), 1);
+    assert_eq!(turns[0]["prompt"], "Make a.txt say b");
+    assert_eq!(turns[0]["state"], "pending");
+    assert_eq!(turns[0]["counts"]["modified"], 1);
+    let text = ok(&home, &["turns", s(fx.root())]);
+    assert!(
+        text.contains("review") && text.contains("Make a.txt say b"),
+        "{text}"
+    );
+}

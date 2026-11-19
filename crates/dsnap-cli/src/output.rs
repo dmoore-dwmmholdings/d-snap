@@ -6,7 +6,7 @@ use std::path::Path;
 
 use dsnap_core::{
     ChangeCounts, ChangeStatus, DiffBody, FileChange, FileDiff, LineTag, Project, RestorePlan,
-    RestoreReport, SkipReason, SkippedFile, Version, VersionKind,
+    RestoreReport, SkipReason, SkippedFile, Turn, TurnState, Version, VersionKind,
 };
 use time::macros::format_description;
 use time::{OffsetDateTime, UtcOffset};
@@ -96,6 +96,46 @@ pub fn versions(list: &[Version]) -> String {
             if v.pinned { "*" } else { " " },
             counts(&v.counts),
             v.label,
+        );
+    }
+    s
+}
+
+/// Longest prompt shown per turn line, in characters.
+const PROMPT_CHARS: usize = 72;
+
+/// One line per turn: number, start time, state, counts and the prompt's first line.
+pub fn turns(list: &[Turn]) -> String {
+    if list.is_empty() {
+        return "No agent turns yet. Install the hooks with `dsnap hooks print`.\n".to_owned();
+    }
+    let width = list
+        .iter()
+        .map(|t| t.seq.to_string().len())
+        .max()
+        .unwrap_or(1);
+    let mut s = String::new();
+    for t in list {
+        let state = match t.state {
+            TurnState::Running => "running",
+            TurnState::Pending => "review",
+            TurnState::Reviewed => "reviewed",
+            TurnState::Empty => "empty",
+            TurnState::Pruned => "pruned",
+        };
+        let first = t.prompt.lines().next().unwrap_or_default();
+        let mut prompt: String = first.chars().take(PROMPT_CHARS).collect();
+        if first.chars().count() > PROMPT_CHARS || t.prompt.lines().nth(1).is_some() {
+            prompt.push('…');
+        }
+        let _ = writeln!(
+            s,
+            "{:>width$}  {}  {:<8} {:<16} {}",
+            t.seq,
+            local_time(t.started_at_ms),
+            state,
+            counts(&t.counts),
+            prompt,
         );
     }
     s

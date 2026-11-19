@@ -85,6 +85,8 @@ export interface GlobalSettings {
   sizeCapBytes: number;
   /** Retention keeps pinned versions plus this many latest (default 200). */
   retentionKeep: number;
+  /** Closing the window keeps D-Snap running in the system tray (default true). */
+  keepInTray: boolean;
 }
 
 /** A tracked folder. */
@@ -253,6 +255,85 @@ export interface ProjectChangedEvent {
 /** Payload of `onVersionsChanged`: versions were added, edited or removed (GUI or CLI). */
 export interface VersionsChangedEvent {
   projectId: ProjectId;
+}
+
+/** Turn id (`TurnId(i64)`). */
+export type TurnId = number;
+
+/** Where an agent turn stands. */
+export type TurnState = 'running' | 'pending' | 'reviewed' | 'empty' | 'pruned';
+
+/**
+ * One agent turn (DSNA-113): the snapshots the Claude Code hooks take when a prompt is
+ * submitted and when the agent stops, with the prompt as its title.
+ */
+export interface Turn {
+  id: TurnId;
+  projectId: ProjectId;
+  /** 1-based number within the project ("Turn 9"). */
+  seq: number;
+  sessionId: string | null;
+  /** The prompt that started the turn (empty when unknown). */
+  prompt: string;
+  startedAtMs: number;
+  /** `null` while running. */
+  endedAtMs: number | null;
+  /** The folder before the turn; `null` once that version is deleted. */
+  before: VersionId | null;
+  /** The folder after the turn; `null` while running or once deleted. */
+  after: VersionId | null;
+  /** Changes from `before` to `after`. */
+  counts: ChangeCounts;
+  kept: number;
+  undone: number;
+  /** When the last file was decided; `null` while any is pending. */
+  reviewedAtMs: number | null;
+  state: TurnState;
+}
+
+/** A review decision on one file of a turn. */
+export type FileDecision = 'kept' | 'undone';
+
+/** One file a turn changed. */
+export interface TurnFile {
+  /** Before → after, with line counts. */
+  change: FileChange;
+  /** `null` while pending. */
+  decision: FileDecision | null;
+  /** The folder's file differs from the turn's result (edited or undone since). */
+  changedSince: boolean;
+}
+
+/** What `undoTurn` undoes. */
+export interface UndoTurnRequest {
+  /** Paths to undo (a rename by its new path); `null` = every file. */
+  paths: RelPath[] | null;
+  /** Also undo files changed after the turn, discarding those edits. */
+  includeChanged: boolean;
+}
+
+/** Outcome of `undoTurn` / `redoTurn`. */
+export interface UndoTurnReport {
+  /** The restore; restoring its `safetyVersion` undoes the undo. */
+  restore: RestoreReport;
+  /** Files left alone because they changed after the turn. */
+  skippedChanged: RelPath[];
+  /** The turn with its new decisions. */
+  turn: Turn;
+}
+
+/** One decision change for `setTurnDecisions`; `decision: null` clears it. */
+export interface TurnDecisionChange {
+  path: RelPath;
+  decision: FileDecision | null;
+}
+
+/** One point in a file's history (`pathHistory`). */
+export interface PathVersion {
+  /** The version where the path changed. */
+  version: Version;
+  /** Its entry there; `null` = deleted in this version. */
+  entry: Entry | null;
 }
 
 /** Stable error codes (DSNA-66 maps `dsnap_core::Error` to these). */

@@ -3,6 +3,7 @@
 export interface Form {
   sizeCapMb: string;
   retentionKeep: string;
+  keepInTray: boolean;
   extraIgnore: string;
   respectGitignore: boolean;
   autoKind: 'off' | 'every' | 'afterIdle';

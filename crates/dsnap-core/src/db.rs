@@ -46,6 +46,7 @@ mod refs;
 mod schema;
 #[cfg(test)]
 mod tests;
+mod turns;
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -526,7 +527,8 @@ impl Db {
 
     /// Retention step: delete up to `limit` of a project's oldest unpinned versions beyond
     /// the newest `keep` unpinned ones, recomputing successor counts like
-    /// [`Db::delete_versions`]. Versions in `protect` are treated like pinned ones: never
+    /// [`Db::delete_versions`]. Versions in `protect`, and both sides of the newest
+    /// pending turns (`turns::PROTECTED_PENDING_TURNS`), are treated like pinned ones: never
     /// deleted and not counted toward `keep`. The candidates are chosen inside the same
     /// `BEGIN IMMEDIATE` transaction, so a version pinned or added by another process
     /// meanwhile is honored. Returns the number deleted; call again until it returns 0.
@@ -548,11 +550,14 @@ impl Db {
                 stmt.query_map([project.0], |r| r.get::<_, i64>(0))?
                     .collect::<rusqlite::Result<Vec<_>>>()?
             };
+            // Versions of turns that wait for review are kept like protected ones
+            // (DSNA-118), read in this transaction so a turn started meanwhile counts.
+            let turn_versions = turns::pending_turn_versions_tx(tx, project)?;
             // Newest first: skip protected ones and the newest `keep`; delete oldest first.
             let mut ids: Vec<VersionId> = ids
                 .into_iter()
                 .map(VersionId)
-                .filter(|id| !protect.contains(id))
+                .filter(|id| !protect.contains(id) && !turn_versions.contains(id))
                 .skip(keep)
                 .collect();
             ids.reverse();

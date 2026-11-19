@@ -69,7 +69,9 @@ const SHAPES: Record<string, Shape> = {
   ProjectSettings: {
     object: keys<T.ProjectSettings>()(['extraIgnore', 'respectGitignore', 'autoSnapshot']),
   },
-  GlobalSettings: { object: keys<T.GlobalSettings>()(['sizeCapBytes', 'retentionKeep']) },
+  GlobalSettings: {
+    object: keys<T.GlobalSettings>()(['sizeCapBytes', 'retentionKeep', 'keepInTray']),
+  },
   Project: { object: keys<T.Project>()(['id', 'name', 'root', 'settings', 'missing']) },
   ChangeStatus: {
     tagged: tagged<T.ChangeStatus>()({
@@ -134,6 +136,33 @@ const SHAPES: Record<string, Shape> = {
   },
   VersionsChangedEvent: { object: keys<T.VersionsChangedEvent>()(['projectId']) },
   ApiError: { object: keys<{ code: ApiErrorCode; message: string }>()(['code', 'message']) },
+  TurnState: {
+    strings: values<T.TurnState>()(['running', 'pending', 'reviewed', 'empty', 'pruned']),
+  },
+  Turn: {
+    object: keys<T.Turn>()([
+      'id',
+      'projectId',
+      'seq',
+      'sessionId',
+      'prompt',
+      'startedAtMs',
+      'endedAtMs',
+      'before',
+      'after',
+      'counts',
+      'kept',
+      'undone',
+      'reviewedAtMs',
+      'state',
+    ]),
+  },
+  FileDecision: { strings: values<T.FileDecision>()(['kept', 'undone']) },
+  TurnFile: { object: keys<T.TurnFile>()(['change', 'decision', 'changedSince']) },
+  UndoTurnRequest: { object: keys<T.UndoTurnRequest>()(['paths', 'includeChanged']) },
+  UndoTurnReport: { object: keys<T.UndoTurnReport>()(['restore', 'skippedChanged', 'turn']) },
+  TurnDecisionChange: { object: keys<T.TurnDecisionChange>()(['path', 'decision']) },
+  PathVersion: { object: keys<T.PathVersion>()(['version', 'entry']) },
 };
 
 const sorted = (a: readonly string[]) => [...a].sort();

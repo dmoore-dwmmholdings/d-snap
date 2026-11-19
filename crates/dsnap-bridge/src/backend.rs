@@ -15,12 +15,12 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use dsnap_core::lock::{ProjectLock, STALE_AFTER};
 use dsnap_core::{
-    BlobHash, CancelToken, DiffOptions, Dsnap, FileChange, FileDiff, GlobalSettings, Progress,
-    ProgressEvent, Project, ProjectId, ProjectSettings, RelPath, RestorePlan, RestoreReport,
-    RevertHunk, SnapshotOptions, SnapshotReport, Stage, Version, VersionId, VersionKind,
-    VersionRef,
+    BlobHash, CancelToken, DiffOptions, Dsnap, FileChange, FileDecision, FileDiff, GlobalSettings,
+    PathVersion, Progress, ProgressEvent, Project, ProjectId, ProjectSettings, RelPath,
+    RestorePlan, RestoreReport, RevertHunk, SnapshotOptions, SnapshotReport, Stage, Turn, TurnFile,
+    TurnId, UndoTurn, UndoTurnReport, Version, VersionId, VersionKind, VersionRef,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::error::ApiError;
 use crate::live::Live;
@@ -105,6 +105,17 @@ pub struct ProjectChanged {
     pub project_id: ProjectId,
     /// Files changed since the latest version.
     pub changed_count: u32,
+}
+
+/// One decision change in `set_turn_decisions` (`TurnDecisionChange`); `decision: null`
+/// clears it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnDecisionChange {
+    /// A file of the turn.
+    pub path: RelPath,
+    /// The new decision, or `None` to make it pending again.
+    pub decision: Option<FileDecision>,
 }
 
 /// A write operation that has been announced ([`Backend::begin`]).
@@ -520,11 +531,105 @@ impl Backend {
         self.restore_op(ctx, |d| d.revert_hunk(ctx.project, req))
     }
 
-    fn restore_op(
+    // ---- turns (DSNA-122) ----
+
+    /// A project's agent turns, newest first.
+    pub fn list_turns(&self, project: ProjectId) -> ApiResult<Vec<Turn>> {
+        Ok(self.dsnap()?.list_turns(project)?)
+    }
+
+    /// The files a turn changed, with decisions and later-edit flags.
+    pub fn turn_files(&self, id: TurnId) -> ApiResult<Vec<TurnFile>> {
+        Ok(self.dsnap()?.turn_files(id)?)
+    }
+
+    /// Set or clear review decisions; every window refreshes (`versions-changed`).
+    pub fn set_turn_decisions(
+        &self,
+        id: TurnId,
+        changes: &[TurnDecisionChange],
+    ) -> ApiResult<Turn> {
+        let pairs: Vec<(RelPath, Option<FileDecision>)> = changes
+            .iter()
+            .map(|c| (c.path.clone(), c.decision))
+            .collect();
+        let t = self.dsnap()?.set_turn_decisions(id, &pairs)?;
+        self.versions_changed(t.project_id);
+        Ok(t)
+    }
+
+    /// Keep every undecided file of a turn.
+    pub fn keep_turn(&self, id: TurnId) -> ApiResult<Turn> {
+        let t = self.dsnap()?.keep_turn(id)?;
+        self.versions_changed(t.project_id);
+        Ok(t)
+    }
+
+    /// Undo files of a turn (announced with [`Backend::begin`] on the turn's project).
+    pub fn undo_turn(&self, ctx: &OpCtx, id: TurnId, req: &UndoTurn) -> ApiResult<UndoTurnReport> {
+        self.check_turn_project(ctx, id)?;
+        self.restore_op(ctx, |d| d.undo_turn(id, req))
+    }
+
+    /// Put undone files of a turn back (announced with [`Backend::begin`]).
+    pub fn redo_turn(
         &self,
         ctx: &OpCtx,
-        f: impl FnOnce(&Dsnap) -> dsnap_core::Result<RestoreReport>,
+        id: TurnId,
+        paths: Option<&[RelPath]>,
+    ) -> ApiResult<UndoTurnReport> {
+        self.check_turn_project(ctx, id)?;
+        self.restore_op(ctx, |d| d.redo_turn(id, paths))
+    }
+
+    /// Undo one hunk of a turn's diff (announced with [`Backend::begin`]).
+    pub fn undo_turn_hunk(
+        &self,
+        ctx: &OpCtx,
+        id: TurnId,
+        path: &RelPath,
+        hunk_index: u32,
+        opts: &DiffOptions,
     ) -> ApiResult<RestoreReport> {
+        self.check_turn_project(ctx, id)?;
+        self.restore_op(ctx, |d| d.undo_turn_hunk(id, path, hunk_index, opts))
+    }
+
+    /// Every version where `path` changed, newest first.
+    pub fn path_history(&self, project: ProjectId, path: &RelPath) -> ApiResult<Vec<PathVersion>> {
+        Ok(self.dsnap()?.path_history(project, path)?)
+    }
+
+    /// Paths for "Find any file".
+    pub fn known_paths(&self, project: ProjectId) -> ApiResult<Vec<RelPath>> {
+        Ok(self.dsnap()?.known_paths(project)?)
+    }
+
+    /// `invalid_input` unless the turn belongs to the announced project (the operation's
+    /// lock and progress are per project). Ends the announced operation on error.
+    fn check_turn_project(&self, ctx: &OpCtx, id: TurnId) -> ApiResult<()> {
+        let res = self.dsnap().and_then(|d| Ok(d.turn(id)?)).and_then(|t| {
+            if t.project_id == ctx.project {
+                Ok(())
+            } else {
+                Err(ApiError::new(
+                    "invalid_input",
+                    format!("turn {id} is not in project {}", ctx.project),
+                ))
+            }
+        });
+        if res.is_err() {
+            self.progress(ctx, Phase::Done, 0, None, None);
+            lock(&self.ops).remove(&ctx.op_id);
+        }
+        res
+    }
+
+    fn restore_op<T>(
+        &self,
+        ctx: &OpCtx,
+        f: impl FnOnce(&Dsnap) -> dsnap_core::Result<T>,
+    ) -> ApiResult<T> {
         let res = self.run_write(ctx, |d| {
             self.progress(ctx, Phase::Restore, 0, None, None);
             Ok(f(d)?)

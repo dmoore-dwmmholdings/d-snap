@@ -1,18 +1,25 @@
-/* D-Snap design tokens. Light by default, dark via prefers-color-scheme. */
+/*
+  D-Snap design tokens, "Turn review" (DSNA-124): ink on a near-white ground, one lime
+  highlight for what waits for you, Bricolage Grotesque over JetBrains Mono. Light by
+  default, dark via prefers-color-scheme. Fonts are bundled (the app is offline).
+*/
+@import '@fontsource-variable/bricolage-grotesque/opsz.css';
+@import '@fontsource/jetbrains-mono/400.css';
+@import '@fontsource/jetbrains-mono/500.css';
+
 :root {
   color-scheme: light dark;
 
-  --font-sans:
-    system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif;
+  --font-sans: 'Bricolage Grotesque Variable', system-ui, -apple-system, 'Segoe UI', sans-serif;
   --font-mono:
-    ui-monospace, 'Cascadia Code', 'Cascadia Mono', Consolas, 'SF Mono', Menlo, 'Liberation Mono',
-    monospace;
+    'JetBrains Mono', ui-monospace, 'Cascadia Code', Consolas, 'SF Mono', Menlo, monospace;
 
   --text-xs: 11px;
   --text-sm: 12px;
-  --text-md: 13px;
-  --text-lg: 15px;
-  --text-xl: 18px;
+  --text-md: 14px;
+  --text-lg: 16px;
+  --text-xl: 20px;
+  --text-display: 32px;
 
   --space-1: 4px;
   --space-2: 8px;
@@ -20,70 +27,104 @@
   --space-4: 16px;
   --space-5: 24px;
   --space-6: 32px;
+  --space-7: 48px;
 
-  --radius-sm: 4px;
-  --radius-md: 6px;
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 14px;
 
-  --bg: #ffffff;
-  --surface-1: #f6f7f9;
-  --surface-2: #eceef2;
-  --border: #d9dde3;
-  --text: #1c2026;
-  --text-muted: #5d6673;
-  --accent: #2463eb;
+  /* Ground and ink */
+  --bg: #fafafa;
+  --surface-0: #ffffff;
+  --surface-1: #f4f4f2;
+  --surface-2: #ececea;
+  --border: #e3e3e0;
+  --border-strong: #d2d2ce;
+  --text: #0e0e0e;
+  --text-muted: #555555;
+  --text-faint: #6e6e6e;
+
+  /* One action color (ink) and one highlight (lime) for what waits for review. */
+  --accent: #0e0e0e;
   --accent-text: #ffffff;
-  --focus: #2463eb;
+  --marker: #d7f542;
+  --marker-ink: #0e0e0e;
+  --marker-soft: #f1fbc7;
+  --focus: #0e0e0e;
 
-  --status-added: #1a7f37;
-  --status-modified: #9a6700;
-  --status-deleted: #cf222e;
-  --status-renamed: #8250df;
+  --warn-bg: #fff6ea;
+  --warn-border: #e8c79a;
+  --warn-text: #5a3300;
+  --warn-strong: #8a4b00;
 
-  --diff-insert-bg: #e6ffec;
-  --diff-insert-gutter: #ccffd8;
-  --diff-delete-bg: #ffebe9;
-  --diff-delete-gutter: #ffd7d5;
-  --diff-hunk-bg: #ddf4ff;
+  --shadow-pop: 0 12px 32px rgba(14, 14, 14, 0.14);
+  --shadow-dialog: 0 24px 64px rgba(14, 14, 14, 0.24);
 
-  --hl-keyword: #cf222e;
-  --hl-string: #0a3069;
-  --hl-comment: #6e7781;
-  --hl-number: #0550ae;
-  --hl-title: #8250df;
-  --hl-type: #953800;
-  --hl-meta: #116329;
+  --status-added: #3c6b00;
+  --status-modified: #555555;
+  --status-deleted: #b23c17;
+  --status-renamed: #3d4fb8;
+
+  --diff-insert-bg: #f1fbc7;
+  --diff-insert-gutter: #ddf28a;
+  --diff-delete-bg: #fff0e8;
+  --diff-delete-gutter: #ffd9c4;
+  --diff-hunk-bg: #f4f4f2;
+
+  --hl-keyword: #a1240f;
+  --hl-string: #1d4d8f;
+  --hl-comment: #6e6e6e;
+  --hl-number: #1d4d8f;
+  --hl-title: #5b2ca0;
+  --hl-type: #8a4b00;
+  --hl-meta: #3c6b00;
 }
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --bg: #16181d;
-    --surface-1: #1d2027;
-    --surface-2: #262a33;
-    --border: #353a45;
-    --text: #e3e6eb;
-    --text-muted: #9aa3b0;
-    --accent: #5b8def;
-    --accent-text: #0d1117;
-    --focus: #79a6ff;
+    --bg: #111110;
+    --surface-0: #181817;
+    --surface-1: #1f1f1d;
+    --surface-2: #2a2a27;
+    --border: #2e2e2b;
+    --border-strong: #42423e;
+    --text: #f2f2ee;
+    --text-muted: #a8a8a2;
+    --text-faint: #8c8c86;
 
-    --status-added: #3fb950;
-    --status-modified: #d29922;
-    --status-deleted: #f85149;
-    --status-renamed: #a371f7;
+    --accent: #f2f2ee;
+    --accent-text: #111110;
+    --marker: #d7f542;
+    --marker-ink: #111110;
+    --marker-soft: #2c3410;
+    --focus: #d7f542;
 
-    --diff-insert-bg: #12261a;
-    --diff-insert-gutter: #1b3a25;
-    --diff-delete-bg: #2d1416;
-    --diff-delete-gutter: #4a1d20;
-    --diff-hunk-bg: #142338;
+    --warn-bg: #2b2012;
+    --warn-border: #6b4b1f;
+    --warn-text: #f3d3a6;
+    --warn-strong: #f0b866;
 
-    --hl-keyword: #ff7b72;
-    --hl-string: #a5d6ff;
-    --hl-comment: #8b949e;
-    --hl-number: #79c0ff;
-    --hl-title: #d2a8ff;
-    --hl-type: #ffa657;
-    --hl-meta: #7ee787;
+    --shadow-pop: 0 12px 32px rgba(0, 0, 0, 0.5);
+    --shadow-dialog: 0 24px 64px rgba(0, 0, 0, 0.6);
+
+    --status-added: #b8e04a;
+    --status-modified: #a8a8a2;
+    --status-deleted: #ff9d7a;
+    --status-renamed: #9fb0ff;
+
+    --diff-insert-bg: #232b0c;
+    --diff-insert-gutter: #3a4714;
+    --diff-delete-bg: #2e1b12;
+    --diff-delete-gutter: #4a2a1a;
+    --diff-hunk-bg: #1f1f1d;
+
+    --hl-keyword: #ff9d7a;
+    --hl-string: #9fc4ff;
+    --hl-comment: #8c8c86;
+    --hl-number: #9fc4ff;
+    --hl-title: #d0b3ff;
+    --hl-type: #f0b866;
+    --hl-meta: #b8e04a;
   }
 }
 
@@ -101,6 +142,15 @@ body {
   color: var(--text);
   font-family: var(--font-sans);
   font-size: var(--text-md);
+  line-height: 1.45;
+  -webkit-font-smoothing: antialiased;
+}
+
+input[type='checkbox'],
+input[type='radio'] {
+  accent-color: var(--accent);
+  width: 16px;
+  height: 16px;
 }
 
 code,
@@ -111,26 +161,36 @@ pre,
 
 :focus-visible {
   outline: 2px solid var(--focus);
-  outline-offset: 1px;
+  outline-offset: 2px;
 }
 
 button,
 input,
-select {
+select,
+textarea {
   font: inherit;
   color: inherit;
 }
 
 button {
-  background: var(--bg);
-  border: 1px solid var(--border);
+  background: var(--surface-0);
+  border: 1px solid var(--border-strong);
   border-radius: var(--radius-sm);
-  padding: 4px 10px;
+  padding: 4px 12px;
+  min-height: 32px;
   cursor: pointer;
+  transition:
+    background-color 0.12s,
+    border-color 0.12s,
+    transform 0.06s;
 }
 
 button:hover:not(:disabled) {
   background: var(--surface-2);
+}
+
+button:active:not(:disabled) {
+  transform: translateY(1px);
 }
 
 button:disabled {
@@ -142,10 +202,26 @@ button.primary {
   background: var(--accent);
   border-color: var(--accent);
   color: var(--accent-text);
+  font-weight: 600;
 }
 
 button.primary:hover:not(:disabled) {
-  background: color-mix(in srgb, var(--accent) 85%, black);
+  background: color-mix(in srgb, var(--accent) 82%, var(--bg));
+}
+
+/* Big, labelled actions (the review area's main buttons). */
+button.big {
+  min-height: 44px;
+  padding: 0 20px;
+  border-radius: var(--radius-md);
+  font-size: 15px;
+  font-weight: 600;
+}
+
+button.outline {
+  background: transparent;
+  border: 1.5px solid var(--accent);
+  font-weight: 600;
 }
 
 button.danger {
@@ -157,19 +233,71 @@ button.danger {
 button.link {
   border: none;
   background: none;
-  padding: 0;
-  color: var(--accent);
+  padding: 0 4px;
+  min-height: 28px;
+  color: var(--text);
   text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+button.link:hover:not(:disabled) {
+  background: none;
+  text-decoration-thickness: 2px;
+}
+
+button.ghost {
+  border-color: transparent;
+  background: transparent;
 }
 
 input[type='text'],
 input[type='search'],
 input[type='number'],
-select {
-  background: var(--bg);
-  border: 1px solid var(--border);
+select,
+textarea {
+  background: var(--surface-0);
+  border: 1px solid var(--border-strong);
   border-radius: var(--radius-sm);
-  padding: 4px 8px;
+  padding: 6px 10px;
+  min-height: 34px;
+}
+
+/* Small uppercase tags: NEW, EDITED, UNDONE... */
+.chip {
+  display: inline-flex;
+  align-items: center;
+  flex: none;
+  font-size: var(--text-xs);
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  padding: 2px 7px;
+  border-radius: 4px;
+  background: var(--surface-1);
+  color: var(--text);
+}
+
+.chip.marker {
+  background: var(--marker);
+  color: var(--marker-ink);
+}
+
+.chip.ink {
+  background: var(--accent);
+  color: var(--accent-text);
+}
+
+.chip.warn {
+  background: var(--warn-bg);
+  color: var(--warn-strong);
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
 }
 
 .pane-title {
@@ -181,4 +309,11 @@ select {
   letter-spacing: 0.04em;
   color: var(--text-muted);
   border-bottom: 1px solid var(--border);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation: none !important;
+    transition: none !important;
+  }
 }

@@ -14,7 +14,14 @@ import type {
   RelPath,
   RestorePlan,
   RestoreReport,
+  PathVersion,
   SnapshotReport,
+  Turn,
+  TurnDecisionChange,
+  TurnFile,
+  TurnId,
+  UndoTurnReport,
+  UndoTurnRequest,
   Version,
   VersionId,
   VersionRef,
@@ -165,6 +172,41 @@ export interface Api {
     hunkIndex: number,
     opts: DiffOptions,
   ): Promise<RestoreReport>;
+
+  // Agent turns (DSNA-113). Decisions emit `onVersionsChanged`, so every window refreshes.
+  /** A project's turns, newest first. */
+  listTurns(projectId: ProjectId): Promise<Turn[]>;
+  /** The files a turn changed, with decisions; a running turn lists its changes so far. */
+  turnFiles(turnId: TurnId): Promise<TurnFile[]>;
+  /** Set or clear decisions; the turn is reviewed once every file has one. */
+  setTurnDecisions(turnId: TurnId, changes: TurnDecisionChange[]): Promise<Turn>;
+  /** Keep every undecided file. */
+  keepTurn(turnId: TurnId): Promise<Turn>;
+  /**
+   * Put files back as they were before the turn, with one safety snapshot. Files changed
+   * after the turn are skipped (`skippedChanged`) unless `req.includeChanged`. A write:
+   * same queueing and progress as `restoreFile`.
+   */
+  undoTurn(projectId: ProjectId, turnId: TurnId, req: UndoTurnRequest): Promise<UndoTurnReport>;
+  /** Put undone files (all, or `paths`) back as the turn left them; clears their decisions. */
+  redoTurn(projectId: ProjectId, turnId: TurnId, paths: RelPath[] | null): Promise<UndoTurnReport>;
+  /**
+   * Undo hunk `hunkIndex` of the turn's diff of `path` (before → after with `opts`).
+   * `invalid_input` when the file changed since the turn.
+   */
+  undoTurnHunk(
+    projectId: ProjectId,
+    turnId: TurnId,
+    path: RelPath,
+    hunkIndex: number,
+    opts: DiffOptions,
+  ): Promise<RestoreReport>;
+
+  // Find any file (DSNA-121)
+  /** Every version where `path` changed, newest first. */
+  pathHistory(projectId: ProjectId, path: RelPath): Promise<PathVersion[]>;
+  /** Files in the latest version plus files added since, sorted. */
+  knownPaths(projectId: ProjectId): Promise<RelPath[]>;
 
   // Events
   /** The folder changed on disk. */

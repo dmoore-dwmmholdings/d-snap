@@ -39,6 +39,15 @@ export const COMMANDS = {
   restoreProject: 'restore_project',
   restoreFile: 'restore_file',
   revertHunk: 'revert_hunk',
+  listTurns: 'list_turns',
+  turnFiles: 'turn_files',
+  setTurnDecisions: 'set_turn_decisions',
+  keepTurn: 'keep_turn',
+  undoTurn: 'undo_turn',
+  redoTurn: 'redo_turn',
+  undoTurnHunk: 'undo_turn_hunk',
+  pathHistory: 'path_history',
+  knownPaths: 'known_paths',
 } as const satisfies Record<CommandMethod, string>;
 
 /** Tauri event names for the `Api` subscriptions. */

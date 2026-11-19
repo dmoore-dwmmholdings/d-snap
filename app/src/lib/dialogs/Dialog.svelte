@@ -84,27 +84,41 @@
   .backdrop {
     position: fixed;
     inset: 0;
-    background: rgb(0 0 0 / 35%);
+    background: rgb(14 14 14 / 38%);
     display: grid;
     place-items: center;
     z-index: 50;
   }
   .dialog {
-    background: var(--bg);
+    background: var(--surface-0);
     color: var(--text);
     border: 1px solid var(--border);
-    border-radius: var(--radius-md);
-    box-shadow: 0 10px 30px rgb(0 0 0 / 25%);
-    width: min(560px, calc(100vw - 32px));
+    border-radius: 16px;
+    box-shadow: var(--shadow-dialog);
+    width: min(520px, calc(100vw - 32px));
     max-height: calc(100vh - 64px);
     display: flex;
     flex-direction: column;
-    padding: var(--space-4);
+    padding: var(--space-5);
     gap: var(--space-3);
+    animation: rise 0.16s ease-out;
+  }
+  @keyframes rise {
+    from {
+      opacity: 0;
+      transform: translateY(8px);
+    }
   }
   h2 {
     margin: 0;
-    font-size: var(--text-lg);
+    font-size: 22px;
+    line-height: 1.2;
+    font-weight: 600;
+    letter-spacing: -0.02em;
+    overflow-wrap: anywhere;
+  }
+  .body :global(p) {
+    margin: 0 0 10px;
   }
   .body {
     overflow: auto;
@@ -112,7 +126,15 @@
   }
   .actions {
     display: flex;
+    flex-wrap: wrap;
     justify-content: flex-end;
     gap: var(--space-2);
+    padding-top: var(--space-1);
+  }
+  .actions button {
+    min-height: 44px;
+    padding: 0 18px;
+    border-radius: var(--radius-md);
+    font-weight: 600;
   }
 </style>

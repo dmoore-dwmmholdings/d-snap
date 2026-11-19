@@ -6,14 +6,14 @@
 use std::sync::Arc;
 
 use dsnap_core::{
-    BlobHash, DiffOptions, FileChange, FileDiff, GlobalSettings, Project, ProjectId,
-    ProjectSettings, RelPath, RestorePlan, RestoreReport, RevertHunk, SnapshotReport, Version,
-    VersionId, VersionRef,
+    BlobHash, DiffOptions, FileChange, FileDiff, GlobalSettings, PathVersion, Project, ProjectId,
+    ProjectSettings, RelPath, RestorePlan, RestoreReport, RevertHunk, SnapshotReport, Turn,
+    TurnFile, TurnId, UndoTurn, UndoTurnReport, Version, VersionId, VersionRef,
 };
 use tauri::{AppHandle, State};
 use tauri_plugin_dialog::DialogExt;
 
-use dsnap_bridge::backend::{ApiResult, Backend, Op};
+use dsnap_bridge::backend::{ApiResult, Backend, Op, TurnDecisionChange};
 use dsnap_bridge::error::ApiError;
 
 /// Managed state: the shared backend.
@@ -268,4 +268,86 @@ pub async fn revert_hunk(
         working_hash: None,
     };
     blocking(&state, move |b| b.revert_hunk(&ctx, &req)).await
+}
+
+#[tauri::command]
+pub async fn list_turns(state: State<'_, AppState>, project_id: ProjectId) -> ApiResult<Vec<Turn>> {
+    blocking(&state, move |b| b.list_turns(project_id)).await
+}
+
+#[tauri::command]
+pub async fn turn_files(state: State<'_, AppState>, turn_id: TurnId) -> ApiResult<Vec<TurnFile>> {
+    blocking(&state, move |b| b.turn_files(turn_id)).await
+}
+
+#[tauri::command]
+pub async fn set_turn_decisions(
+    state: State<'_, AppState>,
+    turn_id: TurnId,
+    changes: Vec<TurnDecisionChange>,
+) -> ApiResult<Turn> {
+    blocking(&state, move |b| b.set_turn_decisions(turn_id, &changes)).await
+}
+
+#[tauri::command]
+pub async fn keep_turn(state: State<'_, AppState>, turn_id: TurnId) -> ApiResult<Turn> {
+    blocking(&state, move |b| b.keep_turn(turn_id)).await
+}
+
+#[tauri::command]
+pub async fn undo_turn(
+    state: State<'_, AppState>,
+    project_id: ProjectId,
+    turn_id: TurnId,
+    req: UndoTurn,
+) -> ApiResult<UndoTurnReport> {
+    let ctx = state.0.begin(project_id, Op::Restore);
+    blocking(&state, move |b| b.undo_turn(&ctx, turn_id, &req)).await
+}
+
+#[tauri::command]
+pub async fn redo_turn(
+    state: State<'_, AppState>,
+    project_id: ProjectId,
+    turn_id: TurnId,
+    paths: Option<Vec<RelPath>>,
+) -> ApiResult<UndoTurnReport> {
+    let ctx = state.0.begin(project_id, Op::Restore);
+    blocking(&state, move |b| {
+        b.redo_turn(&ctx, turn_id, paths.as_deref())
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn undo_turn_hunk(
+    state: State<'_, AppState>,
+    project_id: ProjectId,
+    turn_id: TurnId,
+    path: RelPath,
+    hunk_index: u32,
+    opts: DiffOptions,
+) -> ApiResult<RestoreReport> {
+    let ctx = state.0.begin(project_id, Op::Restore);
+    blocking(&state, move |b| {
+        b.undo_turn_hunk(&ctx, turn_id, &path, hunk_index, &opts)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn path_history(
+    state: State<'_, AppState>,
+    project_id: ProjectId,
+    path: RelPath,
+) -> ApiResult<Vec<PathVersion>> {
+    blocking(&state, move |b| b.path_history(project_id, &path)).await
+}
+
+#[tauri::command]
+pub async fn known_paths(
+    state: State<'_, AppState>,
+    project_id: ProjectId,
+) -> ApiResult<Vec<RelPath>> {
+    blocking(&state, move |b| b.known_paths(project_id)).await
 }
